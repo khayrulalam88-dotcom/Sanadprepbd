@@ -1,0 +1,6 @@
+{
+  "name": "Bar Council MCQ Prep",
+  "description": "Comprehensive Bangladesh Bar Council Enrollment MCQ exam preparation platform with 60-minute timed mock tests, subject practice, instant negative scoring, and question review.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

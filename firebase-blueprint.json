@@ -1,0 +1,231 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile with role-based access control (Student, Question Manager, Admin)",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 100 },
+        "email": { "type": "string", "maxLength": 100 },
+        "phone": { "type": "string", "maxLength": 20 },
+        "role": { "type": "string", "enum": ["student", "question_manager", "admin"] },
+        "subscriptionStatus": { "type": "string", "enum": ["free", "pro", "expired"] },
+        "subscriptionExpiresAt": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["uid", "name", "role", "subscriptionStatus", "createdAt"]
+    },
+    "Subject": {
+      "title": "Subject",
+      "description": "Core legal code or subject from the Bangladesh Bar Council syllabus",
+      "type": "object",
+      "properties": {
+        "code": { "type": "string", "maxLength": 10 },
+        "nameBn": { "type": "string", "maxLength": 150 },
+        "nameEn": { "type": "string", "maxLength": 150 },
+        "marksWeight": { "type": "number" },
+        "totalQuestions": { "type": "number" },
+        "actTitle": { "type": "string", "maxLength": 100 }
+      },
+      "required": ["code", "nameBn", "nameEn", "marksWeight"]
+    },
+    "Question": {
+      "title": "Question",
+      "description": "Authentic Bar Council exam question with 4 options, legal reference, and explanation",
+      "type": "object",
+      "properties": {
+        "subjectId": { "type": "string", "maxLength": 64 },
+        "questionBn": { "type": "string", "maxLength": 1000 },
+        "questionEn": { "type": "string", "maxLength": 1000 },
+        "correctOptionIndex": { "type": "number" },
+        "explanationBn": { "type": "string", "maxLength": 2000 },
+        "explanationEn": { "type": "string", "maxLength": 2000 },
+        "legalReference": { "type": "string", "maxLength": 200 },
+        "difficulty": { "type": "string", "enum": ["easy", "medium", "hard"] },
+        "status": { "type": "string", "enum": ["draft", "reviewed", "published"] },
+        "isDemoSample": { "type": "boolean" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["subjectId", "questionBn", "correctOptionIndex", "difficulty", "status"]
+    },
+    "Exam": {
+      "title": "Exam",
+      "description": "Mock exam configuration with duration, pass threshold, and negative marking",
+      "type": "object",
+      "properties": {
+        "titleBn": { "type": "string", "maxLength": 200 },
+        "titleEn": { "type": "string", "maxLength": 200 },
+        "descriptionBn": { "type": "string", "maxLength": 500 },
+        "descriptionEn": { "type": "string", "maxLength": 500 },
+        "type": { "type": "string", "enum": ["full_mock", "subject_test", "practice_quiz", "custom_test"] },
+        "durationMinutes": { "type": "number" },
+        "totalMarks": { "type": "number" },
+        "passThresholdPercentage": { "type": "number" },
+        "isPaid": { "type": "boolean" },
+        "published": { "type": "boolean" },
+        "negativeMarkRatio": { "type": "number" },
+        "positiveMarkRatio": { "type": "number" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["titleBn", "titleEn", "type", "durationMinutes", "totalMarks", "negativeMarkRatio", "positiveMarkRatio"]
+    },
+    "ExamAttempt": {
+      "title": "ExamAttempt",
+      "description": "An ongoing or completed student exam attempt with server-bound deadline",
+      "type": "object",
+      "properties": {
+        "examId": { "type": "string", "maxLength": 64 },
+        "userId": { "type": "string", "maxLength": 128 },
+        "studentName": { "type": "string", "maxLength": 100 },
+        "startTime": { "type": "string" },
+        "deadlineTime": { "type": "string" },
+        "submittedTime": { "type": "string" },
+        "status": { "type": "string", "enum": ["in_progress", "submitted", "timed_out"] },
+        "lastSavedAt": { "type": "string" }
+      },
+      "required": ["examId", "userId", "startTime", "deadlineTime", "status"]
+    },
+    "ExamResult": {
+      "title": "ExamResult",
+      "description": "Final score and evaluation for an exam attempt",
+      "type": "object",
+      "properties": {
+        "attemptId": { "type": "string", "maxLength": 64 },
+        "examId": { "type": "string", "maxLength": 64 },
+        "userId": { "type": "string", "maxLength": 128 },
+        "studentName": { "type": "string", "maxLength": 100 },
+        "submittedAt": { "type": "string" },
+        "timeSpentSeconds": { "type": "number" },
+        "totalQuestions": { "type": "number" },
+        "correctAnswersCount": { "type": "number" },
+        "incorrectAnswersCount": { "type": "number" },
+        "unansweredCount": { "type": "number" },
+        "positiveMarks": { "type": "number" },
+        "negativeMarks": { "type": "number" },
+        "finalScore": { "type": "number" },
+        "percentage": { "type": "number" },
+        "passed": { "type": "boolean" }
+      },
+      "required": ["attemptId", "examId", "userId", "finalScore", "percentage"]
+    },
+    "PaymentRequest": {
+      "title": "PaymentRequest",
+      "description": "Manual bKash or Nagad subscription transaction request",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "maxLength": 128 },
+        "studentName": { "type": "string", "maxLength": 100 },
+        "studentPhone": { "type": "string", "maxLength": 20 },
+        "method": { "type": "string", "enum": ["bKash", "Nagad", "Rocket"] },
+        "senderNumber": { "type": "string", "maxLength": 20 },
+        "transactionId": { "type": "string", "maxLength": 64 },
+        "amount": { "type": "number" },
+        "packageTitle": { "type": "string", "maxLength": 150 },
+        "status": { "type": "string", "enum": ["pending", "approved", "rejected"] },
+        "requestedAt": { "type": "string" },
+        "verifiedAt": { "type": "string" },
+        "verifiedBy": { "type": "string", "maxLength": 100 }
+      },
+      "required": ["userId", "method", "senderNumber", "transactionId", "amount", "status", "requestedAt"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Administrative actions and state changes audit record",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "maxLength": 128 },
+        "userName": { "type": "string", "maxLength": 100 },
+        "action": { "type": "string", "maxLength": 100 },
+        "details": { "type": "string", "maxLength": 500 },
+        "timestamp": { "type": "string" }
+      },
+      "required": ["userId", "action", "details", "timestamp"]
+    },
+    "UserSubscription": {
+      "title": "UserSubscription",
+      "description": "Active and historical paid student subscriptions",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "maxLength": 128 },
+        "studentName": { "type": "string", "maxLength": 100 },
+        "studentPhone": { "type": "string", "maxLength": 20 },
+        "packageId": { "type": "string", "maxLength": 64 },
+        "packageNameBn": { "type": "string", "maxLength": 150 },
+        "packageNameEn": { "type": "string", "maxLength": 150 },
+        "pricePaid": { "type": "number" },
+        "paymentRequestId": { "type": "string", "maxLength": 64 },
+        "paymentMethod": { "type": "string", "enum": ["bKash", "Nagad"] },
+        "transactionId": { "type": "string", "maxLength": 64 },
+        "activatedAt": { "type": "string" },
+        "expiresAt": { "type": "string" },
+        "validityType": { "type": "string", "enum": ["days", "exam_date"] },
+        "status": { "type": "string", "enum": ["active", "expired", "revoked"] }
+      },
+      "required": ["userId", "packageId", "pricePaid", "activatedAt", "expiresAt", "status"]
+    },
+    "LeaderboardEntry": {
+      "title": "LeaderboardEntry",
+      "description": "Ranked mock test performance record for public merit list and competition",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "maxLength": 128 },
+        "studentName": { "type": "string", "maxLength": 100 },
+        "examId": { "type": "string", "maxLength": 64 },
+        "examTitleBn": { "type": "string", "maxLength": 200 },
+        "examTitleEn": { "type": "string", "maxLength": 200 },
+        "score": { "type": "number" },
+        "totalMarks": { "type": "number" },
+        "percentage": { "type": "number" },
+        "correctAnswersCount": { "type": "number" },
+        "incorrectAnswersCount": { "type": "number" },
+        "timeSpentSeconds": { "type": "number" },
+        "completedAt": { "type": "string" }
+      },
+      "required": ["userId", "studentName", "examId", "score", "totalMarks", "completedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/User" },
+      "description": "User profiles and subscription states"
+    },
+    "/subjects/{subjectId}": {
+      "schema": { "$ref": "#/entities/Subject" },
+      "description": "Bar Council syllabus subjects"
+    },
+    "/questions/{questionId}": {
+      "schema": { "$ref": "#/entities/Question" },
+      "description": "Statutory multiple choice questions"
+    },
+    "/exams/{examId}": {
+      "schema": { "$ref": "#/entities/Exam" },
+      "description": "Exam definitions and configurations"
+    },
+    "/examAttempts/{attemptId}": {
+      "schema": { "$ref": "#/entities/ExamAttempt" },
+      "description": "Student exam attempts with server deadlines"
+    },
+    "/examResults/{resultId}": {
+      "schema": { "$ref": "#/entities/ExamResult" },
+      "description": "Computed final scores and question evaluation"
+    },
+    "/leaderboard/{entryId}": {
+      "schema": { "$ref": "#/entities/LeaderboardEntry" },
+      "description": "Publicly viewable top performers scores from completed mock tests"
+    },
+    "/paymentRequests/{requestId}": {
+      "schema": { "$ref": "#/entities/PaymentRequest" },
+      "description": "bKash and Nagad payment verification submissions"
+    },
+    "/subscriptions/{subscriptionId}": {
+      "schema": { "$ref": "#/entities/UserSubscription" },
+      "description": "Student paid subscription entitlements"
+    },
+    "/auditLogs/{logId}": {
+      "schema": { "$ref": "#/entities/AuditLog" },
+      "description": "Administrative compliance audit log"
+    }
+  }
+}

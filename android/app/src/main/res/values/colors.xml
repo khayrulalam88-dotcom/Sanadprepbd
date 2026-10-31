@@ -1,0 +1,13 @@
+<resources>
+    <!-- BarPrep BD Brand Colors -->
+    <color name="primary_navy">#102A43</color>
+    <color name="secondary_navy">#243B53</color>
+    <color name="gold_accent">#D4AF37</color>
+    <color name="background_light">#F5F7FA</color>
+    <color name="white">#FFFFFF</color>
+    <color name="main_text">#243447</color>
+    <color name="success_green">#218838</color>
+    <color name="error_red">#C62828</color>
+    <color name="bkash_pink">#D12053</color>
+    <color name="nagad_orange">#F7941D</color>
+</resources>
