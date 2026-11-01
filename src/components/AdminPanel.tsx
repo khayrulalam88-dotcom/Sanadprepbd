@@ -35,11 +35,15 @@ import {
   ExternalLink,
   FileSpreadsheet,
   UserCog,
-  Play
+  Play,
+  TrendingUp,
+  DollarSign,
+  Receipt
 } from 'lucide-react';
 import { Question, QuestionDifficulty, QuestionStatus, Exam, SubscriptionPackage, ExamDateConfig } from '../types';
 import { BulkImportModal } from './BulkImportModal';
 import { EditUserModal, EditableUserData } from './EditUserModal';
+import { AdminCreateExamModal } from './AdminCreateExamModal';
 
 export const AdminPanel: React.FC = () => {
   const { 
@@ -78,6 +82,88 @@ export const AdminPanel: React.FC = () => {
   } = useApp();
 
   const [activeTab, setActiveTab] = useState<'overview' | 'packages' | 'subscribers' | 'payments' | 'questions' | 'exams' | 'sessions' | 'audit'>('overview');
+
+  // 8 Authoritative Admin Overview Metrics (Section 5 Requirement)
+  const totalStudents = React.useMemo(() => {
+    const studentIds = new Set<string>();
+    subscriptions.forEach(s => s.userId && studentIds.add(s.userId));
+    paymentRequests.forEach(p => p.userId && studentIds.add(p.userId));
+    examResults.forEach(r => r.userId && studentIds.add(r.userId));
+    return Math.max(studentIds.size, 1);
+  }, [subscriptions, paymentRequests, examResults]);
+
+  const activeSubscribers = React.useMemo(() => {
+    const now = Date.now();
+    return subscriptions.filter(s => s.status === 'active' && new Date(s.expiresAt).getTime() > now).length;
+  }, [subscriptions]);
+
+  const pendingPayments = React.useMemo(() => {
+    return paymentRequests.filter(p => p.status === 'pending').length;
+  }, [paymentRequests]);
+
+  const approvedPayments = React.useMemo(() => {
+    return paymentRequests.filter(p => p.status === 'approved').length;
+  }, [paymentRequests]);
+
+  const rejectedPayments = React.useMemo(() => {
+    return paymentRequests.filter(p => p.status === 'rejected').length;
+  }, [paymentRequests]);
+
+  const expiredSubscriptions = React.useMemo(() => {
+    const now = Date.now();
+    return subscriptions.filter(s => s.status === 'expired' || new Date(s.expiresAt).getTime() <= now).length;
+  }, [subscriptions]);
+
+  const totalVerifiedRevenue = React.useMemo(() => {
+    return paymentRequests
+      .filter(p => p.status === 'approved')
+      .reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+  }, [paymentRequests]);
+
+  const monthlyRevenueReport = React.useMemo(() => {
+    const map = new Map<string, {
+      monthKey: string;
+      totalRevenue: number;
+      approvedCount: number;
+      bkashAmount: number;
+      nagadAmount: number;
+      packages: Record<string, number>;
+    }>();
+
+    paymentRequests
+      .filter(p => p.status === 'approved')
+      .forEach(p => {
+        const date = p.verifiedAt ? new Date(p.verifiedAt) : new Date(p.requestedAt || Date.now());
+        const y = date.getFullYear();
+        const m = String(date.getMonth() + 1).padStart(2, '0');
+        const key = `${y}-${m}`;
+
+        if (!map.has(key)) {
+          map.set(key, {
+            monthKey: key,
+            totalRevenue: 0,
+            approvedCount: 0,
+            bkashAmount: 0,
+            nagadAmount: 0,
+            packages: {}
+          });
+        }
+
+        const entry = map.get(key)!;
+        const amount = Number(p.amount) || 0;
+        entry.totalRevenue += amount;
+        entry.approvedCount += 1;
+        if (p.method?.toLowerCase() === 'bkash') {
+          entry.bkashAmount += amount;
+        } else {
+          entry.nagadAmount += amount;
+        }
+        const pkgName = p.packageNameBn || p.packageNameEn || p.packageId;
+        entry.packages[pkgName] = (entry.packages[pkgName] || 0) + 1;
+      });
+
+    return Array.from(map.values()).sort((a, b) => b.monthKey.localeCompare(a.monthKey));
+  }, [paymentRequests]);
 
   // Admin Login Portal state
   const [adminEmailInput, setAdminEmailInput] = useState<string>('khayrulalam88@gmail.com');
@@ -140,6 +226,11 @@ export const AdminPanel: React.FC = () => {
   const [examSearch, setExamSearch] = useState<string>('');
   const [editingExamDateId, setEditingExamDateId] = useState<string | null>(null);
   const [scheduledDateInput, setScheduledDateInput] = useState<string>('');
+
+  // Admin Question Bank Exam Creator states
+  const [showAdminCreateExamModal, setShowAdminCreateExamModal] = useState<boolean>(false);
+  const [adminSelectedQuestionIds, setAdminSelectedQuestionIds] = useState<string[]>([]);
+  const [adminCheckedQuestions, setAdminCheckedQuestions] = useState<Set<string>>(new Set());
 
   // Rejection modal
   const [rejectingPaymentId, setRejectingPaymentId] = useState<string | null>(null);
@@ -566,27 +657,176 @@ export const AdminPanel: React.FC = () => {
       {/* TAB 1: Overview */}
       {activeTab === 'overview' && (
         <div className="space-y-6">
+          {/* 8 Essential Admin Performance Metrics (Section 5 Requirement) */}
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs">
-              <span className="text-xs text-slate-500 font-semibold">{t('সক্রিয় সাবস্ক্রাইবার', 'Active Subscribers')}</span>
-              <p className="text-2xl font-black text-emerald-700 mt-1">
-                {subscriptions.filter(s => s.status === 'active' && new Date(s.expiresAt).getTime() > Date.now()).length}
-              </p>
+            
+            {/* Metric 1: Total Students */}
+            <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs flex items-center justify-between">
+              <div>
+                <span className="text-xs text-slate-500 font-semibold">{t('মোট শিক্ষার্থী', 'Total Students')}</span>
+                <p className="text-2xl font-black text-[#102A43] mt-1">{totalStudents}</p>
+              </div>
+              <div className="w-10 h-10 rounded-xl bg-slate-100 text-[#102A43] flex items-center justify-center shrink-0">
+                <Users className="w-5 h-5" />
+              </div>
             </div>
-            <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs">
-              <span className="text-xs text-slate-500 font-semibold">{t('অপেক্ষমান পেমেন্ট', 'Pending Payments')}</span>
-              <p className="text-2xl font-black text-amber-600 mt-1">
-                {paymentRequests.filter(p => p.status === 'pending').length}
-              </p>
+
+            {/* Metric 2: Active Subscribers */}
+            <div className="bg-white p-5 rounded-2xl border border-emerald-200 shadow-xs flex items-center justify-between bg-emerald-50/20">
+              <div>
+                <span className="text-xs text-emerald-800 font-semibold">{t('সক্রিয় সাবস্ক্রাইবার', 'Active Subscribers')}</span>
+                <p className="text-2xl font-black text-emerald-700 mt-1">{activeSubscribers}</p>
+              </div>
+              <div className="w-10 h-10 rounded-xl bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0">
+                <ShieldCheck className="w-5 h-5" />
+              </div>
             </div>
-            <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs">
-              <span className="text-xs text-slate-500 font-semibold">{t('মোট প্রকাশিত প্রশ্ন', 'Total Questions')}</span>
-              <p className="text-2xl font-bold text-slate-900 mt-1">{questions.length}</p>
+
+            {/* Metric 3: Pending Payments */}
+            <div className="bg-white p-5 rounded-2xl border border-amber-200 shadow-xs flex items-center justify-between bg-amber-50/30">
+              <div>
+                <span className="text-xs text-amber-800 font-semibold">{t('অপেক্ষমান পেমেন্ট', 'Pending Payments')}</span>
+                <p className="text-2xl font-black text-amber-600 mt-1">{pendingPayments}</p>
+              </div>
+              <div className="w-10 h-10 rounded-xl bg-amber-100 text-amber-700 flex items-center justify-center shrink-0">
+                <Clock className="w-5 h-5" />
+              </div>
             </div>
-            <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs">
-              <span className="text-xs text-slate-500 font-semibold">{t('মোট পরীক্ষা সম্পন্ন', 'Exam Attempts')}</span>
-              <p className="text-2xl font-bold text-slate-900 mt-1">{examResults.length}</p>
+
+            {/* Metric 4: Approved Payments */}
+            <div className="bg-white p-5 rounded-2xl border border-emerald-200 shadow-xs flex items-center justify-between">
+              <div>
+                <span className="text-xs text-slate-500 font-semibold">{t('অনুমোদিত পেমেন্ট', 'Approved Payments')}</span>
+                <p className="text-2xl font-black text-emerald-800 mt-1">{approvedPayments}</p>
+              </div>
+              <div className="w-10 h-10 rounded-xl bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0">
+                <CheckCircle2 className="w-5 h-5" />
+              </div>
             </div>
+
+            {/* Metric 5: Rejected Payments */}
+            <div className="bg-white p-5 rounded-2xl border border-rose-200 shadow-xs flex items-center justify-between bg-rose-50/30">
+              <div>
+                <span className="text-xs text-rose-800 font-semibold">{t('বাতিলকৃত পেমেন্ট', 'Rejected Payments')}</span>
+                <p className="text-2xl font-black text-rose-700 mt-1">{rejectedPayments}</p>
+              </div>
+              <div className="w-10 h-10 rounded-xl bg-rose-100 text-rose-700 flex items-center justify-center shrink-0">
+                <XCircle className="w-5 h-5" />
+              </div>
+            </div>
+
+            {/* Metric 6: Expired Subscriptions */}
+            <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs flex items-center justify-between">
+              <div>
+                <span className="text-xs text-slate-500 font-semibold">{t('মেয়াদোত্তীর্ণ সাবস্ক্রিপশন', 'Expired Subscriptions')}</span>
+                <p className="text-2xl font-black text-slate-600 mt-1">{expiredSubscriptions}</p>
+              </div>
+              <div className="w-10 h-10 rounded-xl bg-slate-100 text-slate-500 flex items-center justify-center shrink-0">
+                <Clock className="w-5 h-5" />
+              </div>
+            </div>
+
+            {/* Metric 7: Total Verified Revenue */}
+            <div className="bg-gradient-to-br from-[#102A43] to-[#243B53] text-white p-5 rounded-2xl border border-[#D4AF37]/40 shadow-xs flex items-center justify-between col-span-2 md:col-span-1">
+              <div>
+                <span className="text-xs text-[#D4AF37] font-bold">{t('মোট সংগৃহীত রাজস্ব', 'Total Verified Revenue')}</span>
+                <p className="text-2xl font-black text-white mt-1">৳{totalVerifiedRevenue.toLocaleString()}</p>
+              </div>
+              <div className="w-10 h-10 rounded-xl bg-[#D4AF37]/20 text-[#D4AF37] flex items-center justify-center shrink-0">
+                <Coins className="w-5 h-5" />
+              </div>
+            </div>
+
+            {/* Metric 8: Quick Stats Summary / Active Ratio */}
+            <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs flex items-center justify-between col-span-2 md:col-span-1">
+              <div>
+                <span className="text-xs text-slate-500 font-semibold">{t('পেইড কনভার্শন অনুপাত', 'Subscribers Ratio')}</span>
+                <p className="text-2xl font-black text-[#102A43] mt-1">
+                  {totalStudents > 0 ? `${Math.round((activeSubscribers / totalStudents) * 100)}%` : '0%'}
+                </p>
+              </div>
+              <div className="w-10 h-10 rounded-xl bg-blue-50 text-blue-700 flex items-center justify-center shrink-0">
+                <TrendingUp className="w-5 h-5" />
+              </div>
+            </div>
+          </div>
+
+          {/* Monthly Revenue Report (Section 5 Requirement) */}
+          <div className="bg-white rounded-3xl border border-slate-200 p-6 shadow-xs space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-100">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-emerald-50 text-emerald-700 flex items-center justify-center shrink-0">
+                  <Receipt className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-black text-slate-900 text-base">
+                    {t('মাসিক রাজস্ব প্রতিবেদন (Monthly Revenue Report)', 'Monthly Verified Revenue Report')}
+                  </h3>
+                  <p className="text-xs text-slate-500">
+                    {t('অনুমোদিত পেমেন্ট ও প্যাকেজভিত্তিক আয়ের মাসিক পরিসংখ্যান', 'Month-by-month verified revenue & package breakdowns')}
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <span className="px-3 py-1 rounded-full text-xs font-mono font-bold bg-[#102A43] text-[#D4AF37]">
+                  {t('সর্বমোট রাজস্ব:', 'Total:')} ৳{totalVerifiedRevenue.toLocaleString()}
+                </span>
+              </div>
+            </div>
+
+            {monthlyRevenueReport.length === 0 ? (
+              <div className="py-8 text-center text-slate-400 text-xs">
+                {t('কোনো অনুমোদিত পেমেন্ট রেকর্ড নেই। নতুন পেমেন্ট অনুমোদনের পর এখানে স্বয়ংক্রিয়ভাবে মাসিক প্রতিবেদন প্রদর্শিত হবে।', 'No approved payment records yet.')}
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead className="bg-slate-50 text-slate-700 font-bold uppercase text-[11px] border-b border-slate-200">
+                    <tr>
+                      <th className="p-3">{t('মাস (Month)', 'Month')}</th>
+                      <th className="p-3">{t('মোট রাজস্ব (Revenue)', 'Total Revenue')}</th>
+                      <th className="p-3">{t('অনুমোদিত লেনদেন', 'Approved Count')}</th>
+                      <th className="p-3">{t('বিকাশ (bKash)', 'bKash')}</th>
+                      <th className="p-3">{t('নগদ (Nagad)', 'Nagad')}</th>
+                      <th className="p-3">{t('প্যাকেজ বিস্তার', 'Packages')}</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {monthlyRevenueReport.map((m) => (
+                      <tr key={m.monthKey} className="hover:bg-slate-50/80 transition">
+                        <td className="p-3 font-mono font-bold text-[#102A43]">
+                          {m.monthKey}
+                        </td>
+                        <td className="p-3 font-mono font-black text-emerald-700 text-sm">
+                          ৳{m.totalRevenue.toLocaleString()}
+                        </td>
+                        <td className="p-3">
+                          <span className="px-2 py-0.5 rounded bg-slate-100 font-mono font-bold text-slate-800">
+                            {m.approvedCount} টি
+                          </span>
+                        </td>
+                        <td className="p-3 font-mono text-slate-600">
+                          ৳{m.bkashAmount.toLocaleString()}
+                        </td>
+                        <td className="p-3 font-mono text-slate-600">
+                          ৳{m.nagadAmount.toLocaleString()}
+                        </td>
+                        <td className="p-3">
+                          <div className="flex flex-wrap gap-1">
+                            {Object.entries(m.packages).map(([pkg, cnt]) => (
+                              <span key={pkg} className="px-2 py-0.5 bg-slate-100 rounded text-[10px] text-slate-700 font-medium">
+                                {pkg}: <strong>{cnt}</strong>
+                              </span>
+                            ))}
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
 
           {/* Quick Target Exam Date Card */}
@@ -1427,6 +1667,22 @@ export const AdminPanel: React.FC = () => {
             <div className="flex items-center gap-2">
               <button
                 type="button"
+                onClick={() => {
+                  setAdminSelectedQuestionIds(Array.from(adminCheckedQuestions));
+                  setShowAdminCreateExamModal(true);
+                }}
+                className="px-3.5 py-2 rounded-xl bg-[#102A43] hover:bg-[#243B53] text-[#D4AF37] border border-[#D4AF37] font-bold text-xs flex items-center gap-1.5 transition cursor-pointer shadow-xs"
+              >
+                <Sparkles className="w-4 h-4 text-[#D4AF37]" />
+                <span>
+                  {adminCheckedQuestions.size > 0 
+                    ? t(`নির্বাচিত ${adminCheckedQuestions.size}টি প্রশ্ন দিয়ে টেস্ট তৈরি`, `Create Test with ${adminCheckedQuestions.size} MCQs`)
+                    : t('প্রশ্ন দ্বারা মডেল টেস্ট তৈরি', 'Create Test from Bank')}
+                </span>
+              </button>
+
+              <button
+                type="button"
                 onClick={() => setShowBulkImportModal(true)}
                 className="px-3.5 py-2 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white font-bold text-xs flex items-center gap-1.5 transition cursor-pointer shadow-xs"
                 title={t('সিএসভি ফাইলের মাধ্যমে বাল্ক প্রশ্ন আপলোড করুন', 'Bulk import multiple questions from a CSV file')}
@@ -1446,13 +1702,55 @@ export const AdminPanel: React.FC = () => {
             </div>
           </div>
 
+          {adminCheckedQuestions.size > 0 && (
+            <div className="p-3 bg-amber-50 border border-amber-300 rounded-2xl flex items-center justify-between text-xs animate-in fade-in">
+              <span className="font-bold text-[#102A43]">
+                {t(`মোট নির্বাচিত প্রশ্ন: ${adminCheckedQuestions.size} টি`, `Total Selected: ${adminCheckedQuestions.size} questions`)}
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setAdminCheckedQuestions(new Set())}
+                  className="px-3 py-1 bg-white border border-slate-300 rounded-lg text-slate-700 font-bold hover:bg-slate-100 cursor-pointer"
+                >
+                  {t('সিলেকশন বাতিল', 'Clear')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAdminSelectedQuestionIds(Array.from(adminCheckedQuestions));
+                    setShowAdminCreateExamModal(true);
+                  }}
+                  className="px-4 py-1.5 bg-[#102A43] text-[#D4AF37] font-bold rounded-lg shadow-xs hover:bg-[#243B53] cursor-pointer"
+                >
+                  {t('মডেল টেস্ট তৈরি করুন ও পরীক্ষা নিন', 'Create Model Test & Host Exam')}
+                </button>
+              </div>
+            </div>
+          )}
+
           <div className="bg-white rounded-3xl border border-slate-200 shadow-xs divide-y divide-slate-100 overflow-hidden">
             {filteredQuestions.map((q) => {
               const sub = subjects.find(s => s.id === q.subjectId);
+              const isChecked = adminCheckedQuestions.has(q.id);
               return (
-                <div key={q.id} className="p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4 hover:bg-slate-50 transition">
-                  <div className="space-y-1.5 max-w-3xl">
-                    <div className="flex items-center gap-2">
+                <div key={q.id} className="p-4 sm:p-5 flex flex-col sm:flex-row sm:items-start justify-between gap-4 hover:bg-slate-50 transition">
+                  <div className="flex items-start gap-3 max-w-3xl">
+                    <input
+                      type="checkbox"
+                      checked={isChecked}
+                      onChange={() => {
+                        setAdminCheckedQuestions(prev => {
+                          const next = new Set(prev);
+                          if (next.has(q.id)) next.delete(q.id);
+                          else next.add(q.id);
+                          return next;
+                        });
+                      }}
+                      className="mt-1 rounded text-[#102A43] focus:ring-[#102A43] cursor-pointer"
+                    />
+                    <div className="space-y-1.5">
+                      <div className="flex items-center gap-2">
                       <span className="font-mono text-xs font-bold text-[#102A43] bg-slate-100 px-2 py-0.5 rounded">
                         {sub?.code || 'LAW'}
                       </span>
@@ -1474,6 +1772,7 @@ export const AdminPanel: React.FC = () => {
                       {t('সঠিক উত্তর:', 'Correct Ans:')} <strong className="text-emerald-700">{q.optionsBn[q.correctOptionIndex]}</strong>
                     </p>
                   </div>
+                </div>
 
                   <div className="flex items-center gap-2 shrink-0">
                     <button
@@ -1494,6 +1793,49 @@ export const AdminPanel: React.FC = () => {
       {/* TAB 7: Exams */}
       {activeTab === 'exams' && (
         <div className="space-y-6">
+          
+          {/* Dedicated Question Bank Test Creator Callout (User Requirement) */}
+          <div className="bg-gradient-to-r from-amber-500/10 via-[#102A43]/5 to-transparent rounded-3xl p-6 border-2 border-[#D4AF37] shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-5">
+            <div className="flex items-start gap-4">
+              <div className="w-12 h-12 rounded-2xl bg-[#102A43] text-[#D4AF37] flex items-center justify-center shrink-0 shadow-sm mt-0.5">
+                <Sparkles className="w-6 h-6 text-[#D4AF37]" />
+              </div>
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <span className="px-2.5 py-0.5 rounded-full text-[10px] font-black bg-[#102A43] text-[#D4AF37] uppercase">
+                    ADMIN EXAM BUILDER
+                  </span>
+                  <span className="text-xs font-bold text-[#102A43]">
+                    {t('৩,০০০+ প্রশ্নের সমৃদ্ধ সংগ্রহশালা', '3,000+ Question Repository')}
+                  </span>
+                </div>
+                <h3 className="text-base sm:text-lg font-black text-[#102A43]">
+                  {t('প্রশ্ন সম্ভার থেকে নিজের মতো করে মডেল টেস্ট তৈরি করুন ও পরীক্ষা নিন', 'Create Model Tests from Question Bank & Conduct Exams')}
+                </h3>
+                <p className="text-xs sm:text-sm text-slate-600 max-w-xl">
+                  {t(
+                    'প্রশ্ন সম্ভার থেকে প্রশ্ন বাছাই করুন অথবা আইনভিত্তিক প্রশ্ন সংখ্যা (১০/২৫/৫০/১০০), নেগেটিভ মার্কিং ও সময় নির্ধারণ করে কাস্টম মডেল টেস্ট তৈরি করুন এবং শিক্ষার্থীদের জন্য পরীক্ষা চালু করুন।',
+                    'Curate model tests using the question repository, customize rules and negative marking, and conduct exams for candidates.'
+                  )}
+                </p>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+              <button
+                type="button"
+                onClick={() => {
+                  setAdminSelectedQuestionIds([]);
+                  setShowAdminCreateExamModal(true);
+                }}
+                className="px-5 py-3 rounded-xl bg-[#102A43] hover:bg-[#243B53] text-[#D4AF37] border border-[#D4AF37] font-black text-xs sm:text-sm transition flex items-center gap-2 cursor-pointer shadow-sm"
+              >
+                <Plus className="w-4 h-4 text-[#D4AF37]" />
+                <span>{t('প্রশ্ন সম্ভার থেকে মডেল টেস্ট তৈরি করুন', 'Create Model Test')}</span>
+              </button>
+            </div>
+          </div>
+
           {/* Header & Re-sync */}
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-white p-5 rounded-3xl border border-slate-200 shadow-xs">
             <div>
@@ -1511,11 +1853,23 @@ export const AdminPanel: React.FC = () => {
             <div className="flex items-center gap-2">
               <button
                 type="button"
+                onClick={() => {
+                  setAdminSelectedQuestionIds([]);
+                  setShowAdminCreateExamModal(true);
+                }}
+                className="px-4 py-2.5 rounded-xl bg-[#102A43] hover:bg-[#243B53] text-[#D4AF37] border border-[#D4AF37] text-xs font-bold transition flex items-center gap-1.5 shrink-0 cursor-pointer shadow-xs"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>{t('নতুন মডেল টেস্ট তৈরি', 'Create Test')}</span>
+              </button>
+
+              <button
+                type="button"
                 onClick={async () => {
                   const res = await generateAndSync30ModelTests();
                   alert(res.message);
                 }}
-                className="px-4 py-2.5 rounded-xl bg-[#102A43] hover:bg-[#243B53] text-[#D4AF37] border border-[#D4AF37] text-xs font-bold transition flex items-center gap-1.5 shrink-0 cursor-pointer shadow-xs"
+                className="px-4 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-[#102A43] border border-slate-300 text-xs font-bold transition flex items-center gap-1.5 shrink-0 cursor-pointer"
               >
                 <RefreshCw className="w-3.5 h-3.5" />
                 <span>{t('৩০টি টেস্ট রি-সিঙ্ক', 'Re-Sync 30 Tests')}</span>
@@ -1992,6 +2346,13 @@ export const AdminPanel: React.FC = () => {
           }}
         />
       )}
+
+      {/* Admin Question Bank Model Test Creator Modal */}
+      <AdminCreateExamModal
+        isOpen={showAdminCreateExamModal}
+        onClose={() => setShowAdminCreateExamModal(false)}
+        preSelectedQuestionIds={adminSelectedQuestionIds}
+      />
 
     </div>
   );

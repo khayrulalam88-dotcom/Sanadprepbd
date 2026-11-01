@@ -73,8 +73,8 @@ export const SubscriptionPlansSection: React.FC<Props> = ({
         </span>
       </div>
 
-      {/* Packages Cards (Monthly Subscription & One-Time Packages) */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 items-stretch">
+      {/* Packages Cards (Monthly Subscription, Long Course & Exam Pass) */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-6 items-stretch">
         {packages.filter(p => p.isActive).map((pkg) => {
           const isCurrentActive = activeSubscription?.packageId === pkg.id && new Date(activeSubscription.expiresAt).getTime() > Date.now();
           const isExamPass = pkg.id === 'pkg_exam_pass';

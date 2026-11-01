@@ -629,6 +629,91 @@ async function startServer() {
     });
   });
 
+  // 6.5. Admin Dashboard Statistics & Monthly Revenue Report (Requirement 5)
+  app.get('/api/admin/dashboard-stats', (req, res) => {
+    const now = Date.now();
+    const studentUserIds = new Set<string>();
+    db.paymentRequests.forEach(p => { if (p.userId) studentUserIds.add(p.userId); });
+    db.subscriptions.forEach(s => { if (s.userId) studentUserIds.add(s.userId); });
+    db.examResults.forEach(r => { if (r.userId) studentUserIds.add(r.userId); });
+    const totalStudents = Math.max(studentUserIds.size, 1);
+
+    const activeSubscribers = db.subscriptions.filter(
+      s => s.status === 'active' && new Date(s.expiresAt).getTime() > now
+    ).length;
+
+    const pendingPayments = db.paymentRequests.filter(p => p.status === 'pending').length;
+    const approvedPayments = db.paymentRequests.filter(p => p.status === 'approved').length;
+    const rejectedPayments = db.paymentRequests.filter(p => p.status === 'rejected').length;
+
+    const expiredSubscriptions = db.subscriptions.filter(
+      s => s.status === 'expired' || new Date(s.expiresAt).getTime() <= now
+    ).length;
+
+    const totalVerifiedRevenue = db.paymentRequests
+      .filter(p => p.status === 'approved')
+      .reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+
+    // Monthly revenue aggregation
+    const monthlyMap: Record<string, {
+      monthKey: string;
+      monthLabelBn: string;
+      monthLabelEn: string;
+      totalRevenue: number;
+      approvedCount: number;
+      bkashRevenue: number;
+      nagadRevenue: number;
+      packages: Record<string, number>;
+    }> = {};
+
+    const monthNamesEn = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const monthNamesBn = ['জানুয়ারি', 'ফেব্রুয়ারি', 'মার্চ', 'এপ্রিল', 'মে', 'জুন', 'জুলাই', 'আগস্ট', 'সেপ্টেম্বর', 'অক্টোবর', 'নভেম্বর', 'ডিসেম্বর'];
+
+    db.paymentRequests
+      .filter(p => p.status === 'approved')
+      .forEach(p => {
+        const d = new Date(p.verifiedAt || p.requestedAt);
+        const y = d.getFullYear();
+        const m = d.getMonth();
+        const monthKey = `${y}-${String(m + 1).padStart(2, '0')}`;
+        
+        if (!monthlyMap[monthKey]) {
+          monthlyMap[monthKey] = {
+            monthKey,
+            monthLabelBn: `${monthNamesBn[m]} ${y}`,
+            monthLabelEn: `${monthNamesEn[m]} ${y}`,
+            totalRevenue: 0,
+            approvedCount: 0,
+            bkashRevenue: 0,
+            nagadRevenue: 0,
+            packages: {}
+          };
+        }
+
+        const amt = Number(p.amount) || 0;
+        monthlyMap[monthKey].totalRevenue += amt;
+        monthlyMap[monthKey].approvedCount += 1;
+        if (p.method === 'bKash') monthlyMap[monthKey].bkashRevenue += amt;
+        else if (p.method === 'Nagad') monthlyMap[monthKey].nagadRevenue += amt;
+
+        const pkgName = p.packageNameEn || p.packageId;
+        monthlyMap[monthKey].packages[pkgName] = (monthlyMap[monthKey].packages[pkgName] || 0) + amt;
+      });
+
+    const monthlyReport = Object.values(monthlyMap).sort((a, b) => b.monthKey.localeCompare(a.monthKey));
+
+    res.json({
+      totalStudents,
+      activeSubscribers,
+      pendingPayments,
+      approvedPayments,
+      rejectedPayments,
+      expiredSubscriptions,
+      totalVerifiedRevenue,
+      monthlyRevenueReport: monthlyReport
+    });
+  });
+
   // 7. Statutory Subjects, Questions & Exams APIs for Android & Web
   app.get('/api/subjects', (req, res) => {
     res.json({ subjects: db.subjects });

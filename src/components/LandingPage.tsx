@@ -348,53 +348,6 @@ export const LandingPage: React.FC = () => {
             </button>
           </div>
         </div>
-
-        {/* Question Bank & Custom Model Test Feature Callout */}
-        <div className="bg-gradient-to-r from-amber-500/10 via-[#102A43]/5 to-transparent rounded-3xl p-6 sm:p-8 border-2 border-[#D4AF37] shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-6">
-          <div className="flex items-start gap-4">
-            <div className="w-14 h-14 rounded-2xl bg-[#102A43] text-[#D4AF37] flex items-center justify-center shrink-0 shadow-md">
-              <Sparkles className="w-7 h-7 text-[#D4AF37]" />
-            </div>
-            <div className="space-y-1.5">
-              <div className="flex items-center gap-2">
-                <span className="px-2.5 py-0.5 rounded-full text-[10px] font-black bg-[#102A43] text-[#D4AF37] uppercase">
-                  CUSTOM TEST MAKER
-                </span>
-                <span className="text-xs font-bold text-[#102A43]">
-                  {t('৩,০০০+ প্রশ্নের বিশাল সম্ভার', '3,000+ Question Repository')}
-                </span>
-              </div>
-              <h3 className="text-lg sm:text-xl font-black text-[#102A43]">
-                {t('যে প্রশ্নগুলো প্রশ্ন সম্ভারে আছে সেগুলো থেকে আপনি নিজে মডেল টেস্ট নিতে পারবেন!', 'Create and take personalized model tests directly from the question bank!')}
-              </h3>
-              <p className="text-xs sm:text-sm text-slate-600 max-w-xl leading-relaxed">
-                {t(
-                  'প্রশ্ন সম্ভার ব্রাউজ করে নিজের পছন্দের প্রশ্নগুলো টিকচিহ্ন দিয়ে বাছাই করুন অথবা আইনসমূহ, প্রশ্নের সংখ্যা (১০/২৫/৫০/১০০) ও সময় নির্ধারণ করে এখনই কাস্টম মডেল টেস্ট শুরু করুন।',
-                  'Pick questions individually or customize duration and quotas to take self-curated mock exams anytime.'
-                )}
-              </p>
-            </div>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-3 shrink-0">
-            <button
-              onClick={() => setActiveScreen('question_bank')}
-              className="px-5 py-3 rounded-xl bg-white border border-slate-300 text-[#102A43] hover:bg-slate-50 font-bold text-xs sm:text-sm transition flex items-center gap-2 cursor-pointer shadow-xs"
-            >
-              <BookOpen className="w-4 h-4 text-[#102A43]" />
-              <span>{t('প্রশ্ন সম্ভার খুলুন', 'Open Question Bank')}</span>
-            </button>
-
-            <button
-              onClick={() => setActiveScreen('question_bank')}
-              className="px-6 py-3 rounded-xl bg-[#102A43] hover:bg-[#243B53] text-[#D4AF37] border border-[#D4AF37] font-black text-xs sm:text-sm transition flex items-center gap-2 shadow-md cursor-pointer"
-            >
-              <Play className="w-4 h-4 fill-current text-[#D4AF37]" />
-              <span>{t('কাস্টম টেস্ট শুরু করুন', 'Start Custom Test')}</span>
-            </button>
-          </div>
-        </div>
-
       </section>
 
       {/* 7 Core Statutory Subjects Breakdown */}

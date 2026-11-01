@@ -29,11 +29,14 @@ export const CustomTestModal: React.FC<CustomTestModalProps> = ({
   const { 
     language, 
     t, 
+    currentUser,
     subjects, 
     questions, 
     createAndStartCustomExam, 
     setActiveScreen 
   } = useApp();
+
+  const isAdmin = currentUser.role === 'admin' || currentUser.email === 'khayrulalam88@gmail.com';
 
   // Mode: 'auto_mix' (All 7 subjects), 'select_subjects' (Custom subjects), or 'pre_selected' (if user selected in bank)
   const [selectedSubjectIds, setSelectedSubjectIds] = useState<string[]>([]);
@@ -43,7 +46,7 @@ export const CustomTestModal: React.FC<CustomTestModalProps> = ({
   const [testTitle, setTestTitle] = useState<string>('');
   const [difficultyFilter, setDifficultyFilter] = useState<'all' | 'easy' | 'medium' | 'hard'>('all');
 
-  if (!isOpen) return null;
+  if (!isOpen || !isAdmin) return null;
 
   const hasPreSelected = preSelectedQuestionIds.length > 0;
 

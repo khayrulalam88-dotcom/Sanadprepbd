@@ -23,7 +23,8 @@ import {
   FileText,
   Calendar,
   Check,
-  X
+  X,
+  ShieldAlert
 } from 'lucide-react';
 import { Question } from '../types';
 
@@ -31,6 +32,7 @@ export const QuestionBankView: React.FC = () => {
   const { 
     language, 
     t, 
+    currentUser,
     questions, 
     subjects, 
     exams, 
@@ -39,6 +41,8 @@ export const QuestionBankView: React.FC = () => {
     createAndStartCustomExam,
     setActiveScreen 
   } = useApp();
+
+  const isAdmin = currentUser.role === 'admin' || currentUser.email === 'khayrulalam88@gmail.com';
 
   const [activeTab, setActiveTab] = useState<'browse' | 'generator' | 'my_tests'>('browse');
   const [searchQuery, setSearchQuery] = useState<string>('');
@@ -182,6 +186,33 @@ export const QuestionBankView: React.FC = () => {
 
   const optionPrefixesBn = ['ক', 'খ', 'গ', 'ঘ'];
 
+  if (!isAdmin) {
+    return (
+      <div className="max-w-2xl mx-auto my-12 p-8 bg-white rounded-3xl border border-slate-200 shadow-sm text-center space-y-4">
+        <div className="w-16 h-16 rounded-2xl bg-amber-50 text-amber-700 mx-auto flex items-center justify-center">
+          <ShieldAlert className="w-8 h-8 text-[#D4AF37]" />
+        </div>
+        <h2 className="text-xl font-black text-[#102A43]">
+          {t('শুধুমাত্র অ্যাডমিনের জন্য সংরক্ষিত', 'Admin Access Only')}
+        </h2>
+        <p className="text-xs sm:text-sm text-slate-600 leading-relaxed max-w-md mx-auto">
+          {t(
+            'অ্যাডমিন ছাড়া কেউ কাস্টম টেস্ট তৈরি বা পরিচালনা করতে পারবে না। শিক্ষার্থীরা শুধুমাত্র অ্যাডমিন কর্তৃক পরিচালিত অফিসিয়াল মডেল টেস্টসমূহে অংশ নিতে পারবে।',
+            'Custom tests can only be curated and conducted by the Admin. Students can participate in official mock tests published by the Admin.'
+          )}
+        </p>
+        <div className="pt-2">
+          <button
+            onClick={() => setActiveScreen('dashboard')}
+            className="px-6 py-2.5 rounded-xl bg-[#102A43] hover:bg-[#243B53] text-[#D4AF37] border border-[#D4AF37] font-bold text-xs transition cursor-pointer shadow-xs"
+          >
+            {t('ড্যাশবোর্ডে ফিরে যান', 'Back to Dashboard')}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-6 pb-20 max-w-7xl mx-auto">
       
@@ -196,12 +227,12 @@ export const QuestionBankView: React.FC = () => {
               <span>{t('প্রশ্ন সম্ভার ও কাস্টম মডেল টেস্ট', 'Question Repository & Custom Mock Tests')}</span>
             </div>
             <h1 className="text-2xl sm:text-3xl font-black text-white tracking-tight">
-              {t('প্রশ্ন সম্ভার থেকে নিজের মতো করে মডেল টেস্ট দিন', 'Take Self-Curated Model Tests from Question Bank')}
+              {t('প্রশ্ন সম্ভার থেকে মডেল টেস্ট তৈরি ও পরীক্ষা পরিচালনা', 'Curate Model Tests from Question Bank & Conduct Exams')}
             </h1>
             <p className="text-xs sm:text-sm text-slate-300 max-w-2xl leading-relaxed">
               {t(
-                '৩,০০০+ অফিসিয়াল ও প্রমিত প্রশ্নের সংগ্রহশালা থেকে ইচ্ছামতো প্রশ্ন বেছে নিন অথবা সিলেবাস অনুযায়ী স্বয়ংক্রিয়ভাবে ২৫, ৫০ বা ১০০ নম্বরের কাস্টম মডেল টেস্ট তৈরি করে সরাসরি অংশ নিন।',
-                'Select individual questions or auto-generate custom mock tests (25, 50, 100 MCQs) with exact time limits and negative scoring.'
+                '৩,০০০+ অফিসিয়াল ও প্রমিত প্রশ্নের সংগ্রহশালা থেকে ইচ্ছামতো প্রশ্ন বেছে নিয়ে মডেল টেস্ট তৈরি করুন এবং শিক্ষার্থীদের জন্য পরীক্ষা চালু ও পরিচালনা করুন।',
+                'Curate mock tests using 3,000+ official questions from the repository and launch timed exams for students.'
               )}
             </p>
           </div>

@@ -27,11 +27,15 @@ service cloud.firestore {
       );
     }
 
-    // Users collection
+    // Users collection (Users cannot escalate their own role or subscription status)
     match /users/{userId} {
       allow read: if isOwner(userId) || isStaff();
-      allow create: if isAuthenticated() && request.auth.uid == userId;
-      allow update: if isOwner(userId) || isAdmin();
+      allow create: if isAuthenticated() && request.auth.uid == userId && (request.resource.data.role == 'student' || isAdmin());
+      allow update: if isAdmin() || (
+        isOwner(userId) && 
+        (!('role' in request.resource.data) || request.resource.data.role == resource.data.role) &&
+        (!('subscriptionStatus' in request.resource.data) || request.resource.data.subscriptionStatus == resource.data.subscriptionStatus)
+      );
       allow delete: if isAdmin();
     }
 
@@ -82,17 +86,19 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
 
-    // Payment requests
+    // Payment requests (Students can only submit with status 'pending'; only Admin can approve/reject/update)
     match /paymentRequests/{paymentId} {
       allow read: if isOwner(resource.data.userId) || isAdmin();
-      allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
+      allow create: if isAuthenticated() && 
+        request.resource.data.userId == request.auth.uid && 
+        request.resource.data.status == 'pending';
       allow update: if isAdmin();
       allow delete: if isAdmin();
     }
 
-    // Subscriptions collection
+    // Subscriptions collection (Read-only for owner; STRICTLY written by Admin)
     match /subscriptions/{subscriptionId} {
-      allow read: if isOwner(resource.data.userId) || isAdmin();
+      allow read: if (isAuthenticated() && resource.data.userId == request.auth.uid) || isAdmin();
       allow write: if isAdmin();
     }
 

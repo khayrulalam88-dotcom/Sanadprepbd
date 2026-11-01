@@ -26,8 +26,10 @@ import {
   Calendar,
   Smartphone,
   RefreshCw,
-  Zap
+  Zap,
+  Receipt
 } from 'lucide-react';
+import { StudentPaymentHistoryModal } from './StudentPaymentHistoryModal';
 
 export const Dashboard: React.FC = () => {
   const { 
@@ -48,9 +50,10 @@ export const Dashboard: React.FC = () => {
     isSessionRevoked,
     sessionRevokedReason,
     recoverSession,
-    answeredQuestions,
-    setShowCustomTestModal
+    answeredQuestions
   } = useApp();
+
+  const [showPaymentHistoryModal, setShowPaymentHistoryModal] = React.useState<boolean>(false);
 
   // Extract student first name
   const getFirstName = () => {
@@ -229,64 +232,10 @@ export const Dashboard: React.FC = () => {
               <span>{t('আইনভিত্তিক অনুশীলন', 'Practice by Code')}</span>
             </button>
 
-            <button
-              onClick={() => setActiveScreen('question_bank')}
-              className="inline-flex items-center gap-2 px-5 py-3 rounded-xl bg-white/10 hover:bg-white/20 text-[#D4AF37] border border-[#D4AF37]/50 font-bold transition text-xs sm:text-sm cursor-pointer"
-            >
-              <Sparkles className="w-4 h-4 text-[#D4AF37]" />
-              <span>{t('প্রশ্ন সম্ভার ও কাস্টম টেস্ট', 'Question Bank & Custom Tests')}</span>
-            </button>
-
             <WhatsAppSupportButton 
               className="px-5 py-3"
             />
           </div>
-        </div>
-      </div>
-
-      {/* NEW: Dedicated Question Bank & Custom Model Test Callout Card */}
-      <div className="bg-gradient-to-r from-amber-500/10 via-[#102A43]/5 to-transparent rounded-3xl p-6 border-2 border-[#D4AF37] shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-5">
-        <div className="flex items-start gap-4">
-          <div className="w-12 h-12 rounded-2xl bg-[#102A43] text-[#D4AF37] flex items-center justify-center shrink-0 shadow-sm mt-0.5">
-            <Sparkles className="w-6 h-6 text-[#D4AF37]" />
-          </div>
-          <div className="space-y-1">
-            <div className="flex items-center gap-2">
-              <span className="px-2.5 py-0.5 rounded-full text-[10px] font-black bg-[#102A43] text-[#D4AF37] uppercase">
-                NEW FEATURE
-              </span>
-              <span className="text-xs font-bold text-[#102A43]">
-                {t('৩,০০০+ প্রশ্নের সমৃদ্ধ সংগ্রহশালা', '3,000+ Question Repository')}
-              </span>
-            </div>
-            <h3 className="text-base sm:text-lg font-black text-[#102A43]">
-              {t('প্রশ্ন সম্ভার থেকে নিজের মতো করে মডেল টেস্ট দিন', 'Take Self-Curated Model Tests from Question Bank')}
-            </h3>
-            <p className="text-xs sm:text-sm text-slate-600 max-w-xl">
-              {t(
-                'প্রশ্ন সম্ভারের প্রশ্নসমূহ ব্রাউজ করে টিকচিহ্ন দিয়ে বাছাই করুন অথবা আপনার সুবিধাজনক আইন, প্রশ্নের সংখ্যা (১০/২৫/৫০/১০০) ও সময় নির্ধারণ করে এখনই কাস্টম মডেল টেস্ট শুরু করুন।',
-                'Pick specific questions or configure a custom test by legal subjects, question quota, and time limit.'
-              )}
-            </p>
-          </div>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2.5 shrink-0">
-          <button
-            onClick={() => setActiveScreen('question_bank')}
-            className="px-4 py-2.5 rounded-xl bg-white border border-slate-300 text-[#102A43] hover:bg-slate-50 font-bold text-xs transition flex items-center gap-1.5 cursor-pointer shadow-xs"
-          >
-            <BookOpen className="w-3.5 h-3.5 text-[#102A43]" />
-            <span>{t('প্রশ্ন সম্ভার খুলুন', 'Browse Repository')}</span>
-          </button>
-
-          <button
-            onClick={() => setShowCustomTestModal(true)}
-            className="px-5 py-2.5 rounded-xl bg-[#102A43] hover:bg-[#243B53] text-[#D4AF37] border border-[#D4AF37] font-black text-xs transition flex items-center gap-1.5 cursor-pointer shadow-sm"
-          >
-            <Play className="w-3.5 h-3.5 fill-current text-[#D4AF37]" />
-            <span>{t('কাস্টম টেস্ট শুরু করুন', 'Start Custom Test')}</span>
-          </button>
         </div>
       </div>
 
@@ -365,7 +314,15 @@ export const Dashboard: React.FC = () => {
           </div>
         </div>
 
-        <div className="shrink-0 flex items-center gap-3">
+        <div className="shrink-0 flex flex-wrap items-center gap-2.5">
+          <button
+            onClick={() => setShowPaymentHistoryModal(true)}
+            className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-[#102A43] font-bold text-xs sm:text-sm transition flex items-center justify-center gap-1.5 cursor-pointer shadow-xs border border-slate-300"
+          >
+            <Receipt className="w-4 h-4 text-[#102A43]" />
+            <span>{t('পেমেন্ট ইতিহাস', 'Payment History')}</span>
+          </button>
+
           <button
             onClick={() => openSubscriptionModal()}
             className="w-full sm:w-auto px-5 py-2.5 rounded-xl bg-[#102A43] hover:bg-[#243B53] text-[#D4AF37] border border-[#D4AF37] font-bold text-xs sm:text-sm transition flex items-center justify-center gap-1.5 cursor-pointer shadow-xs"
@@ -447,14 +404,6 @@ export const Dashboard: React.FC = () => {
           </div>
 
           <div className="flex items-center gap-3 text-xs text-slate-500">
-            <button
-              onClick={() => setShowCustomTestModal(true)}
-              className="px-3.5 py-1.5 rounded-xl bg-amber-50 hover:bg-amber-100 text-[#102A43] border border-[#D4AF37] font-bold text-xs transition flex items-center gap-1.5 cursor-pointer shadow-xs"
-            >
-              <Sparkles className="w-3.5 h-3.5 text-[#D4AF37]" />
-              <span>{t('+ নিজস্ব টেস্ট তৈরি করুন', '+ Create Custom Test')}</span>
-            </button>
-
             {isSubscriptionActive ? (
               <span className="text-emerald-700 font-semibold flex items-center gap-1">
                 <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
@@ -629,6 +578,12 @@ export const Dashboard: React.FC = () => {
         titleEn="Bar Council Enrollment Subscription Passes"
         subtitleBn="প্রো মডেল টেস্ট পাস, লং কোর্স পাস এবং বার কাউন্সিল এক্সাম পাস থেকে আপনার প্রয়োজনীয় প্যাকেজটি বেছে নিন।"
         subtitleEn="Choose from Pro Model Test Pass (300 BDT), Long Course Pass (999 BDT), and Bar Council Exam Pass."
+      />
+
+      {/* Student Payment History Modal */}
+      <StudentPaymentHistoryModal 
+        isOpen={showPaymentHistoryModal} 
+        onClose={() => setShowPaymentHistoryModal(false)} 
       />
 
     </div>

@@ -964,6 +964,17 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       }
     }
 
+    // 3. Custom Test Restriction: "অ্যাডমিন ছাড়া কেউ কাষ্টম টেষ্ট নিতে পারবে না।"
+    if (exam.type === 'custom_test') {
+      const isSuperAdmin = currentUser.role === 'admin' || currentUser.email === 'khayrulalam88@gmail.com';
+      if (!isSuperAdmin) {
+        return {
+          success: false,
+          reason: 'অননুমোদিত: অ্যাডমিন ছাড়া কেউ কাস্টম টেস্ট নিতে পারবেন না। শিক্ষার্থীরা শুধুমাত্র অ্যাডমিন কর্তৃক পরিচালিত নির্ধারিত মডেল টেস্টে অংশ নিতে পারবে।'
+        };
+      }
+    }
+
     const now = new Date();
     const durationMinutes = exam.durationMinutes || 60;
     const deadline = new Date(now.getTime() + durationMinutes * 60 * 1000);
@@ -1009,6 +1020,14 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     questionIds: string[];
     negativeMarkRatio?: number;
   }): { success: boolean; examId?: string; reason?: string } => {
+    // Strict Admin Authorization Check: "অ্যাডমিন ছাড়া কেউ কাষ্টম টেষ্ট নিতে পারবে না।"
+    if (currentUser.role !== 'admin' && currentUser.email !== 'khayrulalam88@gmail.com') {
+      return { 
+        success: false, 
+        reason: 'অননুমোদিত: অ্যাডমিন ছাড়া কেউ কাস্টম টেস্ট তৈরি বা পরিচালনা করতে পারবে না।' 
+      };
+    }
+
     if (isSessionRevoked || (currentSession && currentSession.status === 'revoked')) {
       return { 
         success: false, 
@@ -1513,6 +1532,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   // Approve Payment Request & Atomically Activate Subscription
   const approvePaymentRequest = (id: string): { success: boolean; error?: string } => {
+    // 1. Authorization: Only Admin or khayrulalam88@gmail.com can approve payments
+    if (currentUser.role !== 'admin' && currentUser.email !== 'khayrulalam88@gmail.com') {
+      return { success: false, error: 'অননুমোদিত চেষ্টা: শুধুমাত্র অ্যাডমিন পেমেন্ট অনুমোদন করতে পারবেন।' };
+    }
+
     const req = paymentRequests.find(r => r.id === id);
     if (!req) return { success: false, error: 'Payment request not found' };
 
@@ -1620,7 +1644,12 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     return { success: true };
   };
 
-  const rejectPaymentRequest = (id: string, reason: string) => {
+  const rejectPaymentRequest = (id: string, reason: string): { success: boolean; error?: string } => {
+    // 1. Authorization: Only Admin or khayrulalam88@gmail.com can reject payments
+    if (currentUser.role !== 'admin' && currentUser.email !== 'khayrulalam88@gmail.com') {
+      return { success: false, error: 'অননুমোদিত চেষ্টা: শুধুমাত্র অ্যাডমিন পেমেন্ট বাতিল করতে পারবেন।' };
+    }
+
     const req = paymentRequests.find(r => r.id === id);
     const rejectionUpdates = {
       status: 'rejected' as const,
@@ -1652,6 +1681,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       },
       ...prev
     ]);
+
+    return { success: true };
   };
 
   const adminUpdateUser = (params: {
