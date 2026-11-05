@@ -27,7 +27,8 @@ import {
   Smartphone,
   RefreshCw,
   Zap,
-  Receipt
+  Receipt,
+  History
 } from 'lucide-react';
 import { StudentPaymentHistoryModal } from './StudentPaymentHistoryModal';
 
@@ -50,7 +51,9 @@ export const Dashboard: React.FC = () => {
     isSessionRevoked,
     sessionRevokedReason,
     recoverSession,
-    answeredQuestions
+    answeredQuestions,
+    previousQuestions,
+    setSelectedPreviousYear
   } = useApp();
 
   const [showPaymentHistoryModal, setShowPaymentHistoryModal] = React.useState<boolean>(false);
@@ -387,6 +390,83 @@ export const Dashboard: React.FC = () => {
         </div>
 
       </div>
+
+      {/* NEW FEATURE: Previous Year Questions & Solutions Dedicated Section */}
+      <section className="bg-gradient-to-br from-slate-900 via-[#102A43] to-slate-900 rounded-3xl p-6 sm:p-8 text-white border-2 border-amber-500/40 shadow-md relative overflow-hidden">
+        {/* Background Subtle Accents */}
+        <div className="absolute right-0 top-0 w-80 h-80 bg-amber-500/10 rounded-full blur-3xl pointer-events-none" />
+        <div className="absolute -left-10 -bottom-10 w-60 h-60 bg-blue-500/10 rounded-full blur-2xl pointer-events-none" />
+
+        <div className="relative z-10 flex flex-col lg:flex-row lg:items-center justify-between gap-6">
+          <div className="space-y-3 max-w-2xl">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="px-3 py-1 rounded-full bg-amber-500 text-slate-950 text-xs font-black uppercase tracking-wider flex items-center gap-1.5 shadow-xs">
+                <History className="w-3.5 h-3.5" />
+                {t('নতুন ফিচার: বিগত সালের প্রশ্ন', 'NEW: PAST QUESTIONS')}
+              </span>
+              <span className="px-2.5 py-0.5 rounded-full bg-white/10 text-amber-300 text-xs font-medium border border-white/10">
+                {previousQuestions.length}+ {t('টি অফিসিয়াল প্রশ্ন ও সমাধান', 'Official Questions & Solutions')}
+              </span>
+            </div>
+
+            <h2 className="text-xl sm:text-2xl lg:text-3xl font-extrabold text-white tracking-tight leading-snug">
+              {t(
+                '২০২০, ২০২২, ২০২৩ ও ২০২৫ সালের অফিসিয়াল প্রশ্ন ও আইনি সমাধান',
+                'Official Bar Council Past Exam Questions (2020-2025)'
+              )}
+            </h2>
+
+            <p className="text-xs sm:text-sm text-slate-300 leading-relaxed">
+              {t(
+                'বাংলাদেশ বার কাউন্সিলের বিগত বছরের প্রশ্নসমূহ অধ্যায়ন করুন। উত্তর বাছাইয়ের সাথে সাথেই নির্ভুল সঠিক উত্তর, সংশ্লিষ্ট আইনের ধারা (Section) ও বিশদ আইনি যুক্তি দেখতে পাবেন। এছাড়া সরাসরি টাইমড মডেল টেস্ট দেওয়ার সুযোগ রয়েছে।',
+                'Practice past year questions with instant solutions, statutory references, and comprehensive legal reasoning. Includes full simulated Exam Mode.'
+              )}
+            </p>
+
+            {/* Quick Year Pill Jumpers */}
+            <div className="flex flex-wrap items-center gap-2 pt-2">
+              <span className="text-xs text-slate-400 font-medium mr-1">{t('সরাসরি অনুশীলন:', 'Quick Jump:')}</span>
+              {[2025, 2023, 2022, 2020].map((yr) => (
+                <button
+                  key={yr}
+                  onClick={() => {
+                    setSelectedPreviousYear(yr);
+                    setActiveScreen('previous_questions');
+                  }}
+                  className="px-3 py-1 rounded-lg bg-white/10 hover:bg-amber-500 hover:text-slate-950 text-amber-300 text-xs font-bold transition-all border border-white/10 cursor-pointer"
+                >
+                  {yr} {t('সাল', 'Exam')}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Action CTAs */}
+          <div className="flex flex-col sm:flex-row lg:flex-col gap-3 shrink-0">
+            <button
+              onClick={() => {
+                setSelectedPreviousYear('all');
+                setActiveScreen('previous_questions');
+              }}
+              className="px-6 py-3.5 rounded-2xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-sm shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer"
+            >
+              <BookOpen className="w-4 h-4" />
+              <span>{t('প্রশ্ন ও সমাধান অনুশীলন', 'Practice Solutions')}</span>
+            </button>
+
+            <button
+              onClick={() => {
+                setSelectedPreviousYear('all');
+                setActiveScreen('previous_questions');
+              }}
+              className="px-6 py-3.5 rounded-2xl bg-white/10 hover:bg-white/20 text-white font-bold text-sm border border-white/20 transition-all flex items-center justify-center gap-2 cursor-pointer"
+            >
+              <Play className="w-4 h-4 text-amber-400" />
+              <span>{t('বিগত সালের টেস্ট দিন', 'Take Timed Mock')}</span>
+            </button>
+          </div>
+        </div>
+      </section>
 
       {/* Available 60-Minute Mock Tests */}
       <section className="space-y-4">

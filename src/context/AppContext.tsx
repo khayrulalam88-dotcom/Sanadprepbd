@@ -18,12 +18,15 @@ import {
   StudentSession,
   SubjectPracticeProgress,
   AnsweredQuestionRecord,
-  LeaderboardEntry
+  LeaderboardEntry,
+  PreviousQuestion,
+  PreviousExamResult
 } from '../types';
 import { INITIAL_SUBJECTS, INITIAL_QUESTIONS } from '../data/mockData';
 import { INITIAL_EXAMS, SUBJECT_PRACTICE_TESTS } from '../data/initialExams';
 import { INITIAL_PACKAGES, INITIAL_EXAM_DATE_CONFIG } from '../data/initialPackages';
 import { INITIAL_LEADERBOARD_ENTRIES } from '../data/initialLeaderboard';
+import { INITIAL_PREVIOUS_QUESTIONS } from '../data/initialPreviousQuestions';
 import { calculateExamScore } from '../utils/scoring';
 import { generate30ModelTests } from '../utils/modelTestGenerator';
 import { isFirebaseConnected, getFirebaseProjectDetails } from '../lib/firebase';
@@ -42,6 +45,10 @@ import {
   saveExamResultToFirestore, 
   fetchLeaderboardFromFirestore,
   saveLeaderboardEntryToFirestore,
+  fetchPreviousQuestionsFromFirestore,
+  savePreviousQuestionToFirestore,
+  deletePreviousQuestionFromFirestore,
+  batchImportPreviousQuestionsToFirestore,
   seedFirestoreIfEmpty 
 } from '../lib/firestoreService';
 
@@ -98,9 +105,17 @@ interface AppContextType {
   recoverSession: () => void;
   
   // Screen Navigation
-  activeScreen: 'landing' | 'dashboard' | 'exam' | 'practice' | 'result' | 'admin' | 'tests' | 'subjects' | 'history' | 'question_bank';
-  setActiveScreen: (screen: 'landing' | 'dashboard' | 'exam' | 'practice' | 'result' | 'admin' | 'tests' | 'subjects' | 'history' | 'question_bank') => void;
+  activeScreen: 'landing' | 'dashboard' | 'exam' | 'practice' | 'result' | 'admin' | 'tests' | 'subjects' | 'history' | 'question_bank' | 'previous_questions';
+  setActiveScreen: (screen: 'landing' | 'dashboard' | 'exam' | 'practice' | 'result' | 'admin' | 'tests' | 'subjects' | 'history' | 'question_bank' | 'previous_questions') => void;
   
+  // Previous Year Questions
+  previousQuestions: PreviousQuestion[];
+  selectedPreviousYear: number | 'all';
+  setSelectedPreviousYear: (year: number | 'all') => void;
+  savePreviousQuestion: (question: PreviousQuestion) => Promise<void>;
+  deletePreviousQuestion: (id: string) => Promise<void>;
+  batchImportPreviousQuestions: (questions: PreviousQuestion[]) => Promise<{ successCount: number; failureCount: number; errors: string[] }>;
+
   // Exams & Custom Model Test
   activeAttempt: ExamAttempt | null;
   currentExamForAttempt: Exam | null;
@@ -193,6 +208,7 @@ const LOCAL_STORAGE_KEY_SESSION = 'barprep_bd_current_session';
 const LOCAL_STORAGE_KEY_EXAMS = 'sanadprep_bd_exams';
 const LOCAL_STORAGE_KEY_ANSWERED_QUESTIONS = 'sanadprep_answered_questions';
 const LOCAL_STORAGE_KEY_LEADERBOARD = 'sanadprep_bd_leaderboard';
+const LOCAL_STORAGE_KEY_PREVIOUS_QUESTIONS = 'sanadprep_previous_questions';
 
 export const INITIAL_SUBSCRIPTIONS: UserSubscription[] = [
   {
@@ -445,7 +461,18 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   ]);
 
-  const [activeScreen, setActiveScreen] = useState<'landing' | 'dashboard' | 'exam' | 'practice' | 'result' | 'admin' | 'tests' | 'subjects' | 'history' | 'question_bank'>('landing');
+  const [activeScreen, setActiveScreen] = useState<'landing' | 'dashboard' | 'exam' | 'practice' | 'result' | 'admin' | 'tests' | 'subjects' | 'history' | 'question_bank' | 'previous_questions'>('landing');
+  const [selectedPreviousYear, setSelectedPreviousYear] = useState<number | 'all'>('all');
+  const [previousQuestions, setPreviousQuestions] = useState<PreviousQuestion[]>(() => {
+    try {
+      const saved = localStorage.getItem(LOCAL_STORAGE_KEY_PREVIOUS_QUESTIONS);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+    } catch (e) {}
+    return INITIAL_PREVIOUS_QUESTIONS;
+  });
   const [showCustomTestModal, setShowCustomTestModal] = useState<boolean>(false);
   const [activeAttempt, setActiveAttempt] = useState<ExamAttempt | null>(() => {
     try {
@@ -575,6 +602,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
             return merged.map((e, idx) => ({ ...e, rank: idx + 1 }));
           });
         }
+
+        const dbPrevQuestions = await fetchPreviousQuestionsFromFirestore();
+        if (isMounted && dbPrevQuestions && dbPrevQuestions.length > 0) {
+          setPreviousQuestions(dbPrevQuestions);
+        }
       } catch (err) {
         console.warn('Initial Firestore database sync notice:', err);
       }
@@ -585,6 +617,12 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   }, []);
 
   // Sync to Storage
+  useEffect(() => {
+    try {
+      localStorage.setItem(LOCAL_STORAGE_KEY_PREVIOUS_QUESTIONS, JSON.stringify(previousQuestions));
+    } catch (e) {}
+  }, [previousQuestions]);
+
   useEffect(() => {
     try {
       localStorage.setItem(LOCAL_STORAGE_KEY_QUESTIONS, JSON.stringify(questions));
@@ -1405,6 +1443,41 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     deleteQuestionFromFirestore(id).catch(e => console.warn('Firestore question delete error:', e));
   };
 
+  const savePreviousQuestion = async (question: PreviousQuestion): Promise<void> => {
+    const exists = previousQuestions.some(q => q.id === question.id);
+    if (exists) {
+      setPreviousQuestions(prev => prev.map(q => q.id === question.id ? question : q));
+    } else {
+      setPreviousQuestions(prev => [question, ...prev]);
+    }
+    await savePreviousQuestionToFirestore(question);
+  };
+
+  const deletePreviousQuestion = async (id: string): Promise<void> => {
+    setPreviousQuestions(prev => prev.filter(q => q.id !== id));
+    await deletePreviousQuestionFromFirestore(id);
+  };
+
+  const batchImportPreviousQuestions = async (
+    newQuestions: PreviousQuestion[]
+  ): Promise<{ successCount: number; failureCount: number; errors: string[] }> => {
+    // Optimistically merge into local state
+    setPreviousQuestions(prev => {
+      const map = new Map<string, PreviousQuestion>();
+      newQuestions.forEach(q => map.set(q.id, q));
+      prev.forEach(q => {
+        if (!map.has(q.id)) {
+          map.set(q.id, q);
+        }
+      });
+      return Array.from(map.values()).sort((a, b) => b.year - a.year);
+    });
+
+    // Write batch directly to Firestore
+    const res = await batchImportPreviousQuestionsToFirestore(newQuestions);
+    return res;
+  };
+
   const addExam = (newExam: Omit<Exam, 'id' | 'createdAt'>) => {
     const created: Exam = {
       ...newExam,
@@ -1836,6 +1909,12 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         recoverSession,
         activeScreen,
         setActiveScreen,
+        previousQuestions,
+        selectedPreviousYear,
+        setSelectedPreviousYear,
+        savePreviousQuestion,
+        deletePreviousQuestion,
+        batchImportPreviousQuestions,
         activeAttempt,
         currentExamForAttempt,
         startExam,

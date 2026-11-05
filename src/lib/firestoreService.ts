@@ -10,7 +10,8 @@ import {
   where, 
   orderBy, 
   limit, 
-  getDocFromServer
+  getDocFromServer,
+  writeBatch
 } from 'firebase/firestore';
 import { db, auth, isFirebaseConnected } from './firebase.ts';
 import type { 
@@ -21,7 +22,8 @@ import type {
   ExamResult, 
   UserProfile, 
   Subject,
-  LeaderboardEntry
+  LeaderboardEntry,
+  PreviousQuestion
 } from '../types/index.ts';
 
 export enum OperationType {
@@ -505,5 +507,102 @@ export async function fetchLeaderboardFromFirestore(examId?: string): Promise<Le
     console.warn('Fetch leaderboard from Firestore error:', err);
     return [];
   }
+}
+
+// -------------------------------------------------------------
+// PREVIOUS YEAR QUESTIONS CRUD & BATCH IMPORT
+// -------------------------------------------------------------
+export async function fetchPreviousQuestionsFromFirestore(): Promise<PreviousQuestion[]> {
+  if (!db) return [];
+  const path = 'previous_questions';
+  try {
+    const qSnapshot = await getDocs(collection(db, path));
+    const items: PreviousQuestion[] = [];
+    qSnapshot.forEach((docSnap) => {
+      items.push({ id: docSnap.id, ...(docSnap.data() as Omit<PreviousQuestion, 'id'>) });
+    });
+    // Sort by year descending
+    items.sort((a, b) => b.year - a.year);
+    return items;
+  } catch (err) {
+    console.warn('Could not fetch previous questions from Firestore, falling back to local:', err);
+    return [];
+  }
+}
+
+export async function savePreviousQuestionToFirestore(question: PreviousQuestion): Promise<void> {
+  if (!db) return;
+  const path = `previous_questions/${question.id}`;
+  try {
+    await setDoc(doc(db, 'previous_questions', question.id), {
+      year: Number(question.year),
+      subject: question.subject || '',
+      question: question.question || '',
+      options: question.options || [],
+      correctAnswer: question.correctAnswer || '',
+      explanation: question.explanation || '',
+      legalSection: question.legalSection || '',
+      source: question.source || `Bangladesh Bar Council MCQ Exam ${question.year}`,
+      createdAt: question.createdAt || new Date().toISOString()
+    });
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, path);
+  }
+}
+
+export async function deletePreviousQuestionFromFirestore(questionId: string): Promise<void> {
+  if (!db) return;
+  const path = `previous_questions/${questionId}`;
+  try {
+    await deleteDoc(doc(db, 'previous_questions', questionId));
+  } catch (err) {
+    handleFirestoreError(err, OperationType.DELETE, path);
+  }
+}
+
+export async function batchImportPreviousQuestionsToFirestore(
+  questions: PreviousQuestion[]
+): Promise<{ successCount: number; failureCount: number; errors: string[] }> {
+  if (!db) {
+    return { successCount: 0, failureCount: questions.length, errors: ['Firestore database is not connected'] };
+  }
+
+  let successCount = 0;
+  let failureCount = 0;
+  const errors: string[] = [];
+
+  // Write in batches of max 400 to stay well under the 500 document limit
+  const CHUNK_SIZE = 400;
+  for (let i = 0; i < questions.length; i += CHUNK_SIZE) {
+    const chunk = questions.slice(i, i + CHUNK_SIZE);
+    const batch = writeBatch(db);
+
+    for (const q of chunk) {
+      const qId = q.id || `pq_${q.year}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+      const docRef = doc(db, 'previous_questions', qId);
+      batch.set(docRef, {
+        year: Number(q.year),
+        subject: q.subject || '',
+        question: q.question || '',
+        options: Array.isArray(q.options) ? q.options : [],
+        correctAnswer: q.correctAnswer || '',
+        explanation: q.explanation || '',
+        legalSection: q.legalSection || '',
+        source: q.source || `Bangladesh Bar Council MCQ Exam ${q.year}`,
+        createdAt: q.createdAt || new Date().toISOString()
+      }, { merge: true });
+    }
+
+    try {
+      await batch.commit();
+      successCount += chunk.length;
+    } catch (err: any) {
+      console.error('Batch commit failed for chunk:', err);
+      failureCount += chunk.length;
+      errors.push(err?.message || 'Failed to commit batch to Firestore');
+    }
+  }
+
+  return { successCount, failureCount, errors };
 }
 

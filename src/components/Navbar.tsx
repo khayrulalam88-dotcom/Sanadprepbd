@@ -115,18 +115,6 @@ export const Navbar: React.FC = () => {
                   <LayoutDashboard className="w-4 h-4" />
                   <span>{t('ড্যাশবোর্ড', 'Dashboard')}</span>
                 </button>
-
-                <button
-                  onClick={() => setActiveScreen('question_bank')}
-                  className={`px-3 py-1.5 rounded-xl text-xs sm:text-sm font-bold transition flex items-center gap-1.5 cursor-pointer ${
-                    activeScreen === 'question_bank'
-                      ? 'bg-[#102A43] text-white shadow-xs'
-                      : 'text-slate-700 hover:text-[#102A43] hover:bg-slate-100'
-                  }`}
-                >
-                  <BookOpen className="w-4 h-4" />
-                  <span>{t('প্রশ্ন সম্ভার', 'Question Bank')}</span>
-                </button>
               </div>
             )}
           </div>

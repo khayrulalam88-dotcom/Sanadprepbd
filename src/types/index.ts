@@ -106,7 +106,6 @@ export interface Question {
   legalReference?: string; // e.g., "Section 9, Code of Civil Procedure, 1908"
   difficulty: QuestionDifficulty;
   status: QuestionStatus;
-  year?: string; // e.g., "Bar Council 2020 (Model)"
   isDemoSample: boolean; // clearly indicates demo sample
   createdAt: string;
   updatedAt: string;

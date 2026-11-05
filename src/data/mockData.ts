@@ -98,7 +98,6 @@ const SAMPLE_QUESTIONS: Question[] = [
     legalReference: 'The Code of Civil Procedure, 1908 - Section 9',
     difficulty: 'easy',
     status: 'published',
-    year: 'Model Prep (Bar Council Syllabus)',
     isDemoSample: true,
     createdAt: '2026-01-01T00:00:00Z',
     updatedAt: '2026-01-01T00:00:00Z'
@@ -116,7 +115,6 @@ const SAMPLE_QUESTIONS: Question[] = [
     legalReference: 'The Code of Civil Procedure, 1908 - Section 11',
     difficulty: 'medium',
     status: 'published',
-    year: 'Model Prep',
     isDemoSample: true,
     createdAt: '2026-01-01T00:00:00Z',
     updatedAt: '2026-01-01T00:00:00Z'

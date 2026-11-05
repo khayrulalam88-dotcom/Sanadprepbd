@@ -44,6 +44,7 @@ import { Question, QuestionDifficulty, QuestionStatus, Exam, SubscriptionPackage
 import { BulkImportModal } from './BulkImportModal';
 import { EditUserModal, EditableUserData } from './EditUserModal';
 import { AdminCreateExamModal } from './AdminCreateExamModal';
+import { PreviousQuestionsAdminManager } from './PreviousQuestionsAdminManager';
 
 export const AdminPanel: React.FC = () => {
   const { 
@@ -81,7 +82,7 @@ export const AdminPanel: React.FC = () => {
     examResults
   } = useApp();
 
-  const [activeTab, setActiveTab] = useState<'overview' | 'packages' | 'subscribers' | 'payments' | 'questions' | 'exams' | 'sessions' | 'audit'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'packages' | 'subscribers' | 'payments' | 'questions' | 'exams' | 'sessions' | 'audit' | 'previous_questions'>('overview');
 
   // 8 Authoritative Admin Overview Metrics (Section 5 Requirement)
   const totalStudents = React.useMemo(() => {
@@ -638,6 +639,18 @@ export const AdminPanel: React.FC = () => {
           >
             <Award className="w-4 h-4" />
             <span>{t('মডেল পরীক্ষা (Exams)', 'Exams')}</span>
+          </button>
+        )}
+
+        {isQuestionManager && (
+          <button
+            onClick={() => setActiveTab('previous_questions')}
+            className={`px-4 py-2 rounded-xl text-xs sm:text-sm font-bold transition whitespace-nowrap flex items-center gap-1.5 cursor-pointer ${
+              activeTab === 'previous_questions' ? 'bg-[#102A43] text-white shadow-xs' : 'text-slate-600 hover:bg-slate-100'
+            }`}
+          >
+            <FileSpreadsheet className="w-4 h-4 text-emerald-400" />
+            <span>{t('বিগত সালের প্রশ্ন ও CSV', 'Previous Qs & CSV')}</span>
           </button>
         )}
 
@@ -2159,6 +2172,11 @@ export const AdminPanel: React.FC = () => {
             ))}
           </div>
         </div>
+      )}
+
+      {/* TAB 9: Previous Questions & CSV Bulk Importer */}
+      {activeTab === 'previous_questions' && (
+        <PreviousQuestionsAdminManager />
       )}
 
       {/* Rejection Modal */}

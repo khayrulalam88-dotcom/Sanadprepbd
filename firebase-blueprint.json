@@ -184,6 +184,26 @@
         "completedAt": { "type": "string" }
       },
       "required": ["userId", "studentName", "examId", "score", "totalMarks", "completedAt"]
+    },
+    "PreviousQuestion": {
+      "title": "PreviousQuestion",
+      "description": "Official Bar Council previous year question with explanation and statutory section",
+      "type": "object",
+      "properties": {
+        "year": { "type": "number" },
+        "subject": { "type": "string", "maxLength": 100 },
+        "question": { "type": "string", "maxLength": 1000 },
+        "options": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "correctAnswer": { "type": "string", "maxLength": 500 },
+        "explanation": { "type": "string", "maxLength": 2000 },
+        "legalSection": { "type": "string", "maxLength": 200 },
+        "source": { "type": "string", "maxLength": 200 },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["year", "subject", "question", "options", "correctAnswer", "explanation", "legalSection", "source"]
     }
   },
   "firestore": {
@@ -226,6 +246,10 @@
     "/auditLogs/{logId}": {
       "schema": { "$ref": "#/entities/AuditLog" },
       "description": "Administrative compliance audit log"
+    },
+    "/previous_questions/{questionId}": {
+      "schema": { "$ref": "#/entities/PreviousQuestion" },
+      "description": "Authentic previous year exam questions with statutory solutions"
     }
   }
 }

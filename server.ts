@@ -897,10 +897,10 @@ async function startServer() {
     res.json({ auditLogs: db.auditLogs });
   });
 
-  // Mount Vite or static production build
+  // Mount Vite in development or static dist in production
   const distDir = path.resolve(__dirname, 'dist');
   const distIndex = path.resolve(distDir, 'index.html');
-  const isProduction = process.env.NODE_ENV === 'production' || fs.existsSync(distIndex);
+  const isProduction = process.env.NODE_ENV === 'production';
 
   if (isProduction && fs.existsSync(distIndex)) {
     app.use(express.static(distDir));
@@ -918,9 +918,10 @@ async function startServer() {
     app.use(vite.middlewares);
   }
 
-  const PORT = Number(process.env.PORT) || 3000;
+  // AI Studio Dev Server must run on port 3000; in production use Cloud Run PORT
+  const PORT = isProduction ? (Number(process.env.PORT) || 3000) : 3000;
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Sanad Prep BD Production Engine running on port ${PORT}`);
+    console.log(`Sanad Prep BD Engine running on port ${PORT} [mode: ${isProduction ? 'production' : 'development'}]`);
   });
 }
 

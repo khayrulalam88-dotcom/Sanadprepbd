@@ -57,6 +57,12 @@ service cloud.firestore {
       allow write: if isStaff();
     }
 
+    // Previous Year Questions collection (Public read for all students/practice, staff/admin write)
+    match /previous_questions/{questionId} {
+      allow read: if true;
+      allow write: if isStaff();
+    }
+
     // Exams collection
     match /exams/{examId} {
       allow read: if true;

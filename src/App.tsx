@@ -15,6 +15,7 @@ import { SubjectsView } from './components/SubjectsView';
 import { HistoryView } from './components/HistoryView';
 import { AdminPanel } from './components/AdminPanel';
 import { QuestionBankView } from './components/QuestionBankView';
+import { PreviousQuestionsView } from './components/PreviousQuestionsView';
 import { CustomTestModal } from './components/CustomTestModal';
 import { SubscriptionModal } from './components/SubscriptionModal';
 import { TestingSuiteModal } from './components/TestingSuiteModal';
@@ -40,6 +41,7 @@ const MainContent: React.FC = () => {
         {activeScreen === 'result' && <ResultsScreen />}
         {activeScreen === 'subjects' && <SubjectsView />}
         {activeScreen === 'question_bank' && <QuestionBankView />}
+        {activeScreen === 'previous_questions' && <PreviousQuestionsView />}
         {activeScreen === 'history' && <HistoryView />}
         {activeScreen === 'admin' && <AdminPanel />}
       </main>
