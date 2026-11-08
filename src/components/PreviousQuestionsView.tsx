@@ -405,7 +405,7 @@ export const PreviousQuestionsView: React.FC = () => {
 
                     {/* Options List */}
                     <div className="p-5 sm:p-6 space-y-2.5">
-                      {q.options.map((opt, optIdx) => {
+                      {q.options.map((opt: string, optIdx: number) => {
                         const optLetter = ['ক', 'খ', 'গ', 'ঘ'][optIdx] || (optIdx + 1);
                         const isThisSelected = userChoice === opt;
                         const isThisCorrect = q.correctAnswer.trim() === opt.trim();
@@ -569,7 +569,7 @@ export const PreviousQuestionsView: React.FC = () => {
                     </h3>
 
                     <div className="space-y-2.5">
-                      {q.options.map((opt, optIdx) => {
+                      {q.options.map((opt: string, optIdx: number) => {
                         const optLetter = ['ক', 'খ', 'গ', 'ঘ'][optIdx] || (optIdx + 1);
                         const isChosen = userChoice === opt;
 

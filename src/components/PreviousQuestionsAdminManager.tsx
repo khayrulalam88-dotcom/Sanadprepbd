@@ -423,7 +423,7 @@ export const PreviousQuestionsAdminManager: React.FC = () => {
                 {expandedId === q.id && (
                   <div className="mt-3 pt-3 border-t border-slate-100 text-xs space-y-2 bg-slate-50/70 p-3 rounded-xl animate-fadeIn">
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                      {q.options.map((opt, oIdx) => (
+                      {q.options.map((opt: string, oIdx: number) => (
                         <div 
                           key={oIdx} 
                           className={`p-2 rounded-lg border text-xs ${

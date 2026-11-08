@@ -112,6 +112,35 @@ export interface Question {
   createdBy?: string;
 }
 
+export type PreviousYear = 2020 | 2022 | 2023 | 2025 | number;
+
+export interface PreviousQuestion {
+  id: string;
+  year: number;
+  subject: string;
+  question: string;
+  options: string[];
+  correctAnswer: string;
+  explanation: string;
+  legalSection?: string;
+  source?: string;
+  subjectId?: string;
+  questionBn?: string;
+  questionEn?: string;
+  optionsBn?: string[];
+  optionsEn?: string[];
+  correctOptionIndex?: number;
+  explanationBn?: string;
+  explanationEn?: string;
+  legalReference?: string;
+  difficulty?: QuestionDifficulty;
+  status?: QuestionStatus;
+  isDemoSample?: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+  createdBy?: string;
+}
+
 export type ExamType = 'full_mock' | 'subject_test' | 'practice_quiz' | 'custom_test';
 
 export interface Exam {
@@ -184,6 +213,10 @@ export interface ExamResult {
   }>;
   answers: Record<string, number>;
   questions: Question[];
+}
+
+export interface PreviousExamResult extends ExamResult {
+  examYear?: string | number;
 }
 
 export interface PaymentRequest {

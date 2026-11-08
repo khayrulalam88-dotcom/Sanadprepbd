@@ -15,7 +15,20 @@ export interface FirebaseConfig {
   oAuthClientId?: string;
 }
 
-export const firebaseConfig: FirebaseConfig = firebaseConfigJson as FirebaseConfig;
+// Support environment variables with seamless fallback to firebase-applet-config.json
+const env = typeof import.meta !== 'undefined' && import.meta.env ? import.meta.env : {} as Record<string, string | undefined>;
+
+export const firebaseConfig: FirebaseConfig = {
+  projectId: env.VITE_FIREBASE_PROJECT_ID || firebaseConfigJson.projectId,
+  appId: env.VITE_FIREBASE_APP_ID || firebaseConfigJson.appId,
+  apiKey: env.VITE_FIREBASE_API_KEY || firebaseConfigJson.apiKey,
+  authDomain: env.VITE_FIREBASE_AUTH_DOMAIN || firebaseConfigJson.authDomain,
+  firestoreDatabaseId: env.VITE_FIREBASE_DATABASE_ID || firebaseConfigJson.firestoreDatabaseId,
+  storageBucket: env.VITE_FIREBASE_STORAGE_BUCKET || firebaseConfigJson.storageBucket,
+  messagingSenderId: env.VITE_FIREBASE_MESSAGING_SENDER_ID || firebaseConfigJson.messagingSenderId,
+  measurementId: env.VITE_FIREBASE_MEASUREMENT_ID || firebaseConfigJson.measurementId || '',
+  oAuthClientId: env.VITE_FIREBASE_OAUTH_CLIENT_ID || firebaseConfigJson.oAuthClientId || '',
+};
 
 let appInstance: FirebaseApp;
 let authInstance: Auth;
