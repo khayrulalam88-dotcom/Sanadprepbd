@@ -11,7 +11,7 @@ import {
   orderBy, 
   limit, 
   getDocFromServer,
-  writeBatch
+  writeBatch, Timestamp
 } from 'firebase/firestore';
 import { db, auth, isFirebaseConnected } from './firebase.ts';
 import type { 
