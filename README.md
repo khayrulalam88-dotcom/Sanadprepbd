@@ -1,1 +1,1 @@
-Cloudflare deployment setup
+set up
