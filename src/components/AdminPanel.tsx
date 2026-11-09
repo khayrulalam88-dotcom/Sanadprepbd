@@ -670,6 +670,46 @@ export const AdminPanel: React.FC = () => {
       {/* TAB 1: Overview */}
       {activeTab === 'overview' && (
         <div className="space-y-6">
+          {/* Zero-Trust Firebase Free Spark Security Card */}
+          <div className="bg-gradient-to-r from-slate-900 via-[#102A43] to-slate-900 text-white p-6 rounded-3xl border border-[#D4AF37]/30 shadow-lg relative overflow-hidden">
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <span className="px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 text-[11px] font-bold">
+                    FIREBASE SPARK (100% FREE) • ZERO-TRUST
+                  </span>
+                  <span className="px-2.5 py-0.5 rounded-full bg-[#D4AF37]/20 text-[#D4AF37] border border-[#D4AF37]/30 text-[11px] font-bold">
+                    SECURITY ENFORCED
+                  </span>
+                </div>
+                <h3 className="text-lg font-bold text-white flex items-center gap-2">
+                  <ShieldCheck className="w-5 h-5 text-[#D4AF37]" />
+                  <span>{t('ফায়ারবেস ক্লাউড সিকিউরিটি ও অ্যাডমিন অথরাইজেশন স্ট্যাটাস', 'Firebase Cloud Security & Admin Authorization Status')}</span>
+                </h3>
+                <p className="text-xs text-slate-300 max-w-2xl leading-relaxed">
+                  {t(
+                    'আপনার অ্যাপটি ফায়ারবেসের বিনামূল্যের (Spark Free Tier) সিকিউরিটি রুলস দ্বারা ক্লাউড লেভেলে সুরক্ষিত। সাধারণ কোনো শিক্ষার্থী প্রোফাইল, ব্রাউজার ডাটা বা লোকালস্টোরেজ পরিবর্তন করে অ্যাডমিন হতে পারবে না এবং সাবস্ক্রিপশন চালু করতে পারবে না।',
+                    'Your app is secured at the cloud layer with Firebase Spark Free Tier Security Rules. Students cannot escalate privileges or manipulate subscriptions.'
+                  )}
+                </p>
+              </div>
+
+              <div className="bg-slate-800/80 p-4 rounded-2xl border border-slate-700/80 text-xs space-y-1.5 shrink-0">
+                <div className="flex items-center justify-between gap-4">
+                  <span className="text-slate-400 font-medium">{t('প্রধান অ্যাডমিন ইমেইল:', 'Super Admin Email:')}</span>
+                  <span className="font-mono text-emerald-400 font-bold">khayrulalam88@gmail.com</span>
+                </div>
+                <div className="flex items-center justify-between gap-4">
+                  <span className="text-slate-400 font-medium">{t('বর্তমান ইউজার UID:', 'Active Account UID:')}</span>
+                  <span className="font-mono text-[#D4AF37] font-bold text-[11px] select-all">{currentUser.uid}</span>
+                </div>
+                <div className="flex items-center justify-between gap-4">
+                  <span className="text-slate-400 font-medium">{t('হোস্টিং টার্গেট:', 'Hosting Platform:')}</span>
+                  <span className="text-white font-semibold">Cloudflare Pages (Free)</span>
+                </div>
+              </div>
+            </div>
+          </div>
           {/* 8 Essential Admin Performance Metrics (Section 5 Requirement) */}
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
             

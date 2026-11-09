@@ -1,5 +1,5 @@
 import { initializeApp, getApps, getApp, FirebaseApp } from 'firebase/app';
-import { getAuth, Auth } from 'firebase/auth';
+import { getAuth, Auth, GoogleAuthProvider } from 'firebase/auth';
 import { getFirestore, Firestore } from 'firebase/firestore';
 import firebaseConfigJson from '../../firebase-applet-config.json' with { type: 'json' };
 
@@ -61,6 +61,7 @@ try {
 export const app = appInstance!;
 export const auth = authInstance!;
 export const db = firestoreInstance!;
+export const googleProvider = new GoogleAuthProvider();
 export const isFirebaseConnected = () => isInitializedSuccessfully;
 export const getFirebaseInitError = () => initError;
 export const getFirebaseProjectDetails = () => ({

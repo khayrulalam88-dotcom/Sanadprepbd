@@ -29,7 +29,8 @@ import { INITIAL_LEADERBOARD_ENTRIES } from '../data/initialLeaderboard';
 import { INITIAL_PREVIOUS_QUESTIONS } from '../data/initialPreviousQuestions';
 import { calculateExamScore } from '../utils/scoring';
 import { generate30ModelTests } from '../utils/modelTestGenerator';
-import { isFirebaseConnected, getFirebaseProjectDetails } from '../lib/firebase';
+import { signInWithPopup, signOut, onAuthStateChanged } from 'firebase/auth';
+import { isFirebaseConnected, getFirebaseProjectDetails, auth, googleProvider } from '../lib/firebase';
 import { 
   fetchQuestionsFromFirestore, 
   saveQuestionToFirestore, 
@@ -49,7 +50,11 @@ import {
   savePreviousQuestionToFirestore,
   deletePreviousQuestionFromFirestore,
   batchImportPreviousQuestionsToFirestore,
-  seedFirestoreIfEmpty 
+  seedFirestoreIfEmpty,
+  fetchUserProfileFromFirestore,
+  checkIsAdminInFirestore,
+  saveUserProfileToFirestore,
+  updateUserRoleOrSubscriptionInFirestore
 } from '../lib/firestoreService';
 
 interface AppContextType {
@@ -176,6 +181,7 @@ interface AppContextType {
   // UI Modals & Auth
   isLoggedIn: boolean;
   loginUser: (userData?: Partial<UserProfile>) => void;
+  loginWithGoogle: () => Promise<{ success: boolean; error?: string }>;
   logoutUser: () => void;
   showLoginModal: boolean;
   setShowLoginModal: (show: boolean) => void;
@@ -544,22 +550,141 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     } catch (e) {}
   };
 
+  const loginWithGoogle = async (): Promise<{ success: boolean; error?: string }> => {
+    try {
+      if (!auth || !googleProvider) {
+        return { success: false, error: 'Firebase Authentication is not available.' };
+      }
+      const result = await signInWithPopup(auth, googleProvider);
+      const fbUser = result.user;
+      const uid = fbUser.uid;
+      const email = fbUser.email || '';
+      const name = fbUser.displayName || 'ব্যবহারকারী';
+      const phone = fbUser.phoneNumber || '';
+
+      const isAdmin = await checkIsAdminInFirestore(uid, email);
+
+      let existingProfile = await fetchUserProfileFromFirestore(uid);
+      if (!existingProfile) {
+        const newProfile: UserProfile = {
+          uid,
+          name,
+          email,
+          phone,
+          role: isAdmin ? 'admin' : 'student',
+          subscriptionStatus: 'free',
+          createdAt: new Date().toISOString()
+        };
+        await saveUserProfileToFirestore(newProfile);
+        existingProfile = newProfile;
+      } else if (isAdmin && existingProfile.role !== 'admin') {
+        existingProfile.role = 'admin';
+        await updateUserRoleOrSubscriptionInFirestore(uid, { role: 'admin' });
+      }
+
+      setCurrentUser(existingProfile);
+      setIsLoggedIn(true);
+
+      // Fetch user-scoped records from Firestore
+      try {
+        const [userPayments, userSubs, userResults] = await Promise.all([
+          fetchPaymentRequestsFromFirestore(uid, isAdmin),
+          fetchSubscriptionsFromFirestore(uid, isAdmin),
+          fetchExamResultsFromFirestore(uid, isAdmin)
+        ]);
+
+        if (userPayments && userPayments.length > 0) setPaymentRequests(userPayments);
+        if (userSubs && userSubs.length > 0) setSubscriptions(userSubs);
+        if (userResults && userResults.length > 0) setExamResults(userResults);
+      } catch (err) {
+        console.warn('Post-login Firestore sync notice:', err);
+      }
+
+      if (isAdmin) {
+        setActiveScreen('admin');
+      } else {
+        setActiveScreen('dashboard');
+      }
+      return { success: true };
+    } catch (err: any) {
+      console.error('Google Sign-In failed:', err);
+      return { success: false, error: err?.message || 'Google Sign-In failed' };
+    }
+  };
+
   const logoutUser = () => {
+    if (auth) {
+      signOut(auth).catch(e => console.warn('Firebase sign out notice:', e));
+    }
     setIsLoggedIn(false);
     setCurrentUser({
-      uid: 'user_candidate_786',
-      name: 'মো: খাইরুল আলম (Khayrul Alam)',
-      email: 'khayrulalam88@gmail.com',
-      phone: '01712-345678',
+      uid: `guest_${Date.now()}`,
+      name: 'অতিথি শিক্ষার্থী (Guest)',
+      email: '',
+      phone: '',
       role: 'student',
       subscriptionStatus: 'free',
-      createdAt: '2026-01-10T12:00:00Z',
+      createdAt: new Date().toISOString(),
     });
     setActiveScreen('landing');
     try {
       localStorage.removeItem('sanadprep_is_logged_in');
     } catch (e) {}
   };
+
+  // Firebase Auth State Listener (Auto-restores session on page reload / navigation)
+  useEffect(() => {
+    if (!auth) return;
+    const unsubscribe = onAuthStateChanged(auth, async (fbUser) => {
+      if (fbUser) {
+        const uid = fbUser.uid;
+        const email = fbUser.email || '';
+        const name = fbUser.displayName || 'ব্যবহারকারী';
+        const phone = fbUser.phoneNumber || '';
+
+        const isAdmin = await checkIsAdminInFirestore(uid, email);
+        const profile = await fetchUserProfileFromFirestore(uid);
+
+        if (profile) {
+          if (isAdmin && profile.role !== 'admin') {
+            profile.role = 'admin';
+            updateUserRoleOrSubscriptionInFirestore(uid, { role: 'admin' }).catch(() => {});
+          }
+          setCurrentUser(profile);
+        } else {
+          const newProfile: UserProfile = {
+            uid,
+            name,
+            email,
+            phone,
+            role: isAdmin ? 'admin' : 'student',
+            subscriptionStatus: 'free',
+            createdAt: new Date().toISOString()
+          };
+          saveUserProfileToFirestore(newProfile).catch(() => {});
+          setCurrentUser(newProfile);
+        }
+
+        setIsLoggedIn(true);
+
+        // Fetch scoped data for the authenticated user
+        try {
+          const [userPayments, userSubs, userResults] = await Promise.all([
+            fetchPaymentRequestsFromFirestore(uid, isAdmin),
+            fetchSubscriptionsFromFirestore(uid, isAdmin),
+            fetchExamResultsFromFirestore(uid, isAdmin)
+          ]);
+          if (userPayments && userPayments.length > 0) setPaymentRequests(userPayments);
+          if (userSubs && userSubs.length > 0) setSubscriptions(userSubs);
+          if (userResults && userResults.length > 0) setExamResults(userResults);
+        } catch (e) {
+          console.warn('Scoped user data load notice:', e);
+        }
+      }
+    });
+
+    return () => unsubscribe();
+  }, []);
 
   // Synchronize with Firestore Database on Mount
   useEffect(() => {
@@ -753,9 +878,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     return Math.max(0, Math.ceil(diff / (1000 * 60 * 60 * 24)));
   };
 
-  // Check if current user has active Pro access (Admin or Paid Active Subscription)
+  // Check if current user has active Pro access (Admin or Unexpired Paid Subscription)
   const isProSubscribed = currentUser.role === 'admin' || (isLoggedIn && (
-    currentUser.subscriptionStatus === 'pro' || 
+    (currentUser.subscriptionStatus === 'pro' && (!currentUser.subscriptionExpiresAt || new Date(currentUser.subscriptionExpiresAt).getTime() > Date.now())) || 
     (!!activeSubscription && new Date(activeSubscription.expiresAt).getTime() > Date.now())
   ));
 
@@ -984,7 +1109,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
     // 2. Strict Subscription Check for Paid / Pro Exams
     if (exam.isPaid) {
-      const hasValidSub = !!activeSubscription && new Date(activeSubscription.expiresAt).getTime() > Date.now();
+      const hasValidSub = isProSubscribed;
       if (!hasValidSub) {
         openSubscriptionModal(packages[0]?.id);
         return { 
@@ -1550,7 +1675,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     packageId: string;
     packageTitle?: string; 
   }): { success: boolean; error?: string } => {
-    const cleanTrxId = req.transactionId.trim().toUpperCase();
+    const cleanTrxId = req.transactionId.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (cleanTrxId.length < 4) {
+      return { success: false, error: 'সঠিক ট্রানজাকশন আইডি (TrxID) প্রদান করুন (কমপক্ষে ৪ অক্ষর)।' };
+    }
 
     // Prevent duplicate pending TrxID reuse
     const duplicate = paymentRequests.find(
@@ -1567,7 +1695,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     const durationDays = pkg.durationDays || (pkg.validityType === 'exam_date' ? calculateDaysRemaining(examDateConfig.targetExamDate) : 90);
 
     const newReq: PaymentRequest = {
-      id: `pay_${Date.now()}`,
+      id: `trx_${cleanTrxId}`,
       userId: currentUser.uid,
       studentName: currentUser.name,
       studentPhone: req.studentPhone || currentUser.phone,
@@ -1649,7 +1777,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
     // Create Subscription record
     const newSubscription: UserSubscription = {
-      id: `sub_${Date.now()}`,
+      id: `sub_${req.userId}_${req.transactionId}`,
       userId: req.userId,
       studentName: req.studentName,
       studentPhone: req.studentPhone,
@@ -1689,6 +1817,17 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       }
       return r;
     }));
+
+    // Persist pro subscription status to student document in Firestore
+    if (req.userId) {
+      updateUserRoleOrSubscriptionInFirestore(req.userId, {
+        subscriptionStatus: 'pro',
+        subscriptionExpiresAt: expiresAt,
+        activePackageId: req.packageId,
+        activePackageNameBn: req.packageNameBn,
+        activePackageNameEn: req.packageNameEn
+      }).catch(e => console.warn('Firestore student pro update notice:', e));
+    }
 
     // Grant Pro status to user if matching current session
     if (req.userId === currentUser.uid || (req.studentPhone && req.studentPhone === currentUser.phone)) {
@@ -1950,6 +2089,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         rejectPaymentRequest,
         isLoggedIn,
         loginUser,
+        loginWithGoogle,
         logoutUser,
         showLoginModal,
         setShowLoginModal,

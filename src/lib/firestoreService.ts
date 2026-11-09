@@ -204,11 +204,21 @@ export async function deleteExamFromFirestore(examId: string): Promise<void> {
 // -------------------------------------------------------------
 // PAYMENT REQUESTS (bKash & Nagad Verification)
 // -------------------------------------------------------------
-export async function fetchPaymentRequestsFromFirestore(): Promise<PaymentRequest[]> {
+export async function fetchPaymentRequestsFromFirestore(userId?: string, isAdminUser?: boolean): Promise<PaymentRequest[]> {
   if (!db) return [];
   const path = 'paymentRequests';
   try {
-    const snap = await getDocs(collection(db, path));
+    let qRef;
+    if (isAdminUser) {
+      qRef = collection(db, path);
+    } else if (userId) {
+      qRef = query(collection(db, path), where('userId', '==', userId));
+    } else if (auth?.currentUser) {
+      qRef = query(collection(db, path), where('userId', '==', auth.currentUser.uid));
+    } else {
+      return [];
+    }
+    const snap = await getDocs(qRef);
     const items: PaymentRequest[] = [];
     snap.forEach((docSnap) => {
       items.push({ id: docSnap.id, ...(docSnap.data() as Omit<PaymentRequest, 'id'>) });
@@ -266,11 +276,21 @@ export async function updatePaymentRequestStatusInFirestore(
 // -------------------------------------------------------------
 // SUBSCRIPTIONS (Paid Access Records)
 // -------------------------------------------------------------
-export async function fetchSubscriptionsFromFirestore(): Promise<UserSubscription[]> {
+export async function fetchSubscriptionsFromFirestore(userId?: string, isAdminUser?: boolean): Promise<UserSubscription[]> {
   if (!db) return [];
   const path = 'subscriptions';
   try {
-    const snap = await getDocs(collection(db, path));
+    let qRef;
+    if (isAdminUser) {
+      qRef = collection(db, path);
+    } else if (userId) {
+      qRef = query(collection(db, path), where('userId', '==', userId));
+    } else if (auth?.currentUser) {
+      qRef = query(collection(db, path), where('userId', '==', auth.currentUser.uid));
+    } else {
+      return [];
+    }
+    const snap = await getDocs(qRef);
     const items: UserSubscription[] = [];
     snap.forEach((docSnap) => {
       items.push({ id: docSnap.id, ...(docSnap.data() as Omit<UserSubscription, 'id'>) });
@@ -325,11 +345,21 @@ export async function updateSubscriptionInFirestore(
 // -------------------------------------------------------------
 // EXAM RESULTS
 // -------------------------------------------------------------
-export async function fetchExamResultsFromFirestore(): Promise<ExamResult[]> {
+export async function fetchExamResultsFromFirestore(userId?: string, isAdminUser?: boolean): Promise<ExamResult[]> {
   if (!db) return [];
   const path = 'examResults';
   try {
-    const snap = await getDocs(collection(db, path));
+    let qRef;
+    if (isAdminUser) {
+      qRef = collection(db, path);
+    } else if (userId) {
+      qRef = query(collection(db, path), where('userId', '==', userId));
+    } else if (auth?.currentUser) {
+      qRef = query(collection(db, path), where('userId', '==', auth.currentUser.uid));
+    } else {
+      return [];
+    }
+    const snap = await getDocs(qRef);
     const items: ExamResult[] = [];
     snap.forEach((docSnap) => {
       items.push({ id: docSnap.id, ...(docSnap.data() as Omit<ExamResult, 'id'>) });
@@ -388,6 +418,35 @@ export async function fetchUsersFromFirestore(): Promise<UserProfile[]> {
   } catch (err) {
     console.warn('Could not fetch users from Firestore:', err);
     return [];
+  }
+}
+
+export async function fetchUserProfileFromFirestore(uid: string): Promise<UserProfile | null> {
+  if (!db) return null;
+  const path = `users/${uid}`;
+  try {
+    const docSnap = await getDoc(doc(db, 'users', uid));
+    if (docSnap.exists()) {
+      return { uid: docSnap.id, ...(docSnap.data() as Omit<UserProfile, 'uid'>) };
+    }
+    return null;
+  } catch (err) {
+    console.warn('Fetch user profile from Firestore notice:', err);
+    return null;
+  }
+}
+
+export async function checkIsAdminInFirestore(uid: string, email?: string): Promise<boolean> {
+  if (!db) return false;
+  if (email && email.toLowerCase().trim() === 'khayrulalam88@gmail.com') return true;
+  try {
+    const adminDoc = await getDoc(doc(db, 'admins', uid));
+    if (adminDoc.exists()) return true;
+    const userDoc = await getDoc(doc(db, 'users', uid));
+    if (userDoc.exists() && userDoc.data()?.role === 'admin') return true;
+    return false;
+  } catch (err) {
+    return false;
   }
 }
 
