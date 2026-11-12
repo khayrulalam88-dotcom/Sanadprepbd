@@ -52,6 +52,7 @@ export const AdminPanel: React.FC = () => {
     t, 
     currentUser, 
     switchRole,
+    loginWithEmail,
     questions, 
     addQuestion, 
     deleteQuestion, 
@@ -168,7 +169,7 @@ export const AdminPanel: React.FC = () => {
 
   // Admin Login Portal state
   const [adminEmailInput, setAdminEmailInput] = useState<string>('khayrulalam88@gmail.com');
-  const [adminPasswordInput, setAdminPasswordInput] = useState<string>('AdminSanadPrep2026!');
+  const [adminPasswordInput, setAdminPasswordInput] = useState<string>('');
   const [adminLoginError, setAdminLoginError] = useState<string>('');
   const [adminLoginLoading, setAdminLoginLoading] = useState<boolean>(false);
   

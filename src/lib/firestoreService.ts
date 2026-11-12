@@ -392,6 +392,7 @@ export async function saveExamResultToFirestore(result: ExamResult): Promise<voi
       positiveMarks: result.positiveMarks,
       negativeMarks: result.negativeMarks,
       finalScore: result.finalScore,
+      score: result.finalScore,
       percentage: result.percentage,
       passed: result.passed,
       passThresholdPercentage: result.passThresholdPercentage || 50,

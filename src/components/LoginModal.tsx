@@ -24,14 +24,32 @@ export const LoginModal: React.FC = () => {
     currentUser, 
     loginUser, 
     loginWithGoogle,
+    loginWithEmail,
     logoutUser, 
     setActiveScreen,
     t, 
     language 
   } = useApp();
 
-  const [authTab, setAuthTab] = useState<'phone' | 'email' | 'fast'>('phone');
+  const [authTab, setAuthTab] = useState<'email' | 'phone'>('email');
+  const [emailMode, setEmailMode] = useState<'signin' | 'signup'>('signin');
   const [isGoogleLoading, setIsGoogleLoading] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Email login state
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [candidateName, setCandidateName] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+
+  // Mobile guidance state
+  const [phoneNumber, setPhoneNumber] = useState('');
+
+  // Feedback state
+  const [successMessage, setSuccessMessage] = useState('');
+  const [errorMessage, setErrorMessage] = useState('');
+
+  if (!showLoginModal) return null;
 
   const handleGoogleLogin = async () => {
     setIsGoogleLoading(true);
@@ -53,118 +71,45 @@ export const LoginModal: React.FC = () => {
       setIsGoogleLoading(false);
     }
   };
-  
-  // Mobile login state (Direct login, NO OTP)
-  const [phoneNumber, setPhoneNumber] = useState('01712345678');
-  const [candidateName, setCandidateName] = useState('মো: খাইরুল আলম');
 
-  // Email login state
-  const [email, setEmail] = useState('khayrulalam88@gmail.com');
-  const [password, setPassword] = useState('AdminSanadPrep2026!');
-  const [showPassword, setShowPassword] = useState(false);
-
-  // Feedback state
-  const [successMessage, setSuccessMessage] = useState('');
-  const [errorMessage, setErrorMessage] = useState('');
-
-  if (!showLoginModal) return null;
-
-  // Direct Mobile Login - NO OTP
-  const handleMobileLogin = (e: React.FormEvent) => {
+  // Real Email & Password Login / Registration via Firebase Auth
+  const handleEmailSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMessage('');
-    
-    const cleanedPhone = phoneNumber.trim().replace(/\D/g, '');
-    if (cleanedPhone.length < 10) {
-      setErrorMessage(language === 'bn' ? 'অনুগ্রহ করে সঠিক মোবাইল নম্বর দিন' : 'Please enter a valid mobile number');
+    setSuccessMessage('');
+
+    const cleanEmail = email.trim();
+    if (!cleanEmail) {
+      setErrorMessage(language === 'bn' ? 'ইমেইল অ্যাড্রেস প্রদান করুন।' : 'Please provide your email address.');
       return;
     }
 
-    loginUser({
-      name: candidateName.trim() || 'পরীক্ষার্থী (Candidate)',
-      phone: phoneNumber,
-      email: `${cleanedPhone}@sanadprep.com`,
-      role: 'student',
-      subscriptionStatus: 'pro'
-    });
-
-    setSuccessMessage(language === 'bn' ? 'সফলভাবে লগইন সম্পন্ন হয়েছে!' : 'Logged in successfully!');
-    setTimeout(() => {
-      setShowLoginModal(false);
-      setSuccessMessage('');
-      setActiveScreen('dashboard');
-    }, 600);
-  };
-
-  // Email Login
-  const handleEmailLogin = (e: React.FormEvent) => {
-    e.preventDefault();
-    setErrorMessage('');
-    if (!email) {
-      setErrorMessage(language === 'bn' ? 'ইমেইল এড্রেস প্রদান করুন' : 'Provide your email address');
+    if (!password || password.length < 6) {
+      setErrorMessage(language === 'bn' ? 'পাসওয়ার্ড কমপক্ষে ৬ অক্ষরের হতে হবে।' : 'Password must be at least 6 characters.');
       return;
     }
 
-    const isAdmin = email.toLowerCase().trim() === 'khayrulalam88@gmail.com';
-    loginUser({
-      name: isAdmin ? 'মো: খাইরুল আলম (সুপার অ্যাডমিন)' : (candidateName || 'পরীক্ষার্থী'),
-      email: email.trim(),
-      phone: '01712-345678',
-      role: isAdmin ? 'admin' : 'student',
-      subscriptionStatus: 'pro'
-    });
-
-    setSuccessMessage(language === 'bn' ? 'সফলভাবে লগইন হয়েছে!' : 'Logged in successfully!');
-    setTimeout(() => {
-      setShowLoginModal(false);
-      setSuccessMessage('');
-      if (isAdmin) {
-        setActiveScreen('admin');
+    setIsSubmitting(true);
+    try {
+      const res = await loginWithEmail(cleanEmail, password, emailMode === 'signup', candidateName.trim());
+      if (!res.success) {
+        setErrorMessage(res.error || (language === 'bn' ? 'প্রমাণীকরণ সম্পন্ন করা যায়নি।' : 'Authentication failed.'));
       } else {
-        setActiveScreen('dashboard');
+        setSuccessMessage(
+          emailMode === 'signup'
+            ? (language === 'bn' ? 'নিবন্ধন সফলভাবে সম্পন্ন হয়েছে!' : 'Account registered successfully!')
+            : (language === 'bn' ? 'সফলভাবে লগইন হয়েছে!' : 'Logged in successfully!')
+        );
+        setTimeout(() => {
+          setShowLoginModal(false);
+          setSuccessMessage('');
+        }, 600);
       }
-    }, 600);
-  };
-
-  // 1-Click Fast Login for easy testing
-  const handleFastLogin = (role: 'admin' | 'student_pro' | 'student_free') => {
-    if (role === 'admin') {
-      loginUser({
-        uid: 'user_candidate_786',
-        name: 'মো: খাইরুল আলম (সুপার অ্যাডমিন)',
-        email: 'khayrulalam88@gmail.com',
-        phone: '01712-345678',
-        role: 'admin',
-        subscriptionStatus: 'pro'
-      });
-      setActiveScreen('admin');
-    } else if (role === 'student_pro') {
-      loginUser({
-        uid: 'user_candidate_786',
-        name: 'মো: খাইরুল আলম (প্রো পরীক্ষার্থী)',
-        email: 'khayrulalam88@gmail.com',
-        phone: '01712-345678',
-        role: 'student',
-        subscriptionStatus: 'pro'
-      });
-      setActiveScreen('dashboard');
-    } else {
-      loginUser({
-        uid: `user_${Date.now()}`,
-        name: 'নতুন শিক্ষার্থী (ফ্রি একাউন্ট)',
-        email: 'student@sanadprep.com',
-        phone: '01811223344',
-        role: 'student',
-        subscriptionStatus: 'free'
-      });
-      setActiveScreen('dashboard');
+    } catch (err: any) {
+      setErrorMessage(err?.message || 'Authentication error');
+    } finally {
+      setIsSubmitting(false);
     }
-
-    setSuccessMessage(language === 'bn' ? 'সফলভাবে লগইন সম্পন্ন হয়েছে!' : 'Login successful!');
-    setTimeout(() => {
-      setShowLoginModal(false);
-      setSuccessMessage('');
-    }, 500);
   };
 
   return (
@@ -285,33 +230,23 @@ export const LoginModal: React.FC = () => {
           {/* Login Tabs */}
           <div className="flex items-center p-1 bg-slate-100 rounded-xl text-xs font-bold text-slate-600">
             <button
-              onClick={() => { setAuthTab('phone'); setErrorMessage(''); }}
-              className={`flex-1 py-2 rounded-lg transition flex items-center justify-center gap-1.5 cursor-pointer ${
-                authTab === 'phone' ? 'bg-white text-slate-900 shadow-xs' : 'hover:text-slate-900'
-              }`}
-            >
-              <Phone className="w-3.5 h-3.5" />
-              <span>{t('মোবাইল নম্বর', 'Mobile')}</span>
-            </button>
-
-            <button
               onClick={() => { setAuthTab('email'); setErrorMessage(''); }}
               className={`flex-1 py-2 rounded-lg transition flex items-center justify-center gap-1.5 cursor-pointer ${
                 authTab === 'email' ? 'bg-white text-slate-900 shadow-xs' : 'hover:text-slate-900'
               }`}
             >
               <Mail className="w-3.5 h-3.5" />
-              <span>{t('ইমেইল / অ্যাডমিন', 'Email / Admin')}</span>
+              <span>{t('ইমেইল ও পাসওয়ার্ড', 'Email & Password')}</span>
             </button>
 
             <button
-              onClick={() => { setAuthTab('fast'); setErrorMessage(''); }}
+              onClick={() => { setAuthTab('phone'); setErrorMessage(''); }}
               className={`flex-1 py-2 rounded-lg transition flex items-center justify-center gap-1.5 cursor-pointer ${
-                authTab === 'fast' ? 'bg-white text-slate-900 shadow-xs' : 'hover:text-slate-900'
+                authTab === 'phone' ? 'bg-white text-slate-900 shadow-xs' : 'hover:text-slate-900'
               }`}
             >
-              <Sparkles className="w-3.5 h-3.5 text-amber-500" />
-              <span>{t('দ্রুত লগইন', '1-Click')}</span>
+              <Phone className="w-3.5 h-3.5" />
+              <span>{t('মোবাইল নম্বর', 'Mobile Number')}</span>
             </button>
           </div>
 
@@ -328,59 +263,50 @@ export const LoginModal: React.FC = () => {
             </div>
           )}
 
-          {/* Tab 1: Direct Mobile Login (NO OTP) */}
-          {authTab === 'phone' && (
-            <form onSubmit={handleMobileLogin} className="space-y-3">
-              <div>
-                <label className="block text-xs font-bold text-slate-700 mb-1">
-                  {t('আপনার নাম', 'Candidate Name')}
-                </label>
-                <div className="flex items-center rounded-xl border border-slate-300 p-2.5 bg-white focus-within:border-[#102A43]">
-                  <User className="w-4 h-4 text-slate-400 mr-2" />
-                  <input
-                    type="text"
-                    value={candidateName}
-                    onChange={(e) => setCandidateName(e.target.value)}
-                    placeholder={t('আপনার নাম লিখুন', 'Enter your name')}
-                    className="flex-1 text-xs text-slate-900 outline-none"
-                    required
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-xs font-bold text-slate-700 mb-1">
-                  {t('মোবাইল নম্বর', 'Mobile Number')}
-                </label>
-                <div className="flex items-center rounded-xl border border-slate-300 focus-within:border-[#102A43] overflow-hidden bg-white">
-                  <span className="px-3 py-2.5 bg-slate-100 text-xs font-bold text-slate-700 border-r border-slate-200">
-                    +880
-                  </span>
-                  <input
-                    type="tel"
-                    value={phoneNumber}
-                    onChange={(e) => setPhoneNumber(e.target.value)}
-                    placeholder="017XXXXXXXX"
-                    maxLength={11}
-                    className="flex-1 p-2.5 text-xs text-slate-900 outline-none"
-                    required
-                  />
-                </div>
-              </div>
-
-              <button
-                type="submit"
-                className="w-full py-3 rounded-xl bg-[#102A43] hover:bg-[#243B53] text-[#D4AF37] font-bold text-xs transition shadow-sm cursor-pointer flex items-center justify-center gap-2"
-              >
-                <span>{t('সরাসরি লগইন করুন', 'Sign In Directly')}</span>
-                <ArrowRight className="w-4 h-4" />
-              </button>
-            </form>
-          )}
-
-          {/* Tab 2: Email & Password (Super Admin & Student) */}
+          {/* Tab 1: Email & Password (Real Firebase Auth) */}
           {authTab === 'email' && (
-            <form onSubmit={handleEmailLogin} className="space-y-3">
+            <form onSubmit={handleEmailSubmit} className="space-y-3">
+              {/* Sign In vs Sign Up Toggle */}
+              <div className="flex items-center justify-center gap-2 p-1 bg-slate-50 border border-slate-200 rounded-lg text-[11px] font-bold">
+                <button
+                  type="button"
+                  onClick={() => { setEmailMode('signin'); setErrorMessage(''); }}
+                  className={`flex-1 py-1 rounded transition cursor-pointer ${
+                    emailMode === 'signin' ? 'bg-[#102A43] text-[#D4AF37]' : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  {t('সাইন ইন (Sign In)', 'Sign In')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setEmailMode('signup'); setErrorMessage(''); }}
+                  className={`flex-1 py-1 rounded transition cursor-pointer ${
+                    emailMode === 'signup' ? 'bg-[#102A43] text-[#D4AF37]' : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  {t('নতুন একাউন্ট (Sign Up)', 'Create Account')}
+                </button>
+              </div>
+
+              {emailMode === 'signup' && (
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-1">
+                    {t('আপনার পূর্ণ নাম', 'Full Name')}
+                  </label>
+                  <div className="flex items-center rounded-xl border border-slate-300 p-2.5 bg-white focus-within:border-[#102A43]">
+                    <User className="w-4 h-4 text-slate-400 mr-2" />
+                    <input
+                      type="text"
+                      value={candidateName}
+                      onChange={(e) => setCandidateName(e.target.value)}
+                      placeholder={t('যেমন: মো: খাইরুল আলম', 'e.g. Adv. Rahat Islam')}
+                      className="flex-1 text-xs text-slate-900 outline-none"
+                      required={emailMode === 'signup'}
+                    />
+                  </div>
+                </div>
+              )}
+
               <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1">
                   {t('ইমেইল অ্যাড্রেস', 'Email Address')}
@@ -391,7 +317,7 @@ export const LoginModal: React.FC = () => {
                     type="email"
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
-                    placeholder="khayrulalam88@gmail.com"
+                    placeholder="student@example.com"
                     className="flex-1 text-xs text-slate-900 outline-none"
                     required
                   />
@@ -424,82 +350,47 @@ export const LoginModal: React.FC = () => {
 
               <button
                 type="submit"
-                className="w-full py-3 rounded-xl bg-[#102A43] hover:bg-[#243B53] text-[#D4AF37] font-bold text-xs transition shadow-sm cursor-pointer"
+                disabled={isSubmitting}
+                className="w-full py-3 rounded-xl bg-[#102A43] hover:bg-[#243B53] text-[#D4AF37] font-bold text-xs transition shadow-sm cursor-pointer disabled:opacity-60 flex items-center justify-center gap-2"
               >
-                {t('লগইন করুন', 'Sign In')}
+                {isSubmitting ? (
+                  <span>{t('যাচাই করা হচ্ছে...', 'Processing...')}</span>
+                ) : (
+                  <span>{emailMode === 'signup' ? t('নিবন্ধন সম্পন্ন করুন', 'Register Account') : t('নিরাপদ সাইন ইন', 'Sign In')}</span>
+                )}
               </button>
             </form>
           )}
 
-          {/* Tab 3: Fast 1-Click Login */}
-          {authTab === 'fast' && (
-            <div className="space-y-2.5">
-              <p className="text-xs text-slate-500 mb-2">
-                {t('দ্রুত লগইন করতে নিচের যেকোনো একটি একাউন্ট বেছে নিন:', 'Select an account for quick instant access:')}
+          {/* Tab 2: Mobile Notice & Direct Recommendation */}
+          {authTab === 'phone' && (
+            <div className="space-y-3 p-4 rounded-2xl bg-amber-50/60 border border-amber-200 text-xs text-slate-700">
+              <div className="flex items-center gap-2 font-bold text-[#102A43]">
+                <ShieldCheck className="w-4 h-4 text-amber-600" />
+                <span>{t('মোবাইল ও এসএমএস প্রমাণীকরণ নির্দেশিকা', 'Mobile SMS Authentication')}</span>
+              </div>
+              <p className="text-[11px] leading-relaxed text-slate-600">
+                {t(
+                  'মোবাইল নম্বর দিয়ে সাইন ইন করতে ফায়ারবেস কনসোলে ফোন নম্বর প্রভাইডার সক্রিয় থাকা আবশ্যক। আপনার সংরক্ষিত সাবস্ক্রিপশন ও ফলাফল সুরক্ষার জন্য গুগল বা ইমেইল দিয়ে সাইন ইন করুন।',
+                  'Phone SMS verification requires SMS Gateway setup in Firebase Console. For immediate cross-device access and to preserve your subscription, sign in with Google or Email.'
+                )}
               </p>
-
-              <button
-                type="button"
-                onClick={() => handleFastLogin('admin')}
-                className="w-full p-3 rounded-2xl border border-slate-200 hover:border-[#D4AF37] hover:bg-amber-50/50 transition flex items-center justify-between text-left cursor-pointer group"
-              >
-                <div className="flex items-center gap-2.5">
-                  <div className="w-8 h-8 rounded-xl bg-[#102A43] text-[#D4AF37] flex items-center justify-center font-bold text-xs">
-                    👑
-                  </div>
-                  <div>
-                    <h4 className="font-bold text-xs text-slate-900 group-hover:text-[#102A43]">
-                      মো: খাইরুল আলম (সুপার অ্যাডমিন)
-                    </h4>
-                    <p className="text-[10px] text-slate-500 font-mono">khayrulalam88@gmail.com</p>
-                  </div>
-                </div>
-                <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-[#102A43] text-[#D4AF37]">
-                  ADMIN
-                </span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => handleFastLogin('student_pro')}
-                className="w-full p-3 rounded-2xl border border-slate-200 hover:border-emerald-400 hover:bg-emerald-50/50 transition flex items-center justify-between text-left cursor-pointer group"
-              >
-                <div className="flex items-center gap-2.5">
-                  <div className="w-8 h-8 rounded-xl bg-emerald-600 text-white flex items-center justify-center font-bold text-xs">
-                    🎓
-                  </div>
-                  <div>
-                    <h4 className="font-bold text-xs text-slate-900 group-hover:text-emerald-900">
-                      মো: খাইরুল আলম (প্রো পরীক্ষার্থী)
-                    </h4>
-                    <p className="text-[10px] text-slate-500 font-mono">01712-345678 · PRO PASS</p>
-                  </div>
-                </div>
-                <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-emerald-100 text-emerald-800">
-                  PRO
-                </span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => handleFastLogin('student_free')}
-                className="w-full p-3 rounded-2xl border border-slate-200 hover:border-blue-400 hover:bg-blue-50/50 transition flex items-center justify-between text-left cursor-pointer group"
-              >
-                <div className="flex items-center gap-2.5">
-                  <div className="w-8 h-8 rounded-xl bg-blue-600 text-white flex items-center justify-center font-bold text-xs">
-                    👤
-                  </div>
-                  <div>
-                    <h4 className="font-bold text-xs text-slate-900 group-hover:text-blue-900">
-                      সাধারণ পরীক্ষার্থী (ফ্রি একাউন্ট)
-                    </h4>
-                    <p className="text-[10px] text-slate-500">Student Free Tier</p>
-                  </div>
-                </div>
-                <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-blue-100 text-blue-800">
-                  FREE
-                </span>
-              </button>
+              <div className="pt-2 space-y-2">
+                <button
+                  type="button"
+                  onClick={() => { setAuthTab('email'); setEmailMode('signup'); }}
+                  className="w-full py-2.5 rounded-xl bg-[#102A43] text-[#D4AF37] font-bold text-xs hover:bg-[#243B53] transition cursor-pointer text-center block"
+                >
+                  {t('ইমেইল দিয়ে অ্যাকাউন্ট তৈরি করুন', 'Create Account with Email')}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleGoogleLogin}
+                  className="w-full py-2.5 rounded-xl border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 font-bold text-xs transition cursor-pointer text-center block"
+                >
+                  {t('গুগল দিয়ে দ্রুত সাইন ইন', 'Continue with Google')}
+                </button>
+              </div>
             </div>
           )}
 

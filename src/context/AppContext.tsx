@@ -29,7 +29,7 @@ import { INITIAL_LEADERBOARD_ENTRIES } from '../data/initialLeaderboard';
 import { INITIAL_PREVIOUS_QUESTIONS } from '../data/initialPreviousQuestions';
 import { calculateExamScore } from '../utils/scoring';
 import { generate30ModelTests } from '../utils/modelTestGenerator';
-import { signInWithPopup, signOut, onAuthStateChanged } from 'firebase/auth';
+import { signInWithPopup, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged } from 'firebase/auth';
 import { isFirebaseConnected, getFirebaseProjectDetails, auth, googleProvider } from '../lib/firebase';
 import { 
   fetchQuestionsFromFirestore, 
@@ -182,6 +182,8 @@ interface AppContextType {
   isLoggedIn: boolean;
   loginUser: (userData?: Partial<UserProfile>) => void;
   loginWithGoogle: () => Promise<{ success: boolean; error?: string }>;
+  loginWithEmail: (email: string, password: string, isSignUp?: boolean, candidateName?: string) => Promise<{ success: boolean; error?: string }>;
+  getIdToken: () => Promise<string | null>;
   logoutUser: () => void;
   showLoginModal: boolean;
   setShowLoginModal: (show: boolean) => void;
@@ -537,10 +539,30 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     return initialSeed;
   });
 
+  const getIdToken = async (): Promise<string | null> => {
+    try {
+      if (auth?.currentUser) {
+        return await auth.currentUser.getIdToken();
+      }
+      return null;
+    } catch (e) {
+      return null;
+    }
+  };
+
   const loginUser = (userData?: Partial<UserProfile>) => {
     if (userData) {
-      setCurrentUser(prev => ({ ...prev, ...userData }));
-      if (userData.role === 'admin' || userData.email === 'khayrulalam88@gmail.com') {
+      // Prevent privilege escalation: only verified owner email can ever have admin role
+      const isAdminEmail = (userData.email || currentUser.email)?.toLowerCase().trim() === 'khayrulalam88@gmail.com';
+      const safeRole: UserRole = userData.role === 'admin' ? (isAdminEmail ? 'admin' : 'student') : (userData.role || currentUser.role);
+      
+      setCurrentUser(prev => ({ 
+        ...prev, 
+        ...userData,
+        role: safeRole
+      }));
+
+      if (safeRole === 'admin') {
         setActiveScreen('admin');
       }
     }
@@ -548,6 +570,93 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     try {
       localStorage.setItem('sanadprep_is_logged_in', 'true');
     } catch (e) {}
+  };
+
+  const loginWithEmail = async (
+    email: string, 
+    password: string, 
+    isSignUp = false, 
+    candidateName?: string
+  ): Promise<{ success: boolean; error?: string }> => {
+    try {
+      if (!auth) {
+        return { success: false, error: 'Firebase Authentication is not available.' };
+      }
+      const trimmedEmail = email.trim().toLowerCase();
+      let userCredential;
+      if (isSignUp) {
+        userCredential = await createUserWithEmailAndPassword(auth, trimmedEmail, password);
+      } else {
+        userCredential = await signInWithEmailAndPassword(auth, trimmedEmail, password);
+      }
+      const fbUser = userCredential.user;
+      const uid = fbUser.uid;
+      const resolvedEmail = fbUser.email || trimmedEmail;
+      const resolvedName = fbUser.displayName || candidateName || (resolvedEmail === 'khayrulalam88@gmail.com' ? 'মো: খাইরুল আলম' : 'শিক্ষার্থী');
+
+      const isAdmin = await checkIsAdminInFirestore(uid, resolvedEmail);
+
+      let existingProfile = await fetchUserProfileFromFirestore(uid);
+      if (!existingProfile) {
+        const newProfile: UserProfile = {
+          uid,
+          name: resolvedName,
+          email: resolvedEmail,
+          phone: fbUser.phoneNumber || '',
+          role: isAdmin ? 'admin' : 'student',
+          subscriptionStatus: 'free',
+          createdAt: new Date().toISOString()
+        };
+        await saveUserProfileToFirestore(newProfile);
+        existingProfile = newProfile;
+      } else if (isAdmin && existingProfile.role !== 'admin') {
+        existingProfile.role = 'admin';
+        await updateUserRoleOrSubscriptionInFirestore(uid, { role: 'admin' });
+      }
+
+      setCurrentUser(existingProfile);
+      setIsLoggedIn(true);
+
+      try {
+        const [userPayments, userSubs, userResults] = await Promise.all([
+          fetchPaymentRequestsFromFirestore(uid, isAdmin),
+          fetchSubscriptionsFromFirestore(uid, isAdmin),
+          fetchExamResultsFromFirestore(uid, isAdmin)
+        ]);
+        if (userPayments && userPayments.length > 0) setPaymentRequests(userPayments);
+        if (userSubs && userSubs.length > 0) {
+          setSubscriptions(userSubs);
+          const now = Date.now();
+          const hasActiveSub = userSubs.some(s => s.status === 'active' && new Date(s.expiresAt).getTime() > now);
+          if (hasActiveSub && existingProfile.subscriptionStatus !== 'pro') {
+            setCurrentUser(prev => ({ ...prev, subscriptionStatus: 'pro' }));
+          }
+        }
+        if (userResults && userResults.length > 0) setExamResults(userResults);
+      } catch (err) {
+        console.warn('Post-login Firestore sync notice:', err);
+      }
+
+      if (isAdmin) {
+        setActiveScreen('admin');
+      } else {
+        setActiveScreen('dashboard');
+      }
+      return { success: true };
+    } catch (err: any) {
+      console.error('Email Authentication failed:', err);
+      let errMsg = err?.message || 'Authentication failed';
+      if (err?.code === 'auth/wrong-password' || err?.code === 'auth/invalid-credential') {
+        errMsg = language === 'bn' ? 'ভুল পাসওয়ার্ড অথবা ইমেইল। সঠিক তথ্য প্রদান করুন।' : 'Invalid email or password.';
+      } else if (err?.code === 'auth/user-not-found') {
+        errMsg = language === 'bn' ? 'এই ইমেইল দিয়ে কোনো অ্যাকাউন্ট খুঁজে পাওয়া যায়নি। সাইন আপ করুন।' : 'No account found with this email. Please sign up.';
+      } else if (err?.code === 'auth/email-already-in-use') {
+        errMsg = language === 'bn' ? 'এই ইমেইলটি ইতিপূর্বে নিবন্ধিত হয়েছে। অনুগ্রহ করে লগইন করুন।' : 'This email is already in use. Please sign in.';
+      } else if (err?.code === 'auth/weak-password') {
+        errMsg = language === 'bn' ? 'পাসওয়ার্ড কমপক্ষে ৬ অক্ষরের হতে হবে।' : 'Password should be at least 6 characters.';
+      }
+      return { success: false, error: errMsg };
+    }
   };
 
   const loginWithGoogle = async (): Promise<{ success: boolean; error?: string }> => {
@@ -594,7 +703,14 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         ]);
 
         if (userPayments && userPayments.length > 0) setPaymentRequests(userPayments);
-        if (userSubs && userSubs.length > 0) setSubscriptions(userSubs);
+        if (userSubs && userSubs.length > 0) {
+          setSubscriptions(userSubs);
+          const now = Date.now();
+          const hasActiveSub = userSubs.some(s => s.status === 'active' && new Date(s.expiresAt).getTime() > now);
+          if (hasActiveSub && existingProfile.subscriptionStatus !== 'pro') {
+            setCurrentUser(prev => ({ ...prev, subscriptionStatus: 'pro' }));
+          }
+        }
         if (userResults && userResults.length > 0) setExamResults(userResults);
       } catch (err) {
         console.warn('Post-login Firestore sync notice:', err);
@@ -2090,6 +2206,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         isLoggedIn,
         loginUser,
         loginWithGoogle,
+        loginWithEmail,
+        getIdToken,
         logoutUser,
         showLoginModal,
         setShowLoginModal,

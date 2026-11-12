@@ -912,17 +912,54 @@ async function startServer() {
     });
   } else {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: { 
+        middlewareMode: true,
+        hmr: process.env.DISABLE_HMR === 'true' ? false : undefined
+      },
       appType: 'spa'
     });
     app.use(vite.middlewares);
+
+    // Fallback for SPA routing in development mode
+    app.get('*', async (req, res, next) => {
+      if (req.path.startsWith('/api')) {
+        return next();
+      }
+      try {
+        const indexPath = path.resolve(__dirname, 'index.html');
+        let template = fs.readFileSync(indexPath, 'utf-8');
+        template = await vite.transformIndexHtml(req.originalUrl, template);
+        res.status(200).set({ 'Content-Type': 'text/html' }).end(template);
+      } catch (e) {
+        next(e);
+      }
+    });
   }
 
-  // AI Studio Dev Server must run on port 3000; in production use Cloud Run PORT
-  const PORT = isProduction ? (Number(process.env.PORT) || 3000) : 3000;
-  app.listen(PORT, '0.0.0.0', () => {
+  // Parse --port CLI argument or fallback to 3000 (AI Studio requires port 3000)
+  const portArgIndex = process.argv.indexOf('--port');
+  const cliPort = portArgIndex !== -1 ? Number(process.argv[portArgIndex + 1]) : null;
+  const PORT = cliPort || (isProduction && process.env.PORT ? Number(process.env.PORT) : 3000);
+
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Sanad Prep BD Engine running on port ${PORT} [mode: ${isProduction ? 'production' : 'development'}]`);
   });
+
+  server.on('error', (err: any) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`Port ${PORT} is already in use.`);
+    } else {
+      console.error('Server error:', err);
+    }
+  });
+
+  const handleShutdown = () => {
+    server.close(() => {
+      process.exit(0);
+    });
+  };
+  process.on('SIGTERM', handleShutdown);
+  process.on('SIGINT', handleShutdown);
 }
 
 startServer();
