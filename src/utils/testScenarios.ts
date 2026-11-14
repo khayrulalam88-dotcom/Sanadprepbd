@@ -68,7 +68,7 @@ export function runAllTestScenarios(): TestScenarioResult[] {
 
   // --- Test 2: Verify correct amount and package are shown on checkout ---
   {
-    const selectedPkg = INITIAL_PACKAGES[0]; // Pro Model Test Pass
+    const selectedPkg = INITIAL_PACKAGES.find(p => p.id === 'pkg_pro_mock') || INITIAL_PACKAGES[0]; // Pro Model Test Pass
     const checkoutAmount = selectedPkg.price;
     const checkoutTitle = selectedPkg.nameBn;
     const isAmountExact = checkoutAmount === 300 && checkoutTitle.includes('প্রো মডেল টেস্ট');

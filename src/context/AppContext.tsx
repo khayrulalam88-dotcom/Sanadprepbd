@@ -27,35 +27,66 @@ import { INITIAL_EXAMS, SUBJECT_PRACTICE_TESTS } from '../data/initialExams';
 import { INITIAL_PACKAGES, INITIAL_EXAM_DATE_CONFIG } from '../data/initialPackages';
 import { INITIAL_LEADERBOARD_ENTRIES } from '../data/initialLeaderboard';
 import { INITIAL_PREVIOUS_QUESTIONS } from '../data/initialPreviousQuestions';
-import { calculateExamScore } from '../utils/scoring';
 import { generate30ModelTests } from '../utils/modelTestGenerator';
 import { signInWithPopup, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged } from 'firebase/auth';
-import { isFirebaseConnected, getFirebaseProjectDetails, auth, googleProvider } from '../lib/firebase';
-import { 
-  fetchQuestionsFromFirestore, 
-  saveQuestionToFirestore, 
-  deleteQuestionFromFirestore, 
-  fetchExamsFromFirestore, 
-  saveExamToFirestore, 
-  fetchPaymentRequestsFromFirestore, 
-  savePaymentRequestToFirestore, 
-  updatePaymentRequestStatusInFirestore, 
-  fetchSubscriptionsFromFirestore, 
-  saveSubscriptionToFirestore, 
-  fetchExamResultsFromFirestore, 
-  saveExamResultToFirestore, 
+import {
+  isFirebaseConnected,
+  getFirebaseProjectDetails,
+  auth,
+  googleProvider,
+  OWNER_ADMIN_UID,
+  isVerifiedOwnerAccount
+} from '../lib/firebase';
+import {
+  fetchQuestionsFromFirestore,
+  saveQuestionToFirestore,
+  deleteQuestionFromFirestore,
+  fetchExamsFromFirestore,
+  saveExamToFirestore,
+  fetchPaymentRequestsFromFirestore,
+  savePaymentRequestToFirestore,
+  updatePaymentRequestStatusInFirestore,
+  fetchSubscriptionsFromFirestore,
+  saveSubscriptionToFirestore,
+  fetchExamResultsFromFirestore,
   fetchLeaderboardFromFirestore,
-  saveLeaderboardEntryToFirestore,
   fetchPreviousQuestionsFromFirestore,
   savePreviousQuestionToFirestore,
   deletePreviousQuestionFromFirestore,
   batchImportPreviousQuestionsToFirestore,
-  seedFirestoreIfEmpty,
   fetchUserProfileFromFirestore,
   checkIsAdminInFirestore,
   saveUserProfileToFirestore,
   updateUserRoleOrSubscriptionInFirestore
 } from '../lib/firestoreService';
+import {
+  setApiSessionId,
+  apiFetchPublicCatalog,
+  apiFetchLeaderboard,
+  apiCreateSession,
+  apiFetchSanitizedQuestions,
+  apiFetchAdminQuestions,
+  apiFetchAdminPreviousQuestions,
+  apiCheckPracticeAnswer,
+  apiStartExam,
+  apiSaveExamAnswer,
+  apiSubmitExam,
+  apiFetchExamResults,
+  apiCreatePaymentRequest,
+  apiFetchPaymentRequests,
+  apiApprovePaymentRequest,
+  apiRejectPaymentRequest,
+  apiAdminSaveQuestion,
+  apiAdminDeleteQuestion,
+  apiAdminSavePreviousQuestion,
+  apiAdminSaveExam,
+  apiAdminFetchSubscriptions,
+  apiAdminUpdateUser,
+  apiAdminUpdatePackage,
+  apiAdminUpdateExamConfig,
+  apiAdminUpdatePaymentSettings,
+  apiAdminUpdateSupportSettings
+} from '../lib/api';
 
 interface AppContextType {
   language: Language;
@@ -100,7 +131,7 @@ interface AppContextType {
     packageNameEn?: string;
     expiresAt?: string;
     isSessionRevoked?: boolean;
-  }) => { success: boolean; message: string };
+  }) => Promise<{ success: boolean; message: string }>;
   
   // Single-Active-Session & Security
   currentSession: StudentSession | null;
@@ -124,20 +155,22 @@ interface AppContextType {
   // Exams & Custom Model Test
   activeAttempt: ExamAttempt | null;
   currentExamForAttempt: Exam | null;
-  startExam: (examId: string) => { success: boolean; reason?: string };
+  startExam: (examId: string) => Promise<{ success: boolean; reason?: string }>;
   createAndStartCustomExam: (config: {
     titleBn?: string;
     titleEn?: string;
     durationMinutes: number;
     questionIds: string[];
     negativeMarkRatio?: number;
-  }) => { success: boolean; examId?: string; reason?: string };
+  }) => Promise<{ success: boolean; examId?: string; reason?: string }>;
   showCustomTestModal: boolean;
   setShowCustomTestModal: (show: boolean) => void;
   saveActiveAnswer: (questionId: string, optionIndex: number) => void;
   clearActiveAnswer: (questionId: string) => void;
   toggleFlagQuestion: (questionId: string) => void;
-  submitExamAttempt: (isAutoTimeout?: boolean) => ExamResult | null;
+  submitExamAttempt: (isAutoTimeout?: boolean) => Promise<ExamResult | null>;
+  examLaunchError: string | null;
+  setExamLaunchError: (err: string | null) => void;
   
   // Results & Leaderboard
   activeResult: ExamResult | null;
@@ -151,6 +184,15 @@ interface AppContextType {
   startSubjectPractice: (subjectId: string) => { success: boolean; reason?: string };
   answeredQuestions: Record<string, AnsweredQuestionRecord>;
   recordQuestionAnswer: (questionId: string, subjectId: string, selectedOption: number, isCorrect: boolean) => void;
+  checkPracticeAnswer: (questionId: string, selectedOption: number) => Promise<{
+    success: boolean;
+    isCorrect?: boolean;
+    correctOptionIndex?: number;
+    explanationBn?: string;
+    explanationEn?: string;
+    legalReference?: string;
+    error?: string;
+  }>;
   getSubjectProgress: (subjectId: string) => SubjectPracticeProgress;
   
   // Questions & Exams CRUD
@@ -171,16 +213,16 @@ interface AppContextType {
     studentPhone?: string;
     senderNumber: string; 
     transactionId: string; 
-    amount: number; 
+    amount?: number; 
     packageId: string;
     packageTitle?: string; 
-  }) => { success: boolean; error?: string };
-  approvePaymentRequest: (id: string) => { success: boolean; error?: string };
-  rejectPaymentRequest: (id: string, reason: string) => void;
+  }) => Promise<{ success: boolean; error?: string }>;
+  approvePaymentRequest: (id: string) => Promise<{ success: boolean; error?: string }>;
+  rejectPaymentRequest: (id: string, reason: string) => Promise<{ success: boolean; error?: string }>;
   
   // UI Modals & Auth
   isLoggedIn: boolean;
-  loginUser: (userData?: Partial<UserProfile>) => void;
+  isVerifiedAdmin: boolean;
   loginWithGoogle: () => Promise<{ success: boolean; error?: string }>;
   loginWithEmail: (email: string, password: string, isSignUp?: boolean, candidateName?: string) => Promise<{ success: boolean; error?: string }>;
   getIdToken: () => Promise<string | null>;
@@ -202,108 +244,35 @@ interface AppContextType {
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
 
-// Storage Keys
+// Storage Keys (public UI preferences & non-sensitive local caches only)
 const LOCAL_STORAGE_KEY_ATTEMPT = 'barprep_bd_active_attempt';
 const LOCAL_STORAGE_KEY_RESULTS = 'barprep_bd_exam_results';
-const LOCAL_STORAGE_KEY_PAYMENTS = 'barprep_bd_payment_requests';
-const LOCAL_STORAGE_KEY_QUESTIONS = 'barprep_bd_custom_questions';
 const LOCAL_STORAGE_KEY_PAYMENT_SETTINGS = 'barprep_bd_payment_settings';
 const LOCAL_STORAGE_KEY_SUPPORT_SETTINGS = 'barprep_bd_support_settings';
 const LOCAL_STORAGE_KEY_PACKAGES = 'barprep_bd_subscription_packages';
 const LOCAL_STORAGE_KEY_EXAM_CONFIG = 'barprep_bd_exam_date_config';
-const LOCAL_STORAGE_KEY_SUBSCRIPTIONS = 'barprep_bd_user_subscriptions';
-const LOCAL_STORAGE_KEY_SESSION = 'barprep_bd_current_session';
 const LOCAL_STORAGE_KEY_EXAMS = 'sanadprep_bd_exams';
 const LOCAL_STORAGE_KEY_ANSWERED_QUESTIONS = 'sanadprep_answered_questions';
 const LOCAL_STORAGE_KEY_LEADERBOARD = 'sanadprep_bd_leaderboard';
-const LOCAL_STORAGE_KEY_PREVIOUS_QUESTIONS = 'sanadprep_previous_questions';
 
-export const INITIAL_SUBSCRIPTIONS: UserSubscription[] = [
-  {
-    id: 'sub_candidate_786',
-    userId: 'user_candidate_786',
-    studentName: 'মো: খাইরুল আলম (Khayrul Alam)',
-    studentPhone: '01712-345678',
-    packageId: 'pkg_pro_mock',
-    packageNameBn: 'প্রো মডেল টেস্ট পাস (৯০ দিন)',
-    packageNameEn: 'Pro Model Test Pass (90 Days)',
-    pricePaid: 300,
-    paymentRequestId: 'pay_req_demo_1',
-    paymentMethod: 'bKash',
-    transactionId: '9K28DF10PQ',
-    activatedAt: new Date(Date.now() - 5 * 24 * 3600 * 1000).toISOString(),
-    expiresAt: new Date(Date.now() + 85 * 24 * 3600 * 1000).toISOString(),
-    validityType: 'days',
-    status: 'active',
-    createdAt: new Date(Date.now() - 5 * 24 * 3600 * 1000).toISOString()
-  },
-  {
-    id: 'sub_tanvir_02',
-    userId: 'user_tanvir_02',
-    studentName: 'তানভীর আহমেদ (Tanvir Ahmed)',
-    studentPhone: '01819-876543',
-    packageId: 'pkg_long_course',
-    packageNameBn: '১ বছর লং কোর্স পাস (৩৬৫ দিন)',
-    packageNameEn: '1-Year Long Course Pass (365 Days)',
-    pricePaid: 999,
-    paymentRequestId: 'pay_req_tanvir_1',
-    paymentMethod: 'bKash',
-    transactionId: 'BL987654XZ',
-    activatedAt: new Date(Date.now() - 15 * 24 * 3600 * 1000).toISOString(),
-    expiresAt: new Date(Date.now() + 350 * 24 * 3600 * 1000).toISOString(),
-    validityType: 'days',
-    status: 'active',
-    createdAt: new Date(Date.now() - 15 * 24 * 3600 * 1000).toISOString()
-  },
-  {
-    id: 'sub_sabrina_03',
-    userId: 'user_sabrina_03',
-    studentName: 'সাবরিনা ইয়াসমিন (Sabrina Yasmin)',
-    studentPhone: '01912-334455',
-    packageId: 'pkg_exam_pass',
-    packageNameBn: 'বার কাউন্সিল এক্সাম পাস (পরীক্ষার দিন পর্যন্ত)',
-    packageNameEn: 'Bar Council Exam Pass (Until Exam Date)',
-    pricePaid: 1500,
-    paymentRequestId: 'pay_req_sabrina_1',
-    paymentMethod: 'Nagad',
-    transactionId: 'NG654321XY',
-    activatedAt: new Date(Date.now() - 20 * 24 * 3600 * 1000).toISOString(),
-    expiresAt: '2026-12-31T18:00:00.000Z',
-    validityType: 'exam_date',
-    status: 'active',
-    createdAt: new Date(Date.now() - 20 * 24 * 3600 * 1000).toISOString()
-  }
-];
+const createGuestUserProfile = (): UserProfile => ({
+  uid: '',
+  name: 'অতিথি শিক্ষার্থী (Guest)',
+  email: '',
+  phone: '',
+  role: 'student',
+  subscriptionStatus: 'free',
+  createdAt: new Date().toISOString(),
+});
 
 export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [language, setLanguage] = useState<Language>('bn');
-  
-  // Default Demo User with clean identity
-  const [currentUser, setCurrentUser] = useState<UserProfile>({
-    uid: 'user_candidate_786',
-    name: 'মো: খাইরুল আলম (Khayrul Alam)',
-    email: 'khayrulalam88@gmail.com',
-    phone: '01712-345678',
-    role: 'student',
-    subscriptionStatus: 'free',
-    createdAt: '2026-01-10T12:00:00Z',
-  });
+  const [currentUser, setCurrentUser] = useState<UserProfile>(createGuestUserProfile);
 
   const [subjects] = useState<Subject[]>(INITIAL_SUBJECTS);
   
-  // 3,000 MCQ Questions partitioned for 30 Model Tests
-  const [questions, setQuestions] = useState<Question[]>(() => {
-    try {
-      const saved = localStorage.getItem(LOCAL_STORAGE_KEY_QUESTIONS);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length >= 3000) {
-          return parsed;
-        }
-      }
-    } catch (e) {}
-    return INITIAL_QUESTIONS;
-  });
+  // Sanitized questions (hydrated cleanly from backend API or Owner Admin endpoint; never leaked from localStorage)
+  const [questions, setQuestions] = useState<Question[]>(INITIAL_QUESTIONS);
 
   const [exams, setExams] = useState<Exam[]>(() => {
     try {
@@ -368,17 +337,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     return INITIAL_EXAM_DATE_CONFIG;
   });
 
-  // Subscriptions Ledger
-  const [subscriptions, setSubscriptions] = useState<UserSubscription[]>(() => {
-    try {
-      const saved = localStorage.getItem(LOCAL_STORAGE_KEY_SUBSCRIPTIONS);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
-      }
-    } catch (e) {}
-    return INITIAL_SUBSCRIPTIONS;
-  });
+  // Subscriptions Ledger (Loaded strictly from Firestore for authenticated session)
+  const [subscriptions, setSubscriptions] = useState<UserSubscription[]>([]);
 
   // Payment Settings (Configurable bKash & Nagad numbers)
   const [paymentSettings, setPaymentSettings] = useState<PaymentSettings>(() => {
@@ -409,51 +369,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     };
   });
 
-  // Payments Requests
-  const [paymentRequests, setPaymentRequests] = useState<PaymentRequest[]>(() => {
-    try {
-      const saved = localStorage.getItem(LOCAL_STORAGE_KEY_PAYMENTS);
-      if (saved) return JSON.parse(saved);
-    } catch (e) {}
-    return [
-      {
-        id: 'pay_req_demo_1',
-        userId: 'user_candidate_786',
-        studentName: 'মো: খাইরুল আলম',
-        studentPhone: '01712-345678',
-        method: 'bKash',
-        senderNumber: '01712607777',
-        transactionId: '9K28DF10PQ',
-        amount: 300,
-        packageId: 'pkg_pro_mock',
-        packageNameBn: 'প্রো মডেল টেস্ট পাস (Pro Model Test Pass)',
-        packageNameEn: 'Pro Model Test Pass',
-        packageTitle: 'Sanad Prep BD প্রো মডেল টেস্ট পাস (৯০ দিন)',
-        durationDays: 90,
-        validityType: 'days',
-        status: 'pending',
-        requestedAt: new Date(Date.now() - 3600000).toISOString()
-      }
-    ];
-  });
+  // Payments Requests (Loaded strictly from Firestore for authenticated session)
+  const [paymentRequests, setPaymentRequests] = useState<PaymentRequest[]>([]);
 
-  // Single-Active-Session State
-  const [currentSession, setCurrentSession] = useState<StudentSession | null>(() => {
-    try {
-      const saved = localStorage.getItem(LOCAL_STORAGE_KEY_SESSION);
-      if (saved) return JSON.parse(saved);
-    } catch (e) {}
-    return {
-      sessionId: `sess_${Date.now()}_alpha7`,
-      userId: 'user_candidate_786',
-      userEmail: 'khayrulalam88@gmail.com',
-      userName: 'মো: খাইরুল আলম (Khayrul Alam)',
-      deviceInfo: 'Chrome / macOS (Dhaka, BD)',
-      createdAt: new Date().toISOString(),
-      lastActiveAt: new Date().toISOString(),
-      status: 'active'
-    };
-  });
+  // Single-Active-Session State (Created only on verified Firebase login)
+  const [currentSession, setCurrentSession] = useState<StudentSession | null>(null);
 
   const [isSessionRevoked, setIsSessionRevoked] = useState<boolean>(false);
   const [sessionRevokedReason, setSessionRevokedReason] = useState<string>('');
@@ -471,16 +391,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   const [activeScreen, setActiveScreen] = useState<'landing' | 'dashboard' | 'exam' | 'practice' | 'result' | 'admin' | 'tests' | 'subjects' | 'history' | 'question_bank' | 'previous_questions'>('landing');
   const [selectedPreviousYear, setSelectedPreviousYear] = useState<number | 'all'>('all');
-  const [previousQuestions, setPreviousQuestions] = useState<PreviousQuestion[]>(() => {
-    try {
-      const saved = localStorage.getItem(LOCAL_STORAGE_KEY_PREVIOUS_QUESTIONS);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
-      }
-    } catch (e) {}
-    return INITIAL_PREVIOUS_QUESTIONS;
-  });
+  const [previousQuestions, setPreviousQuestions] = useState<PreviousQuestion[]>(INITIAL_PREVIOUS_QUESTIONS);
   const [showCustomTestModal, setShowCustomTestModal] = useState<boolean>(false);
   const [activeAttempt, setActiveAttempt] = useState<ExamAttempt | null>(() => {
     try {
@@ -495,6 +406,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   const [activeResult, setActiveResult] = useState<ExamResult | null>(null);
   const [selectedSubjectForPractice, setSelectedSubjectForPractice] = useState<Subject | null>(null);
+  const [examLaunchError, setExamLaunchError] = useState<string | null>(null);
   
   const [showPaymentModal, setShowPaymentModal] = useState<boolean>(false);
   const [selectedPackageForPayment, setSelectedPackageForPayment] = useState<SubscriptionPackage | null>(packages[0]);
@@ -502,14 +414,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [showTestRunner, setShowTestRunner] = useState<boolean>(false);
   const [isSubmittingExam, setIsSubmittingExam] = useState<boolean>(false);
 
-  const [isLoggedIn, setIsLoggedIn] = useState<boolean>(() => {
-    try {
-      const saved = localStorage.getItem('sanadprep_is_logged_in');
-      return saved === 'true';
-    } catch (e) {
-      return false;
-    }
-  });
+  const [isLoggedIn, setIsLoggedIn] = useState<boolean>(false);
+  const [isVerifiedAdmin, setIsVerifiedAdmin] = useState<boolean>(false);
   const [showLoginModal, setShowLoginModal] = useState<boolean>(false);
   const [showSearchModal, setShowSearchModal] = useState<boolean>(false);
   const [showInfoModal, setShowInfoModal] = useState<'about' | 'syllabus' | 'rules' | 'books' | null>(null);
@@ -523,20 +429,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         if (parsed && typeof parsed === 'object') return parsed;
       }
     } catch (e) {}
-
-    // Seed realistic sample practice progress across subjects based on initial questions
-    const initialSeed: Record<string, AnsweredQuestionRecord> = {};
-    const sampleQuestions = INITIAL_QUESTIONS.slice(0, 48);
-    sampleQuestions.forEach((q, idx) => {
-      initialSeed[q.id] = {
-        questionId: q.id,
-        subjectId: q.subjectId,
-        selectedOption: idx % 6 === 0 ? (q.correctOptionIndex + 1) % 4 : q.correctOptionIndex,
-        isCorrect: idx % 6 !== 0,
-        timestamp: new Date(Date.now() - (idx + 1) * 3600 * 1000).toISOString()
-      };
-    });
-    return initialSeed;
+    return {};
   });
 
   const getIdToken = async (): Promise<string | null> => {
@@ -550,32 +443,122 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   };
 
-  const loginUser = (userData?: Partial<UserProfile>) => {
-    if (userData) {
-      // Prevent privilege escalation: only verified owner email can ever have admin role
-      const isAdminEmail = (userData.email || currentUser.email)?.toLowerCase().trim() === 'khayrulalam88@gmail.com';
-      const safeRole: UserRole = userData.role === 'admin' ? (isAdminEmail ? 'admin' : 'student') : (userData.role || currentUser.role);
-      
-      setCurrentUser(prev => ({ 
-        ...prev, 
-        ...userData,
-        role: safeRole
-      }));
+  const syncAuthenticatedUserData = useCallback(
+    async (fbUser: { uid: string; email?: string | null; displayName?: string | null }, isAdmin: boolean) => {
+      const uid = fbUser.uid;
+      const isOwner = isVerifiedOwnerAccount(fbUser);
 
-      if (safeRole === 'admin') {
-        setActiveScreen('admin');
+      try {
+        // 1. Establish server session & active subscription check
+        const sessionRes = await apiCreateSession(
+          fbUser.displayName || undefined,
+          typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 80) : 'Web Browser'
+        );
+        if (sessionRes.ok && sessionRes.data) {
+          setCurrentSession(sessionRes.data.session);
+          setApiSessionId(sessionRes.data.sessionId);
+          setIsSessionRevoked(false);
+          setSessionRevokedReason('');
+        }
+
+        // 2. Fetch questions (Owner Admin gets full questions + keys; students get sanitized stems & options only)
+        if (isOwner) {
+          const [adminQRes, adminPqRes] = await Promise.all([
+            apiFetchAdminQuestions(),
+            apiFetchAdminPreviousQuestions()
+          ]);
+          if (adminQRes.ok && adminQRes.data?.questions?.length) {
+            setQuestions(adminQRes.data.questions);
+          } else {
+            const fsQ = await fetchQuestionsFromFirestore();
+            if (fsQ.length > 0) setQuestions(fsQ);
+          }
+          if (adminPqRes.ok && adminPqRes.data?.previousQuestions?.length) {
+            setPreviousQuestions(adminPqRes.data.previousQuestions);
+          } else {
+            const fsPq = await fetchPreviousQuestionsFromFirestore();
+            if (fsPq.length > 0) setPreviousQuestions(fsPq);
+          }
+        } else {
+          const qRes = await apiFetchSanitizedQuestions();
+          if (qRes.ok && qRes.data?.questions?.length) {
+            setQuestions(qRes.data.questions);
+          }
+        }
+
+        // 3. Fetch payments, subscriptions, and exam results from BOTH Firestore & backend API
+        const [
+          fsPayments,
+          apiPaymentsRes,
+          fsSubs,
+          apiSubsRes,
+          fsResults,
+          apiResultsRes
+        ] = await Promise.all([
+          fetchPaymentRequestsFromFirestore(uid, isAdmin),
+          apiFetchPaymentRequests(),
+          fetchSubscriptionsFromFirestore(uid, isAdmin),
+          isOwner ? apiAdminFetchSubscriptions() : Promise.resolve(null),
+          fetchExamResultsFromFirestore(uid, isAdmin),
+          apiFetchExamResults(uid)
+        ]);
+
+        const payMap = new Map<string, PaymentRequest>();
+        (apiPaymentsRes.ok ? apiPaymentsRes.data?.paymentRequests || [] : []).forEach(p => payMap.set(p.id, p));
+        (fsPayments || []).forEach(p => payMap.set(p.id, p));
+        const mergedPayments = Array.from(payMap.values()).sort(
+          (a, b) => new Date(b.requestedAt).getTime() - new Date(a.requestedAt).getTime()
+        );
+        setPaymentRequests(mergedPayments);
+
+        const subMap = new Map<string, UserSubscription>();
+        (apiSubsRes?.ok ? apiSubsRes.data?.subscriptions || [] : []).forEach(s => subMap.set(s.id, s));
+        (fsSubs || []).forEach(s => subMap.set(s.id, s));
+        const mergedSubs = Array.from(subMap.values());
+        setSubscriptions(mergedSubs);
+
+        const resMap = new Map<string, ExamResult>();
+        (fsResults || []).forEach(r => resMap.set(r.id, r));
+        (apiResultsRes.ok ? apiResultsRes.data?.results || [] : []).forEach(r => resMap.set(r.id, r));
+        const mergedResults = Array.from(resMap.values()).sort(
+          (a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime()
+        );
+        setExamResults(mergedResults);
+
+        const hasActiveSub = mergedSubs.some(
+          s => s.userId === uid && s.status === 'active' && new Date(s.expiresAt).getTime() > Date.now()
+        );
+        if (hasActiveSub) {
+          setCurrentUser(prev => ({ ...prev, subscriptionStatus: 'pro' }));
+        }
+
+        const [apiCatalogExams, fsExams] = await Promise.all([
+          apiFetchPublicCatalog().then(([exRes]) => (exRes.ok ? exRes.data?.exams || [] : [])),
+          fetchExamsFromFirestore(hasActiveSub || isAdmin)
+        ]);
+        const examSource = apiCatalogExams.length > 0 ? apiCatalogExams : fsExams;
+        if (examSource && examSource.length > 0) {
+          setExams(prev => {
+            const map = new Map<string, Exam>();
+            examSource.forEach(e => map.set(e.id, e));
+            // Keep any freshly synced local exams not yet on server
+            prev.forEach(e => {
+              if (!map.has(e.id)) map.set(e.id, e);
+            });
+            return Array.from(map.values());
+          });
+        }
+      } catch (err) {
+        console.warn('Post-login sync notice:', err);
       }
-    }
-    setIsLoggedIn(true);
-    try {
-      localStorage.setItem('sanadprep_is_logged_in', 'true');
-    } catch (e) {}
-  };
+    },
+    []
+  );
 
   const loginWithEmail = async (
-    email: string, 
-    password: string, 
-    isSignUp = false, 
+    email: string,
+    password: string,
+    isSignUp = false,
     candidateName?: string
   ): Promise<{ success: boolean; error?: string }> => {
     try {
@@ -583,18 +566,16 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         return { success: false, error: 'Firebase Authentication is not available.' };
       }
       const trimmedEmail = email.trim().toLowerCase();
-      let userCredential;
-      if (isSignUp) {
-        userCredential = await createUserWithEmailAndPassword(auth, trimmedEmail, password);
-      } else {
-        userCredential = await signInWithEmailAndPassword(auth, trimmedEmail, password);
-      }
+      const userCredential = isSignUp
+        ? await createUserWithEmailAndPassword(auth, trimmedEmail, password)
+        : await signInWithEmailAndPassword(auth, trimmedEmail, password);
       const fbUser = userCredential.user;
       const uid = fbUser.uid;
       const resolvedEmail = fbUser.email || trimmedEmail;
-      const resolvedName = fbUser.displayName || candidateName || (resolvedEmail === 'khayrulalam88@gmail.com' ? 'মো: খাইরুল আলম' : 'শিক্ষার্থী');
-
-      const isAdmin = await checkIsAdminInFirestore(uid, resolvedEmail);
+      const isOwner = isVerifiedOwnerAccount(fbUser);
+      const isAdmin = isOwner || (await checkIsAdminInFirestore(uid));
+      const resolvedName = fbUser.displayName || candidateName || (isOwner ? 'মো: খাইরুল আলম' : 'শিক্ষার্থী');
+      const effectiveRole: UserRole = isAdmin ? 'admin' : 'student';
 
       let existingProfile = await fetchUserProfileFromFirestore(uid);
       if (!existingProfile) {
@@ -603,39 +584,34 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           name: resolvedName,
           email: resolvedEmail,
           phone: fbUser.phoneNumber || '',
-          role: isAdmin ? 'admin' : 'student',
+          role: effectiveRole,
           subscriptionStatus: 'free',
           createdAt: new Date().toISOString()
         };
         await saveUserProfileToFirestore(newProfile);
         existingProfile = newProfile;
-      } else if (isAdmin && existingProfile.role !== 'admin') {
-        existingProfile.role = 'admin';
-        await updateUserRoleOrSubscriptionInFirestore(uid, { role: 'admin' });
+      } else {
+        existingProfile = { ...existingProfile, role: effectiveRole };
+        if (isOwner && existingProfile.role !== 'admin') {
+          await updateUserRoleOrSubscriptionInFirestore(uid, { role: 'admin' }).catch(() => {});
+        }
       }
 
+      setIsVerifiedAdmin(isAdmin);
       setCurrentUser(existingProfile);
       setIsLoggedIn(true);
+      setCurrentSession({
+        sessionId: `sess_${Date.now()}_${uid.slice(0, 6)}`,
+        userId: uid,
+        userEmail: resolvedEmail,
+        userName: existingProfile.name,
+        deviceInfo: typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 60) : 'Web Browser',
+        createdAt: new Date().toISOString(),
+        lastActiveAt: new Date().toISOString(),
+        status: 'active'
+      });
 
-      try {
-        const [userPayments, userSubs, userResults] = await Promise.all([
-          fetchPaymentRequestsFromFirestore(uid, isAdmin),
-          fetchSubscriptionsFromFirestore(uid, isAdmin),
-          fetchExamResultsFromFirestore(uid, isAdmin)
-        ]);
-        if (userPayments && userPayments.length > 0) setPaymentRequests(userPayments);
-        if (userSubs && userSubs.length > 0) {
-          setSubscriptions(userSubs);
-          const now = Date.now();
-          const hasActiveSub = userSubs.some(s => s.status === 'active' && new Date(s.expiresAt).getTime() > now);
-          if (hasActiveSub && existingProfile.subscriptionStatus !== 'pro') {
-            setCurrentUser(prev => ({ ...prev, subscriptionStatus: 'pro' }));
-          }
-        }
-        if (userResults && userResults.length > 0) setExamResults(userResults);
-      } catch (err) {
-        console.warn('Post-login Firestore sync notice:', err);
-      }
+      await syncAuthenticatedUserData(fbUser, isAdmin);
 
       if (isAdmin) {
         setActiveScreen('admin');
@@ -671,7 +647,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       const name = fbUser.displayName || 'ব্যবহারকারী';
       const phone = fbUser.phoneNumber || '';
 
-      const isAdmin = await checkIsAdminInFirestore(uid, email);
+      const isOwner = isVerifiedOwnerAccount(fbUser);
+      const isAdmin = isOwner || (await checkIsAdminInFirestore(uid));
+      const effectiveRole: UserRole = isAdmin ? 'admin' : 'student';
 
       let existingProfile = await fetchUserProfileFromFirestore(uid);
       if (!existingProfile) {
@@ -680,41 +658,34 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           name,
           email,
           phone,
-          role: isAdmin ? 'admin' : 'student',
+          role: effectiveRole,
           subscriptionStatus: 'free',
           createdAt: new Date().toISOString()
         };
         await saveUserProfileToFirestore(newProfile);
         existingProfile = newProfile;
-      } else if (isAdmin && existingProfile.role !== 'admin') {
-        existingProfile.role = 'admin';
-        await updateUserRoleOrSubscriptionInFirestore(uid, { role: 'admin' });
+      } else {
+        existingProfile = { ...existingProfile, role: effectiveRole };
+        if (isOwner && existingProfile.role !== 'admin') {
+          await updateUserRoleOrSubscriptionInFirestore(uid, { role: 'admin' }).catch(() => {});
+        }
       }
 
+      setIsVerifiedAdmin(isAdmin);
       setCurrentUser(existingProfile);
       setIsLoggedIn(true);
+      setCurrentSession({
+        sessionId: `sess_${Date.now()}_${uid.slice(0, 6)}`,
+        userId: uid,
+        userEmail: email,
+        userName: existingProfile.name,
+        deviceInfo: typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 60) : 'Web Browser',
+        createdAt: new Date().toISOString(),
+        lastActiveAt: new Date().toISOString(),
+        status: 'active'
+      });
 
-      // Fetch user-scoped records from Firestore
-      try {
-        const [userPayments, userSubs, userResults] = await Promise.all([
-          fetchPaymentRequestsFromFirestore(uid, isAdmin),
-          fetchSubscriptionsFromFirestore(uid, isAdmin),
-          fetchExamResultsFromFirestore(uid, isAdmin)
-        ]);
-
-        if (userPayments && userPayments.length > 0) setPaymentRequests(userPayments);
-        if (userSubs && userSubs.length > 0) {
-          setSubscriptions(userSubs);
-          const now = Date.now();
-          const hasActiveSub = userSubs.some(s => s.status === 'active' && new Date(s.expiresAt).getTime() > now);
-          if (hasActiveSub && existingProfile.subscriptionStatus !== 'pro') {
-            setCurrentUser(prev => ({ ...prev, subscriptionStatus: 'pro' }));
-          }
-        }
-        if (userResults && userResults.length > 0) setExamResults(userResults);
-      } catch (err) {
-        console.warn('Post-login Firestore sync notice:', err);
-      }
+      await syncAuthenticatedUserData(fbUser, isAdmin);
 
       if (isAdmin) {
         setActiveScreen('admin');
@@ -732,19 +703,27 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     if (auth) {
       signOut(auth).catch(e => console.warn('Firebase sign out notice:', e));
     }
+    setApiSessionId(null);
     setIsLoggedIn(false);
-    setCurrentUser({
-      uid: `guest_${Date.now()}`,
-      name: 'অতিথি শিক্ষার্থী (Guest)',
-      email: '',
-      phone: '',
-      role: 'student',
-      subscriptionStatus: 'free',
-      createdAt: new Date().toISOString(),
-    });
+    setIsVerifiedAdmin(false);
+    setCurrentUser(createGuestUserProfile());
+    setQuestions(INITIAL_QUESTIONS);
+    setPreviousQuestions(INITIAL_PREVIOUS_QUESTIONS);
+    setSubscriptions([]);
+    setPaymentRequests([]);
+    setExamResults([]);
+    setCurrentSession(null);
+    setActiveAttempt(null);
     setActiveScreen('landing');
     try {
       localStorage.removeItem('sanadprep_is_logged_in');
+      localStorage.removeItem(LOCAL_STORAGE_KEY_RESULTS);
+      localStorage.removeItem(LOCAL_STORAGE_KEY_ATTEMPT);
+      localStorage.removeItem('barprep_bd_custom_questions');
+      localStorage.removeItem('barprep_bd_payment_requests');
+      localStorage.removeItem('barprep_bd_user_subscriptions');
+      localStorage.removeItem('barprep_bd_current_session');
+      localStorage.removeItem('sanadprep_previous_questions');
     } catch (e) {}
   };
 
@@ -758,22 +737,26 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         const name = fbUser.displayName || 'ব্যবহারকারী';
         const phone = fbUser.phoneNumber || '';
 
-        const isAdmin = await checkIsAdminInFirestore(uid, email);
+        const isOwner = isVerifiedOwnerAccount(fbUser);
+        const isAdmin = isOwner || (await checkIsAdminInFirestore(uid));
+        const effectiveRole: UserRole = isAdmin ? 'admin' : 'student';
         const profile = await fetchUserProfileFromFirestore(uid);
 
+        setIsVerifiedAdmin(isAdmin);
+
         if (profile) {
-          if (isAdmin && profile.role !== 'admin') {
-            profile.role = 'admin';
+          const verifiedProfile = { ...profile, role: effectiveRole };
+          if (isOwner && profile.role !== 'admin') {
             updateUserRoleOrSubscriptionInFirestore(uid, { role: 'admin' }).catch(() => {});
           }
-          setCurrentUser(profile);
+          setCurrentUser(verifiedProfile);
         } else {
           const newProfile: UserProfile = {
             uid,
             name,
             email,
             phone,
-            role: isAdmin ? 'admin' : 'student',
+            role: effectiveRole,
             subscriptionStatus: 'free',
             createdAt: new Date().toISOString()
           };
@@ -782,74 +765,85 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         }
 
         setIsLoggedIn(true);
-
-        // Fetch scoped data for the authenticated user
+        await syncAuthenticatedUserData(fbUser, isAdmin);
+      } else {
+        setApiSessionId(null);
+        setIsLoggedIn(false);
+        setIsVerifiedAdmin(false);
+        setCurrentUser(createGuestUserProfile());
+        setQuestions(INITIAL_QUESTIONS);
+        setSubscriptions([]);
+        setPaymentRequests([]);
+        setCurrentSession(null);
+        setActiveScreen(prev => (prev === 'admin' || prev === 'question_bank') ? 'landing' : prev);
         try {
-          const [userPayments, userSubs, userResults] = await Promise.all([
-            fetchPaymentRequestsFromFirestore(uid, isAdmin),
-            fetchSubscriptionsFromFirestore(uid, isAdmin),
-            fetchExamResultsFromFirestore(uid, isAdmin)
-          ]);
-          if (userPayments && userPayments.length > 0) setPaymentRequests(userPayments);
-          if (userSubs && userSubs.length > 0) setSubscriptions(userSubs);
-          if (userResults && userResults.length > 0) setExamResults(userResults);
-        } catch (e) {
-          console.warn('Scoped user data load notice:', e);
-        }
+          localStorage.removeItem('sanadprep_is_logged_in');
+          localStorage.removeItem('barprep_bd_payment_requests');
+          localStorage.removeItem('barprep_bd_user_subscriptions');
+          localStorage.removeItem('barprep_bd_current_session');
+          localStorage.removeItem('barprep_bd_custom_questions');
+          localStorage.removeItem('sanadprep_previous_questions');
+        } catch (e) {}
       }
     });
 
     return () => unsubscribe();
-  }, []);
+  }, [syncAuthenticatedUserData]);
 
-  // Synchronize with Firestore Database on Mount
+  // Synchronize public catalog with Backend API & Firestore on Mount
   useEffect(() => {
     let isMounted = true;
     async function loadDatabaseData() {
       try {
-        const dbQuestions = await fetchQuestionsFromFirestore();
-        if (isMounted && dbQuestions && dbQuestions.length > 0) {
-          setQuestions(dbQuestions);
+        const [
+          examsRes,
+          packagesRes,
+          configRes,
+          paySettingsRes,
+          _subjectsRes,
+          leaderboardRes,
+          prevQuestionsRes
+        ] = await apiFetchPublicCatalog();
+
+        if (isMounted && examsRes.ok && examsRes.data?.exams?.length) {
+          setExams(examsRes.data.exams);
+        } else {
+          const dbExams = await fetchExamsFromFirestore(false);
+          if (isMounted && dbExams && dbExams.length > 0) {
+            setExams(dbExams);
+          }
         }
 
-        const dbExams = await fetchExamsFromFirestore();
-        if (isMounted && dbExams && dbExams.length > 0) {
-          setExams(dbExams);
+        if (isMounted && packagesRes.ok && packagesRes.data?.packages?.length) {
+          setPackages(packagesRes.data.packages);
+        }
+        if (isMounted && configRes.ok && configRes.data?.examDateConfig) {
+          setExamDateConfig(configRes.data.examDateConfig);
+        }
+        if (isMounted && paySettingsRes.ok && paySettingsRes.data) {
+          if (paySettingsRes.data.paymentSettings) setPaymentSettings(paySettingsRes.data.paymentSettings);
+          if (paySettingsRes.data.supportSettings) setSupportSettings(paySettingsRes.data.supportSettings);
         }
 
-        const dbPayments = await fetchPaymentRequestsFromFirestore();
-        if (isMounted && dbPayments && dbPayments.length > 0) {
-          setPaymentRequests(dbPayments);
-        }
-
-        const dbSubs = await fetchSubscriptionsFromFirestore();
-        if (isMounted && dbSubs && dbSubs.length > 0) {
-          setSubscriptions(dbSubs);
-        }
-
-        const dbResults = await fetchExamResultsFromFirestore();
-        if (isMounted && dbResults && dbResults.length > 0) {
-          setExamResults(dbResults);
+        if (isMounted && prevQuestionsRes.ok && prevQuestionsRes.data?.previousQuestions?.length) {
+          setPreviousQuestions(prevQuestionsRes.data.previousQuestions);
         }
 
         const dbLeaderboard = await fetchLeaderboardFromFirestore();
-        if (isMounted && dbLeaderboard && dbLeaderboard.length > 0) {
+        const apiLeaderboard = leaderboardRes.ok ? leaderboardRes.data?.leaderboard || [] : [];
+        const combinedLead = [...apiLeaderboard, ...dbLeaderboard];
+        if (isMounted && combinedLead.length > 0) {
           setLeaderboardEntries(prev => {
             const map = new Map<string, LeaderboardEntry>();
             prev.forEach(item => map.set(item.id, item));
-            dbLeaderboard.forEach(item => map.set(item.id, item));
+            combinedLead.forEach(item => map.set(item.id, item));
             const merged = Array.from(map.values());
             merged.sort((a, b) => b.score - a.score || a.timeSpentSeconds - b.timeSpentSeconds);
             return merged.map((e, idx) => ({ ...e, rank: idx + 1 }));
           });
         }
-
-        const dbPrevQuestions = await fetchPreviousQuestionsFromFirestore();
-        if (isMounted && dbPrevQuestions && dbPrevQuestions.length > 0) {
-          setPreviousQuestions(dbPrevQuestions);
-        }
       } catch (err) {
-        console.warn('Initial Firestore database sync notice:', err);
+        console.warn('Initial catalog sync notice:', err);
       }
     }
 
@@ -857,19 +851,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     return () => { isMounted = false; };
   }, []);
 
-  // Sync to Storage
-  useEffect(() => {
-    try {
-      localStorage.setItem(LOCAL_STORAGE_KEY_PREVIOUS_QUESTIONS, JSON.stringify(previousQuestions));
-    } catch (e) {}
-  }, [previousQuestions]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(LOCAL_STORAGE_KEY_QUESTIONS, JSON.stringify(questions));
-    } catch (e) {}
-  }, [questions]);
-
+  // Sync non-sensitive UI preferences & catalog to Storage (never store answer keys, payments, or subscriptions in localStorage)
   useEffect(() => {
     try {
       localStorage.setItem(LOCAL_STORAGE_KEY_RESULTS, JSON.stringify(examResults));
@@ -896,12 +878,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   useEffect(() => {
     try {
-      localStorage.setItem(LOCAL_STORAGE_KEY_SUBSCRIPTIONS, JSON.stringify(subscriptions));
-    } catch (e) {}
-  }, [subscriptions]);
-
-  useEffect(() => {
-    try {
       localStorage.setItem(LOCAL_STORAGE_KEY_PAYMENT_SETTINGS, JSON.stringify(paymentSettings));
     } catch (e) {}
   }, [paymentSettings]);
@@ -914,23 +890,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   useEffect(() => {
     try {
-      localStorage.setItem(LOCAL_STORAGE_KEY_PAYMENTS, JSON.stringify(paymentRequests));
-    } catch (e) {}
-  }, [paymentRequests]);
-
-  useEffect(() => {
-    try {
       localStorage.setItem(LOCAL_STORAGE_KEY_EXAMS, JSON.stringify(exams));
     } catch (e) {}
   }, [exams]);
-
-  useEffect(() => {
-    try {
-      if (currentSession) {
-        localStorage.setItem(LOCAL_STORAGE_KEY_SESSION, JSON.stringify(currentSession));
-      }
-    } catch (e) {}
-  }, [currentSession]);
 
   useEffect(() => {
     if (activeAttempt) {
@@ -951,12 +913,15 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   }, [answeredQuestions]);
 
   // Derive Active Subscription for Current User
-  const activeSubscription = subscriptions.find(
-    s => s.userId === currentUser.uid && s.status === 'active' && new Date(s.expiresAt).getTime() > Date.now()
-  ) || null;
+  const activeSubscription = (isLoggedIn && currentUser.uid)
+    ? (subscriptions.find(
+        s => s.userId === currentUser.uid && s.status === 'active' && !!s.expiresAt && new Date(s.expiresAt).getTime() > Date.now()
+      ) || null)
+    : null;
 
   // Keep currentUser.subscriptionStatus synced with real subscription
   useEffect(() => {
+    if (!isLoggedIn || !currentUser.uid) return;
     if (activeSubscription) {
       setCurrentUser(prev => ({
         ...prev,
@@ -967,25 +932,26 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         activePackageNameEn: activeSubscription.packageNameEn
       }));
     } else {
-      // If no valid active subscription, check if user had past subscriptions
       const userSubs = subscriptions.filter(s => s.userId === currentUser.uid);
-      const isPastExpired = userSubs.some(s => s.status === 'expired' || new Date(s.expiresAt).getTime() <= Date.now());
+      const isPastExpired = userSubs.some(s => s.status === 'expired' || (!!s.expiresAt && new Date(s.expiresAt).getTime() <= Date.now()));
       setCurrentUser(prev => {
-        const nextStatus = isPastExpired ? 'expired' : 'free';
-        if (prev.subscriptionStatus !== nextStatus || prev.subscriptionExpiresAt !== undefined) {
+        const nextStatus = isPastExpired
+          ? 'expired'
+          : (prev.subscriptionStatus === 'pro' && (!prev.subscriptionExpiresAt || new Date(prev.subscriptionExpiresAt).getTime() <= Date.now()) ? 'expired' : (prev.subscriptionStatus === 'pro' ? 'pro' : 'free'));
+        if (prev.subscriptionStatus !== nextStatus || (nextStatus !== 'pro' && prev.subscriptionExpiresAt !== undefined)) {
           return {
             ...prev,
             subscriptionStatus: nextStatus,
-            subscriptionExpiresAt: undefined,
-            activePackageId: undefined,
-            activePackageNameBn: undefined,
-            activePackageNameEn: undefined
+            subscriptionExpiresAt: nextStatus === 'pro' ? prev.subscriptionExpiresAt : undefined,
+            activePackageId: nextStatus === 'pro' ? prev.activePackageId : undefined,
+            activePackageNameBn: nextStatus === 'pro' ? prev.activePackageNameBn : undefined,
+            activePackageNameEn: nextStatus === 'pro' ? prev.activePackageNameEn : undefined
           };
         }
         return prev;
       });
     }
-  }, [activeSubscription, subscriptions, currentUser.uid]);
+  }, [activeSubscription, subscriptions, currentUser.uid, isLoggedIn]);
 
   // Helper to calculate remaining days
   const calculateDaysRemaining = (expiresAt?: string): number => {
@@ -994,21 +960,26 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     return Math.max(0, Math.ceil(diff / (1000 * 60 * 60 * 24)));
   };
 
-  // Check if current user has active Pro access (Admin or Unexpired Paid Subscription)
-  const isProSubscribed = currentUser.role === 'admin' || (isLoggedIn && (
-    (currentUser.subscriptionStatus === 'pro' && (!currentUser.subscriptionExpiresAt || new Date(currentUser.subscriptionExpiresAt).getTime() > Date.now())) || 
-    (!!activeSubscription && new Date(activeSubscription.expiresAt).getTime() > Date.now())
+  // Check if current user has active Pro access (Verified Owner Admin OR Active Paid Subscription with valid future expiry)
+  const isOwnerAuthenticated = isLoggedIn && isVerifiedAdmin && isVerifiedOwnerAccount(auth?.currentUser);
+  const isProSubscribed = isOwnerAuthenticated || (isLoggedIn && !!currentUser.uid && (
+    (currentUser.subscriptionStatus === 'pro' && !!currentUser.subscriptionExpiresAt && new Date(currentUser.subscriptionExpiresAt).getTime() > Date.now()) ||
+    (!!activeSubscription && !!activeSubscription.expiresAt && new Date(activeSubscription.expiresAt).getTime() > Date.now())
   ));
 
-  // Refresh leaderboard from Firestore
+  // Refresh leaderboard from Backend API & Firestore
   const refreshLeaderboard = async () => {
     try {
-      const dbLeaderboard = await fetchLeaderboardFromFirestore();
-      if (dbLeaderboard && dbLeaderboard.length > 0) {
+      const [apiRes, dbLeaderboard] = await Promise.all([
+        apiFetchLeaderboard(),
+        fetchLeaderboardFromFirestore()
+      ]);
+      const combined = [...(apiRes.ok ? apiRes.data?.leaderboard || [] : []), ...(dbLeaderboard || [])];
+      if (combined.length > 0) {
         setLeaderboardEntries(prev => {
           const map = new Map<string, LeaderboardEntry>();
           prev.forEach(item => map.set(item.id, item));
-          dbLeaderboard.forEach(item => map.set(item.id, item));
+          combined.forEach(item => map.set(item.id, item));
           const merged = Array.from(map.values());
           merged.sort((a, b) => b.score - a.score || a.timeSpentSeconds - b.timeSpentSeconds);
           return merged.map((e, idx) => ({ ...e, rank: idx + 1 }));
@@ -1028,15 +999,17 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const switchRole = (role: UserRole) => {
-    if ((role === 'admin' || role === 'question_manager') && currentUser.email !== 'khayrulalam88@gmail.com') {
-      console.warn('Unauthorized role switch attempt prevented: super admin only.');
+    if ((role === 'admin' || role === 'question_manager') && !isVerifiedOwnerAccount(auth?.currentUser)) {
+      console.warn('Unauthorized role switch attempt prevented: verified owner UID only.');
       return;
     }
     setCurrentUser(prev => ({ ...prev, role }));
   };
 
   const updateUserProfile = (data: Partial<UserProfile>) => {
-    setCurrentUser(prev => ({ ...prev, ...data }));
+    // Strip protected fields from client-side profile updates
+    const { role: _r, subscriptionStatus: _s, subscriptionExpiresAt: _e, uid: _u, ...safeData } = data;
+    setCurrentUser(prev => ({ ...prev, ...safeData }));
   };
 
   // Open subscription modal with specific package pre-selected
@@ -1050,8 +1023,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setShowPaymentModal(true);
   };
 
-  // Update Package (Admin)
+  // Update Package (Verified Owner Admin only)
   const updatePackage = (updated: Partial<SubscriptionPackage> & { id: string }) => {
+    if (!isVerifiedOwnerAccount(auth?.currentUser)) return;
     setPackages(prev => prev.map(p => {
       if (p.id === updated.id) {
         return { ...p, ...updated, updatedAt: new Date().toISOString() };
@@ -1059,10 +1033,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       return p;
     }));
 
-    // If updating Exam Pass price, keep examDateConfig in sync
     if (updated.id === 'pkg_exam_pass' && updated.price !== undefined) {
       setExamDateConfig(prev => ({ ...prev, examPassPrice: Number(updated.price) }));
     }
+
+    apiAdminUpdatePackage(updated).catch(e => console.warn('Backend package update notice:', e));
 
     setAuditLogs(prev => [
       {
@@ -1077,8 +1052,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     ]);
   };
 
-  // Update Exam Date Configuration & Apply Policy
+  // Update Exam Date Configuration & Apply Policy (Verified Owner Admin only)
   const updateExamDateConfig = (config: Partial<ExamDateConfig>) => {
+    if (!isVerifiedOwnerAccount(auth?.currentUser)) return;
     const nextConfig = {
       ...examDateConfig,
       ...config,
@@ -1086,13 +1062,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     };
     setExamDateConfig(nextConfig);
 
-    // Sync package C price
     if (config.examPassPrice !== undefined) {
       setPackages(prev => prev.map(p => p.id === 'pkg_exam_pass' ? { ...p, price: Number(config.examPassPrice) } : p));
     }
 
-    // POLICY ENFORCEMENT:
-    // If 'extend_all' policy and targetExamDate changed, update all existing active Exam Pass subscribers
     let affectedCount = 0;
     if (nextConfig.examDatePolicy === 'extend_all' && config.targetExamDate) {
       setSubscriptions(prev => prev.map(sub => {
@@ -1108,6 +1081,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       }));
     }
 
+    apiAdminUpdateExamConfig(config).catch(e => console.warn('Backend exam config update notice:', e));
+
     setAuditLogs(prev => [
       {
         id: `log_${Date.now()}`,
@@ -1122,6 +1097,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const updatePaymentSettings = (settings: Partial<PaymentSettings>) => {
+    if (!isVerifiedOwnerAccount(auth?.currentUser)) return;
     setPaymentSettings(prev => ({ ...prev, ...settings }));
     if (settings.whatsappNumber || settings.whatsappMessage) {
       setSupportSettings(prev => ({
@@ -1130,6 +1106,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         ...(settings.whatsappMessage ? { whatsappMessage: settings.whatsappMessage } : {})
       }));
     }
+    apiAdminUpdatePaymentSettings(settings).catch(e => console.warn('Backend payment settings sync notice:', e));
     setAuditLogs(prev => [
       {
         id: `log_${Date.now()}`,
@@ -1144,8 +1121,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const updateSupportSettings = (settings: Partial<SupportContactSettings>) => {
+    if (!isVerifiedOwnerAccount(auth?.currentUser)) return;
     setSupportSettings(prev => ({ ...prev, ...settings }));
     setPaymentSettings(prev => ({ ...prev, ...settings }));
+    apiAdminUpdateSupportSettings(settings).catch(e => console.warn('Backend support settings sync notice:', e));
     setAuditLogs(prev => [
       {
         id: `log_${Date.now()}`,
@@ -1210,79 +1189,93 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     ? (exams.find(e => e.id === activeAttempt.examId) || null)
     : null;
 
-  // Start exam with strict subscription & session verification
-  const startExam = (examId: string): { success: boolean; reason?: string } => {
-    // 1. Session Revocation Check
+  // Start exam via server-authoritative /api/exams/start with subscription & token verification
+  const startExam = async (examId: string): Promise<{ success: boolean; reason?: string }> => {
+    setExamLaunchError(null);
+
     if (isSessionRevoked || (currentSession && currentSession.status === 'revoked')) {
-      return { 
-        success: false, 
-        reason: 'সেশনটি অন্য ডিভাইস থেকে ব্যবহারের কারণে বন্ধ করা হয়েছে। অনুগ্রহ করে পুনরায় লগইন করুন।' 
-      };
+      const msg = 'সেশনটি অন্য ডিভাইস থেকে ব্যবহারের কারণে বন্ধ করা হয়েছে। অনুগ্রহ করে পুনরায় লগইন করুন।';
+      setExamLaunchError(msg);
+      return { success: false, reason: msg };
+    }
+
+    if (!isLoggedIn || !auth?.currentUser) {
+      const msg = language === 'bn'
+        ? 'পরীক্ষা শুরু করতে অনুগ্রহ করে প্রথমে আপনার Firebase অ্যাকাউন্ট দিয়ে লগইন করুন।'
+        : 'Please sign in with your Firebase account to start an exam.';
+      setExamLaunchError(msg);
+      setShowLoginModal(true);
+      return { success: false, reason: msg };
     }
 
     const exam = exams.find(e => e.id === examId);
-    if (!exam) return { success: false, reason: 'Exam not found' };
-
-    // 2. Strict Subscription Check for Paid / Pro Exams
-    if (exam.isPaid) {
-      const hasValidSub = isProSubscribed;
-      if (!hasValidSub) {
+    if (exam) {
+      if (exam.isPaid && !isProSubscribed) {
         openSubscriptionModal(packages[0]?.id);
-        return { 
-          success: false, 
-          reason: 'এই স্পেশাল ৬০ মিনিটের পূর্ণাঙ্গ মডেল টেস্টটি আনলক করতে সক্রিয় প্রো সাবস্ক্রিপশন প্রয়োজন। আপনার সাবস্ক্রিপশনের মেয়াদ শেষ হয়েছে অথবা সক্রিয় নেই।' 
-        };
-      }
-
-      // Check if Exam is Active/Launched by Admin
-      if (exam.isActive === false && currentUser.role !== 'admin') {
         return {
           success: false,
-          reason: 'এই মডেল টেস্টটি এখনো চালু করা হয়নি। অ্যাডমিন কর্তৃক নির্ধারিত দিনে পরীক্ষাটি চালু করা হবে।'
+          reason: 'এই স্পেশাল ৬০ মিনিটের পূর্ণাঙ্গ মডেল টেস্টটি আনলক করতে সক্রিয় প্রো সাবস্ক্রিপশন প্রয়োজন।'
         };
+      }
+      if (exam.isActive === false && !isVerifiedOwnerAccount(auth.currentUser)) {
+        const msg = 'এই মডেল টেস্টটি এখনো চালু করা হয়নি। অ্যাডমিন কর্তৃক নির্ধারিত দিনে পরীক্ষাটি চালু করা হবে।';
+        setExamLaunchError(msg);
+        return { success: false, reason: msg };
+      }
+      if (exam.type === 'custom_test' && !isVerifiedOwnerAccount(auth.currentUser)) {
+        const msg = 'অননুমোদিত: অ্যাডমিন ছাড়া কেউ কাস্টম টেস্ট নিতে পারবেন না।';
+        setExamLaunchError(msg);
+        return { success: false, reason: msg };
       }
     }
 
-    // 3. Custom Test Restriction: "অ্যাডমিন ছাড়া কেউ কাষ্টম টেষ্ট নিতে পারবে না।"
-    if (exam.type === 'custom_test') {
-      const isSuperAdmin = currentUser.role === 'admin' || currentUser.email === 'khayrulalam88@gmail.com';
-      if (!isSuperAdmin) {
-        return {
-          success: false,
-          reason: 'অননুমোদিত: অ্যাডমিন ছাড়া কেউ কাস্টম টেস্ট নিতে পারবেন না। শিক্ষার্থীরা শুধুমাত্র অ্যাডমিন কর্তৃক পরিচালিত নির্ধারিত মডেল টেস্টে অংশ নিতে পারবে।'
-        };
+    const res = await apiStartExam(examId, currentUser.name);
+    if (!res.ok || !res.data?.success) {
+      if (res.code === 'SUBSCRIPTION_REQUIRED') {
+        openSubscriptionModal(packages[0]?.id);
+      } else if (res.code === 'SESSION_REVOKED') {
+        setIsSessionRevoked(true);
+        setSessionRevokedReason(res.message || 'Session revoked');
+      } else if (res.status === 401) {
+        setShowLoginModal(true);
       }
+      const errReason = res.message || 'পরীক্ষা শুরু করা যায়নি।';
+      setExamLaunchError(errReason);
+      return { success: false, reason: errReason };
     }
 
-    const now = new Date();
-    const durationMinutes = exam.durationMinutes || 60;
-    const deadline = new Date(now.getTime() + durationMinutes * 60 * 1000);
+    const { attempt, exam: serverExam, questions: serverQuestions } = res.data;
 
-    const newAttempt: ExamAttempt = {
-      id: `attempt_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-      examId: exam.id,
-      userId: currentUser.uid,
-      sessionId: currentSession?.sessionId,
-      studentName: currentUser.name,
-      startTime: now.toISOString(),
-      deadlineTime: deadline.toISOString(),
-      status: 'in_progress',
-      answers: {},
-      flaggedQuestionIds: [],
-      currentQuestionIndex: 0,
-      lastSavedAt: now.toISOString()
-    };
+    // Merge sanitized exam questions into questions state without exposing keys
+    if (Array.isArray(serverQuestions) && serverQuestions.length > 0) {
+      setQuestions(prev => {
+        const map = new Map<string, Question>();
+        prev.forEach(q => map.set(q.id, q));
+        serverQuestions.forEach(sq => {
+          const existing = map.get(sq.id);
+          // Preserve admin-held keys only if already loaded for verified owner; otherwise keep sanitized question
+          map.set(sq.id, existing && isVerifiedOwnerAccount(auth?.currentUser) ? { ...sq, ...existing } : sq);
+        });
+        return Array.from(map.values());
+      });
+    }
 
-    setActiveAttempt(newAttempt);
+    setExams(prev => {
+      const exists = prev.some(e => e.id === serverExam.id);
+      if (exists) return prev.map(e => (e.id === serverExam.id ? serverExam : e));
+      return [serverExam, ...prev];
+    });
+
+    setActiveAttempt(attempt);
     setActiveScreen('exam');
 
     setAuditLogs(prev => [
       {
         id: `log_${Date.now()}`,
-        userId: currentUser.uid,
+        userId: auth.currentUser!.uid,
         userName: currentUser.name,
         action: 'START_EXAM',
-        details: `Started exam "${exam.titleEn}" (Duration: ${durationMinutes}m, Session: ${currentSession?.sessionId?.substring(0, 8) || 'local'})`,
+        details: `Started authoritative exam "${serverExam.titleEn}" (${attempt.id})`,
         timestamp: new Date().toISOString()
       },
       ...prev
@@ -1291,26 +1284,25 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     return { success: true };
   };
 
-  // Create & Start Custom Model Test directly from Question Bank
-  const createAndStartCustomExam = (config: {
+  // Create & Start Custom Model Test directly from Question Bank (Owner Admin Only)
+  const createAndStartCustomExam = async (config: {
     titleBn?: string;
     titleEn?: string;
     durationMinutes: number;
     questionIds: string[];
     negativeMarkRatio?: number;
-  }): { success: boolean; examId?: string; reason?: string } => {
-    // Strict Admin Authorization Check: "অ্যাডমিন ছাড়া কেউ কাষ্টম টেষ্ট নিতে পারবে না।"
-    if (currentUser.role !== 'admin' && currentUser.email !== 'khayrulalam88@gmail.com') {
-      return { 
-        success: false, 
-        reason: 'অননুমোদিত: অ্যাডমিন ছাড়া কেউ কাস্টম টেস্ট তৈরি বা পরিচালনা করতে পারবে না।' 
+  }): Promise<{ success: boolean; examId?: string; reason?: string }> => {
+    if (!isVerifiedOwnerAccount(auth?.currentUser)) {
+      return {
+        success: false,
+        reason: 'অননুমোদিত: অ্যাডমিন ছাড়া কেউ কাস্টম টেস্ট তৈরি বা পরিচালনা করতে পারবে না।'
       };
     }
 
     if (isSessionRevoked || (currentSession && currentSession.status === 'revoked')) {
-      return { 
-        success: false, 
-        reason: 'সেশনটি অন্য ডিভাইস থেকে ব্যবহারের কারণে বন্ধ করা হয়েছে। অনুগ্রহ করে পুনরায় লগইন করুন।' 
+      return {
+        success: false,
+        reason: 'সেশনটি অন্য ডিভাইস থেকে ব্যবহারের কারণে বন্ধ করা হয়েছে। অনুগ্রহ করে পুনরায় লগইন করুন।'
       };
     }
 
@@ -1336,7 +1328,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       totalMarks: config.questionIds.length,
       passThresholdPercentage: 50,
       questionIds: config.questionIds,
-      isPaid: false, // User's self-selected test
+      isPaid: false,
       isActive: true,
       published: true,
       releaseExplanationsImmediately: true,
@@ -1345,44 +1337,14 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       createdAt: new Date().toISOString()
     };
 
-    // Add to exams state
-    setExams(prev => [newCustomExam, ...prev]);
+    const saveRes = await apiAdminSaveExam(newCustomExam);
     saveExamToFirestore(newCustomExam).catch(e => console.warn('Firestore custom exam save notice:', e));
+    setExams(prev => [saveRes.ok && saveRes.data?.exam ? saveRes.data.exam : newCustomExam, ...prev]);
 
-    const now = new Date();
-    const durationMinutes = newCustomExam.durationMinutes || 30;
-    const deadline = new Date(now.getTime() + durationMinutes * 60 * 1000);
-
-    const newAttempt: ExamAttempt = {
-      id: `attempt_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-      examId: newCustomExam.id,
-      userId: currentUser.uid,
-      sessionId: currentSession?.sessionId,
-      studentName: currentUser.name,
-      startTime: now.toISOString(),
-      deadlineTime: deadline.toISOString(),
-      status: 'in_progress',
-      answers: {},
-      flaggedQuestionIds: [],
-      currentQuestionIndex: 0,
-      lastSavedAt: now.toISOString()
-    };
-
-    setActiveAttempt(newAttempt);
-    setActiveScreen('exam');
-
-    setAuditLogs(prev => [
-      {
-        id: `log_${Date.now()}`,
-        userId: currentUser.uid,
-        userName: currentUser.name,
-        action: 'START_CUSTOM_EXAM',
-        details: `Started custom exam "${titleEn}" with ${config.questionIds.length} MCQs (Duration: ${durationMinutes}m)`,
-        timestamp: new Date().toISOString()
-      },
-      ...prev
-    ]);
-
+    const startRes = await startExam(testId);
+    if (!startRes.success) {
+      return { success: false, reason: startRes.reason };
+    }
     return { success: true, examId: testId };
   };
 
@@ -1390,9 +1352,16 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     if (isSessionRevoked) return;
     setActiveAttempt(prev => {
       if (!prev || prev.status !== 'in_progress') return prev;
+      const nextAnswers = { ...prev.answers, [questionId]: optionIndex };
+      apiSaveExamAnswer({
+        attemptId: prev.id,
+        answers: nextAnswers,
+        flaggedQuestionIds: prev.flaggedQuestionIds,
+        currentQuestionIndex: prev.currentQuestionIndex
+      }).catch(() => {});
       return {
         ...prev,
-        answers: { ...prev.answers, [questionId]: optionIndex },
+        answers: nextAnswers,
         lastSavedAt: new Date().toISOString()
       };
     });
@@ -1404,6 +1373,12 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       if (!prev || prev.status !== 'in_progress') return prev;
       const updatedAnswers = { ...prev.answers };
       delete updatedAnswers[questionId];
+      apiSaveExamAnswer({
+        attemptId: prev.id,
+        answers: updatedAnswers,
+        flaggedQuestionIds: prev.flaggedQuestionIds,
+        currentQuestionIndex: prev.currentQuestionIndex
+      }).catch(() => {});
       return {
         ...prev,
         answers: updatedAnswers,
@@ -1416,9 +1391,15 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setActiveAttempt(prev => {
       if (!prev || prev.status !== 'in_progress') return prev;
       const exists = prev.flaggedQuestionIds.includes(questionId);
-      const flagged = exists 
+      const flagged = exists
         ? prev.flaggedQuestionIds.filter(id => id !== questionId)
         : [...prev.flaggedQuestionIds, questionId];
+      apiSaveExamAnswer({
+        attemptId: prev.id,
+        answers: prev.answers,
+        flaggedQuestionIds: flagged,
+        currentQuestionIndex: prev.currentQuestionIndex
+      }).catch(() => {});
       return {
         ...prev,
         flaggedQuestionIds: flagged,
@@ -1427,166 +1408,83 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     });
   };
 
-  // Submit exam attempt
-  const submitExamAttempt = (isAutoTimeout = false): ExamResult | null => {
-    if (!activeAttempt || activeAttempt.status !== 'in_progress') {
+  // Authoritative server-side exam submission & scoring (NO client-side score calculation)
+  const submitExamAttempt = async (isAutoTimeout = false): Promise<ExamResult | null> => {
+    if (!activeAttempt || activeAttempt.status !== 'in_progress' || isSubmittingExam) {
       return null;
     }
 
     if (isSessionRevoked) {
-      alert('আপনার সেশনটি অন্য ডিভাইস থেকে ব্যবহারের কারণে বন্ধ করা হয়েছে। উত্তর জমা নেওয়া সম্ভব নয়।');
+      setExamLaunchError('আপনার সেশনটি অন্য ডিভাইস থেকে ব্যবহারের কারণে বন্ধ করা হয়েছে। উত্তর জমা নেওয়া সম্ভব নয়।');
       return null;
     }
 
     setIsSubmittingExam(true);
-
-    const exam = exams.find(e => e.id === activeAttempt.examId);
-    if (!exam) {
-      setIsSubmittingExam(false);
-      return null;
-    }
-
-    const examQuestions = (exam.questionIds && exam.questionIds.length > 0)
-      ? questions.filter(q => exam.questionIds.includes(q.id))
-      : (exam.subjectId ? questions.filter(q => q.subjectId === exam.subjectId) : questions.slice(0, exam.totalMarks || 100));
-
-    // Calculate score: +1 correct, -0.25 incorrect
-    const scoreResult = calculateExamScore(activeAttempt.answers, examQuestions, {
-      positiveMarkRatio: exam.positiveMarkRatio ?? 1.0,
-      negativeMarkRatio: exam.negativeMarkRatio ?? 0.25,
-      passThresholdPercentage: exam.passThresholdPercentage
-    });
-
-    const startTime = new Date(activeAttempt.startTime).getTime();
-    const submissionTime = Date.now();
-    const timeSpentSeconds = Math.max(1, Math.round((submissionTime - startTime) / 1000));
-
-    // Subject-wise performance
-    const subjectScores: ExamResult['subjectWiseScores'] = {};
-    for (const sub of subjects) {
-      const subQuestions = examQuestions.filter(q => q.subjectId === sub.id);
-      if (subQuestions.length > 0) {
-        let correct = 0;
-        let incorrect = 0;
-        let unanswered = 0;
-        for (const q of subQuestions) {
-          const ans = activeAttempt.answers[q.id];
-          if (ans === undefined || ans === null) unanswered++;
-          else if (ans === q.correctOptionIndex) correct++;
-          else incorrect++;
-        }
-        const score = Math.round((correct * 1.0 - incorrect * 0.25) * 100) / 100;
-        subjectScores[sub.id] = {
-          subjectNameBn: sub.nameBn,
-          subjectNameEn: sub.nameEn,
-          total: subQuestions.length,
-          correct,
-          incorrect,
-          unanswered,
-          score
-        };
-      }
-    }
-
-    const newResult: ExamResult = {
-      id: `result_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-      attemptId: activeAttempt.id,
-      examId: exam.id,
-      examTitleBn: exam.titleBn,
-      examTitleEn: exam.titleEn,
-      examType: exam.type,
-      userId: currentUser.uid,
-      studentName: currentUser.name,
-      submittedAt: new Date().toISOString(),
-      timeSpentSeconds,
-      totalQuestions: scoreResult.totalQuestions,
-      correctAnswersCount: scoreResult.correctAnswersCount,
-      incorrectAnswersCount: scoreResult.incorrectAnswersCount,
-      unansweredCount: scoreResult.unansweredCount,
-      positiveMarks: scoreResult.positiveMarks,
-      negativeMarks: scoreResult.negativeMarks,
-      finalScore: scoreResult.finalScore,
-      percentage: scoreResult.percentage,
-      passed: scoreResult.passed,
-      passThresholdPercentage: exam.passThresholdPercentage,
-      subjectWiseScores: subjectScores,
-      answers: activeAttempt.answers,
-      questions: examQuestions
-    };
-
-    setActiveAttempt(prev => prev ? {
-      ...prev,
-      status: isAutoTimeout ? 'timed_out' : 'submitted',
-      submittedTime: new Date().toISOString()
-    } : null);
-
-    setExamResults(prev => [newResult, ...prev]);
-    saveExamResultToFirestore(newResult).catch(e => console.warn('Firestore result save error:', e));
-
-    // Record to Top Performers Leaderboard
-    const newLeaderboardEntry: LeaderboardEntry = {
-      id: `lead_${newResult.id}`,
-      userId: currentUser.uid,
-      studentName: currentUser.name,
-      examId: exam.id,
-      examTitleBn: exam.titleBn,
-      examTitleEn: exam.titleEn,
-      score: newResult.finalScore,
-      totalMarks: newResult.totalQuestions,
-      percentage: newResult.percentage,
-      correctAnswersCount: newResult.correctAnswersCount,
-      incorrectAnswersCount: newResult.incorrectAnswersCount,
-      unansweredCount: newResult.unansweredCount,
-      timeSpentSeconds,
-      completedAt: new Date().toISOString()
-    };
-    setLeaderboardEntries(prev => {
-      const filtered = prev.filter(item => !(item.userId === currentUser.uid && item.examId === exam.id));
-      const list = [...filtered, newLeaderboardEntry];
-      list.sort((a, b) => b.score - a.score || a.timeSpentSeconds - b.timeSpentSeconds);
-      return list.map((item, idx) => ({ ...item, rank: idx + 1 }));
-    });
-    saveLeaderboardEntryToFirestore(newLeaderboardEntry).catch(e => console.warn('Firestore leaderboard entry save error:', e));
-
-    setActiveResult(newResult);
-    setActiveScreen('result');
-
-    // Sync answered questions into student's subject practice progress ledger
-    setAnsweredQuestions(prev => {
-      const next = { ...prev };
-      for (const q of examQuestions) {
-        const userChoice = activeAttempt.answers[q.id];
-        if (userChoice !== undefined && userChoice !== null) {
-          next[q.id] = {
-            questionId: q.id,
-            subjectId: q.subjectId,
-            selectedOption: userChoice,
-            isCorrect: userChoice === q.correctOptionIndex,
-            timestamp: new Date().toISOString()
-          };
-        }
-      }
-      return next;
-    });
-
     try {
-      localStorage.removeItem(LOCAL_STORAGE_KEY_ATTEMPT);
-    } catch (e) {}
+      const res = await apiSubmitExam(activeAttempt.id, activeAttempt.answers, isAutoTimeout);
+      if (!res.ok || !res.data?.success || !res.data.result) {
+        const errMsg = res.message || 'পরীক্ষা জমা দিতে সমস্যা হয়েছে। অনুগ্রহ করে পুনরায় চেষ্টা করুন।';
+        setExamLaunchError(errMsg);
+        return null;
+      }
 
-    setAuditLogs(prev => [
-      {
-        id: `log_${Date.now()}`,
-        userId: currentUser.uid,
-        userName: currentUser.name,
-        action: isAutoTimeout ? 'EXAM_TIMED_OUT' : 'SUBMIT_EXAM',
-        details: `Completed "${exam.titleEn}". Score: ${newResult.finalScore}/${newResult.totalQuestions} (${newResult.percentage}%)`,
-        timestamp: new Date().toISOString()
-      },
-      ...prev
-    ]);
+      const { result: serverResult, leaderboardEntry } = res.data;
 
-    setIsSubmittingExam(false);
-    return newResult;
+      setActiveAttempt(null);
+      setExamResults(prev => [serverResult, ...prev.filter(r => r.id !== serverResult.id)]);
+
+      if (leaderboardEntry) {
+        setLeaderboardEntries(prev => {
+          const filtered = prev.filter(
+            item => !(item.userId === leaderboardEntry.userId && item.examId === leaderboardEntry.examId)
+          );
+          const list = [...filtered, leaderboardEntry];
+          list.sort((a, b) => b.score - a.score || a.timeSpentSeconds - b.timeSpentSeconds);
+          return list.map((item, idx) => ({ ...item, rank: idx + 1 }));
+        });
+      }
+
+      // Sync revealed question answers into practice completion ledger
+      setAnsweredQuestions(prev => {
+        const next = { ...prev };
+        for (const q of serverResult.questions || []) {
+          const userChoice = serverResult.answers[q.id];
+          if (userChoice !== undefined && userChoice !== null && q.correctOptionIndex !== undefined) {
+            next[q.id] = {
+              questionId: q.id,
+              subjectId: q.subjectId,
+              selectedOption: userChoice,
+              isCorrect: userChoice === q.correctOptionIndex,
+              timestamp: serverResult.submittedAt
+            };
+          }
+        }
+        return next;
+      });
+
+      try {
+        localStorage.removeItem(LOCAL_STORAGE_KEY_ATTEMPT);
+      } catch (e) {}
+
+      setActiveResult(serverResult);
+      setActiveScreen('result');
+
+      setAuditLogs(prev => [
+        {
+          id: `log_${Date.now()}`,
+          userId: serverResult.userId,
+          userName: serverResult.studentName,
+          action: isAutoTimeout ? 'EXAM_TIMED_OUT' : 'SUBMIT_EXAM',
+          details: `Server evaluated "${serverResult.examTitleEn}": ${serverResult.finalScore}/${serverResult.totalQuestions} (${serverResult.percentage}%)`,
+          timestamp: serverResult.submittedAt
+        },
+        ...prev
+      ]);
+
+      return serverResult;
+    } finally {
+      setIsSubmittingExam(false);
+    }
   };
 
   const viewResult = (resultId: string) => {
@@ -1598,7 +1496,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const startSubjectPractice = (subjectId: string): { success: boolean; reason?: string } => {
-    // Subject practice is a Pro feature ("সিলেবাস কাঠামো - ৭টি মূল আইনের বিষয়ভিত্তিক অনুশীলন - এটাও পেইড করার পর অনুশীলন করতে পারবে।")
     if (!isProSubscribed) {
       openSubscriptionModal(packages[0]?.id);
       return {
@@ -1627,6 +1524,30 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         timestamp: new Date().toISOString()
       }
     }));
+  };
+
+  const checkPracticeAnswer = async (questionId: string, selectedOption: number) => {
+    if (!isLoggedIn || !auth?.currentUser) {
+      setShowLoginModal(true);
+      return { success: false, error: 'অনুগ্রহ করে প্রথমে লগইন করুন।' };
+    }
+    const res = await apiCheckPracticeAnswer(questionId, selectedOption);
+    if (!res.ok || !res.data?.success) {
+      if (res.code === 'SUBSCRIPTION_REQUIRED') {
+        openSubscriptionModal(packages[0]?.id);
+      }
+      return { success: false, error: res.message || 'উত্তর যাচাই করা যায়নি।' };
+    }
+    const targetQ = questions.find(q => q.id === questionId);
+    recordQuestionAnswer(questionId, targetQ?.subjectId || '', selectedOption, res.data.isCorrect);
+    return {
+      success: true,
+      isCorrect: res.data.isCorrect,
+      correctOptionIndex: res.data.correctOptionIndex,
+      explanationBn: res.data.explanationBn,
+      explanationEn: res.data.explanationEn,
+      legalReference: res.data.legalReference
+    };
   };
 
   const getSubjectProgress = useCallback((subjectId: string): SubjectPracticeProgress => {
@@ -1663,6 +1584,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   }, [questions, answeredQuestions]);
 
   const addQuestion = (newQ: Omit<Question, 'id' | 'createdAt' | 'updatedAt'>) => {
+    if (!isVerifiedOwnerAccount(auth?.currentUser)) return;
     const created: Question = {
       ...newQ,
       id: `q_custom_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
@@ -1671,30 +1593,39 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       createdBy: currentUser.name
     };
     setQuestions(prev => [created, ...prev]);
+    apiAdminSaveQuestion(created).catch(() => {});
     saveQuestionToFirestore(created).catch(e => console.warn('Firestore question save error:', e));
   };
 
   const updateQuestion = (updated: Question) => {
-    setQuestions(prev => prev.map(q => q.id === updated.id ? { ...updated, updatedAt: new Date().toISOString() } : q));
-    saveQuestionToFirestore(updated).catch(e => console.warn('Firestore question update error:', e));
+    if (!isVerifiedOwnerAccount(auth?.currentUser)) return;
+    const withTime = { ...updated, updatedAt: new Date().toISOString() };
+    setQuestions(prev => prev.map(q => (q.id === updated.id ? withTime : q)));
+    apiAdminSaveQuestion(withTime).catch(() => {});
+    saveQuestionToFirestore(withTime).catch(e => console.warn('Firestore question update error:', e));
   };
 
   const deleteQuestion = (id: string) => {
+    if (!isVerifiedOwnerAccount(auth?.currentUser)) return;
     setQuestions(prev => prev.filter(q => q.id !== id));
+    apiAdminDeleteQuestion(id).catch(() => {});
     deleteQuestionFromFirestore(id).catch(e => console.warn('Firestore question delete error:', e));
   };
 
   const savePreviousQuestion = async (question: PreviousQuestion): Promise<void> => {
+    if (!isVerifiedOwnerAccount(auth?.currentUser)) return;
     const exists = previousQuestions.some(q => q.id === question.id);
     if (exists) {
       setPreviousQuestions(prev => prev.map(q => q.id === question.id ? question : q));
     } else {
       setPreviousQuestions(prev => [question, ...prev]);
     }
+    await apiAdminSavePreviousQuestion(question).catch(() => {});
     await savePreviousQuestionToFirestore(question);
   };
 
   const deletePreviousQuestion = async (id: string): Promise<void> => {
+    if (!isVerifiedOwnerAccount(auth?.currentUser)) return;
     setPreviousQuestions(prev => prev.filter(q => q.id !== id));
     await deletePreviousQuestionFromFirestore(id);
   };
@@ -1702,7 +1633,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const batchImportPreviousQuestions = async (
     newQuestions: PreviousQuestion[]
   ): Promise<{ successCount: number; failureCount: number; errors: string[] }> => {
-    // Optimistically merge into local state
+    if (!isVerifiedOwnerAccount(auth?.currentUser)) {
+      return { successCount: 0, failureCount: newQuestions.length, errors: ['Unauthorized: Admin verification required.'] };
+    }
     setPreviousQuestions(prev => {
       const map = new Map<string, PreviousQuestion>();
       newQuestions.forEach(q => map.set(q.id, q));
@@ -1714,27 +1647,31 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       return Array.from(map.values()).sort((a, b) => b.year - a.year);
     });
 
-    // Write batch directly to Firestore
     const res = await batchImportPreviousQuestionsToFirestore(newQuestions);
     return res;
   };
 
   const addExam = (newExam: Omit<Exam, 'id' | 'createdAt'>) => {
+    if (!isVerifiedOwnerAccount(auth?.currentUser)) return;
     const created: Exam = {
       ...newExam,
       id: `exam_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
       createdAt: new Date().toISOString()
     };
     setExams(prev => [...prev, created]);
+    apiAdminSaveExam(created).catch(() => {});
     saveExamToFirestore(created).catch(e => console.warn('Firestore exam save error:', e));
   };
 
   const updateExam = (updated: Exam) => {
+    if (!isVerifiedOwnerAccount(auth?.currentUser)) return;
     setExams(prev => prev.map(e => e.id === updated.id ? updated : e));
+    apiAdminSaveExam(updated).catch(() => {});
     saveExamToFirestore(updated).catch(e => console.warn('Firestore exam update error:', e));
   };
 
   const toggleExamStatus = (examId: string, isActive?: boolean, scheduledDate?: string) => {
+    if (!isVerifiedOwnerAccount(auth?.currentUser)) return;
     setExams(prev => prev.map(e => {
       if (e.id === examId) {
         const nextActive = isActive !== undefined ? isActive : !e.isActive;
@@ -1744,6 +1681,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           published: nextActive ? true : e.published,
           scheduledDate: scheduledDate !== undefined ? scheduledDate : e.scheduledDate
         };
+        apiAdminSaveExam(updated).catch(() => {});
         saveExamToFirestore(updated).catch(err => console.warn('Firestore exam status update error:', err));
         return updated;
       }
@@ -1766,254 +1704,236 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const generateAndSync30ModelTests = async (): Promise<{ success: boolean; count: number; message: string }> => {
-    const freshQuestions = questions.length >= 3000 ? questions : INITIAL_QUESTIONS;
-    const generated = generate30ModelTests(freshQuestions);
+    if (!isVerifiedOwnerAccount(auth?.currentUser)) {
+      return { success: false, count: 0, message: 'অননুমোদিত: শুধুমাত্র অ্যাডমিন মডেল টেস্ট সিঙ্ক করতে পারবেন।' };
+    }
+    let questionPool = questions;
+    if (questionPool.length < 3000) {
+      const adminQRes = await apiFetchAdminQuestions();
+      if (adminQRes.ok && adminQRes.data?.questions?.length) {
+        questionPool = adminQRes.data.questions;
+        setQuestions(questionPool);
+      }
+    }
+    const generated = generate30ModelTests(questionPool);
     const nonModelExams = exams.filter(e => e.type !== 'full_mock');
     const updatedExams = [...generated, ...nonModelExams];
     setExams(updatedExams);
     try {
       localStorage.setItem(LOCAL_STORAGE_KEY_EXAMS, JSON.stringify(updatedExams));
     } catch (e) {}
+    // Persist each generated exam metadata without overwriting non-model tests
+    await Promise.all(
+      generated.slice(0, 30).map(ex =>
+        Promise.all([
+          apiAdminSaveExam(ex).catch(() => {}),
+          saveExamToFirestore(ex).catch(() => {})
+        ])
+      )
+    );
     return {
       success: true,
       count: generated.length,
-      message: '৩০টি পূর্ণাঙ্গ মডেল টেস্ট সফলভাবে প্রস্তুত ও সমন্বিত হয়েছে।'
+      message: `${generated.length}টি পূর্ণাঙ্গ মডেল টেস্ট সফলভাবে প্রস্তুত ও সমন্বিত হয়েছে।`
     };
   };
 
-  // Create Payment Request
-  const createPaymentRequest = (req: { 
-    method: 'bKash' | 'Nagad' | 'Rocket'; 
+  // Create Payment Request (Server-authoritative amount & duplicate/rejected TrxID enforcement)
+  const createPaymentRequest = async (req: {
+    method: 'bKash' | 'Nagad' | 'Rocket';
     studentPhone?: string;
-    senderNumber: string; 
-    transactionId: string; 
-    amount: number; 
+    senderNumber: string;
+    transactionId: string;
+    amount?: number;
     packageId: string;
-    packageTitle?: string; 
-  }): { success: boolean; error?: string } => {
-    const cleanTrxId = req.transactionId.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
-    if (cleanTrxId.length < 4) {
-      return { success: false, error: 'সঠিক ট্রানজাকশন আইডি (TrxID) প্রদান করুন (কমপক্ষে ৪ অক্ষর)।' };
+    packageTitle?: string;
+  }): Promise<{ success: boolean; error?: string }> => {
+    const authenticatedUid = auth?.currentUser?.uid;
+    if (!isLoggedIn || !authenticatedUid) {
+      return { success: false, error: 'পেমেন্ট রিকোয়েস্ট পাঠাতে অনুগ্রহ করে প্রথমে আপনার অ্যাকাউন্টে লগইন করুন।' };
     }
 
-    // Prevent duplicate pending TrxID reuse
+    const cleanTrxId = req.transactionId.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (cleanTrxId.length < 4 || cleanTrxId.length > 64) {
+      return { success: false, error: 'সঠিক ট্রানজাকশন আইডি (TrxID) প্রদান করুন (৪–৬৪ অক্ষর)।' };
+    }
+
+    // Check locally known requests across ALL statuses (including rejected)
     const duplicate = paymentRequests.find(
-      p => p.transactionId === cleanTrxId && p.status !== 'rejected'
+      p => p.id === `trx_${cleanTrxId}` || p.transactionId === cleanTrxId
     );
     if (duplicate) {
-      return { 
-        success: false, 
-        error: 'এই ট্রানজাকশন আইডিটি (TrxID) ইতিপূর্বে জমা দেওয়া হয়েছে। একই TrxID পুনরাবৃত্তি গ্রহণযোগ্য নয়।' 
+      return {
+        success: false,
+        error:
+          duplicate.status === 'rejected'
+            ? 'এই ট্রানজাকশন আইডিটি (TrxID) পূর্বে বাতিল করা হয়েছে এবং পুনরায় জমা দেওয়া যাবে না।'
+            : 'এই ট্রানজাকশন আইডিটি (TrxID) ইতিপূর্বে জমা দেওয়া হয়েছে। একই TrxID পুনরাবৃত্তি গ্রহণযোগ্য নয়।'
       };
     }
 
-    const pkg = packages.find(p => p.id === req.packageId) || packages[0];
-    const durationDays = pkg.durationDays || (pkg.validityType === 'exam_date' ? calculateDaysRemaining(examDateConfig.targetExamDate) : 90);
+    // 1. Call trusted backend /api/payments/create (calculates amount from server package pricing)
+    const apiRes = await apiCreatePaymentRequest({
+      method: req.method,
+      studentPhone: req.studentPhone || currentUser.phone,
+      senderNumber: req.senderNumber,
+      transactionId: cleanTrxId,
+      packageId: req.packageId,
+      studentName: currentUser.name
+    });
+
+    if (apiRes.ok && apiRes.data?.success && apiRes.data.paymentRequest) {
+      const persistedReq = apiRes.data.paymentRequest;
+      setPaymentRequests(prev => [persistedReq, ...prev.filter(p => p.id !== persistedReq.id)]);
+      setAuditLogs(prev => [
+        {
+          id: `log_${Date.now()}`,
+          userId: authenticatedUid,
+          userName: currentUser.name,
+          action: 'PAYMENT_REQUEST_SUBMITTED',
+          details: `${persistedReq.method} TrxID: ${persistedReq.transactionId} (৳${persistedReq.amount}) submitted for package "${persistedReq.packageNameEn}".`,
+          timestamp: new Date().toISOString()
+        },
+        ...prev
+      ]);
+      return { success: true };
+    }
+
+    // Explicit failure from backend — NEVER show false success
+    if (apiRes.code !== 'NON_JSON_RESPONSE' && apiRes.code !== 'NETWORK_ERROR') {
+      return {
+        success: false,
+        error: apiRes.message || 'পেমেন্ট রিকোয়েস্ট জমা দেওয়া যায়নি। অনুগ্রহ করে পুনরায় চেষ্টা করুন।'
+      };
+    }
+
+    // Fallback for standalone static hosting without backend API: write strictly to Firestore & await confirmation
+    const pkg = packages.find(p => p.id === req.packageId && p.isActive) || packages[0];
+    const authoritativeAmount =
+      pkg.id === 'pkg_exam_pass' ? examDateConfig.examPassPrice : pkg.price;
+    const durationDays =
+      pkg.durationDays || (pkg.validityType === 'exam_date' ? calculateDaysRemaining(examDateConfig.targetExamDate) : 90);
 
     const newReq: PaymentRequest = {
       id: `trx_${cleanTrxId}`,
-      userId: currentUser.uid,
+      userId: authenticatedUid,
       studentName: currentUser.name,
       studentPhone: req.studentPhone || currentUser.phone,
       method: req.method,
       senderNumber: req.senderNumber,
       transactionId: cleanTrxId,
-      amount: req.amount,
+      amount: authoritativeAmount,
       packageId: pkg.id,
       packageNameBn: pkg.nameBn,
       packageNameEn: pkg.nameEn,
-      packageTitle: req.packageTitle || `${pkg.nameBn} - ৳${req.amount}`,
+      packageTitle: `${pkg.nameBn} - ৳${authoritativeAmount}`,
       durationDays,
       validityType: pkg.validityType,
       status: 'pending',
       requestedAt: new Date().toISOString()
     };
 
+    try {
+      await savePaymentRequestToFirestore(newReq);
+    } catch (err: any) {
+      const errMsg = String(err?.message || '');
+      if (errMsg === 'DUPLICATE_TRX_ID' || errMsg === 'TRX_ALREADY_EXISTS_OR_PERMISSION_DENIED') {
+        return {
+          success: false,
+          error: 'এই ট্রানজাকশন আইডিটি (TrxID) ইতিপূর্বে ব্যবহৃত হয়েছে অথবা বাতিল হয়েছে। পুনরায় জমা দেওয়া সম্ভব নয়।'
+        };
+      }
+      return {
+        success: false,
+        error: 'ডাটাবেজে পেমেন্ট রিকোয়েস্ট সংরক্ষণ ব্যর্থ হয়েছে। অনুগ্রহ করে পরে চেষ্টা করুন।'
+      };
+    }
+
     setPaymentRequests(prev => [newReq, ...prev]);
-    savePaymentRequestToFirestore(newReq).catch(e => console.warn('Firestore payment save notice:', e));
-
-    setAuditLogs(prev => [
-      {
-        id: `log_${Date.now()}`,
-        userId: currentUser.uid,
-        userName: currentUser.name,
-        action: 'PAYMENT_REQUEST_SUBMITTED',
-        details: `${req.method} TrxID: ${newReq.transactionId} (৳${req.amount}) submitted for package "${pkg.nameEn}". Pending manual admin verification.`,
-        timestamp: new Date().toISOString()
-      },
-      ...prev
-    ]);
-
     return { success: true };
   };
 
-  // Approve Payment Request & Atomically Activate Subscription
-  const approvePaymentRequest = (id: string): { success: boolean; error?: string } => {
-    // 1. Authorization: Only Admin or khayrulalam88@gmail.com can approve payments
-    if (currentUser.role !== 'admin' && currentUser.email !== 'khayrulalam88@gmail.com') {
-      return { success: false, error: 'অননুমোদিত চেষ্টা: শুধুমাত্র অ্যাডমিন পেমেন্ট অনুমোদন করতে পারবেন।' };
+  // Approve Payment Request & Atomically Activate Subscription (Owner Admin Only)
+  const approvePaymentRequest = async (id: string): Promise<{ success: boolean; error?: string }> => {
+    if (!isVerifiedOwnerAccount(auth?.currentUser)) {
+      return { success: false, error: 'অননুমোদিত চেষ্টা: শুধুমাত্র যাচাইকৃত সুপার অ্যাডমিন পেমেন্ট অনুমোদন করতে পারবেন।' };
     }
 
     const req = paymentRequests.find(r => r.id === id);
     if (!req) return { success: false, error: 'Payment request not found' };
-
     if (req.status === 'approved') {
       return { success: false, error: 'Payment request is already approved' };
     }
 
-    // Check if TrxID was already used in another approved transaction
-    const duplicateApproved = paymentRequests.find(
-      p => p.id !== id && p.transactionId === req.transactionId && p.status === 'approved'
-    );
-    if (duplicateApproved) {
-      return { 
-        success: false, 
-        error: 'এই ট্রানজাকশন আইডিটি (TrxID) ইতিপূর্বে আরেকটি পেমেন্টে অনুমোদিত হয়েছে! একই TrxID পুনরাবৃত্তি রোধ করা হলো।' 
-      };
-    }
+    const apiRes = await apiApprovePaymentRequest(id, currentUser.name);
+    if (apiRes.ok && apiRes.data?.success) {
+      const { paymentRequest: updatedPay, subscription: newSub } = apiRes.data;
+      setPaymentRequests(prev => prev.map(r => (r.id === id ? updatedPay : r)));
+      setSubscriptions(prev => [newSub, ...prev.filter(s => s.id !== newSub.id)]);
 
-    const pkg = packages.find(p => p.id === req.packageId) || {
-      id: req.packageId,
-      nameBn: req.packageNameBn,
-      nameEn: req.packageNameEn,
-      validityType: req.validityType || 'days',
-      durationDays: req.durationDays || 90
-    };
-
-    // Calculate exact expiry
-    const activatedAt = new Date().toISOString();
-    let expiresAt: string;
-
-    if (pkg.validityType === 'exam_date') {
-      expiresAt = new Date(examDateConfig.targetExamDate).toISOString();
-    } else {
-      const days = pkg.durationDays || 90;
-      expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
-    }
-
-    // Create Subscription record
-    const newSubscription: UserSubscription = {
-      id: `sub_${req.userId}_${req.transactionId}`,
-      userId: req.userId,
-      studentName: req.studentName,
-      studentPhone: req.studentPhone,
-      packageId: req.packageId,
-      packageNameBn: req.packageNameBn,
-      packageNameEn: req.packageNameEn,
-      pricePaid: req.amount,
-      paymentRequestId: req.id,
-      paymentMethod: req.method as 'bKash' | 'Nagad',
-      transactionId: req.transactionId,
-      activatedAt,
-      expiresAt,
-      validityType: pkg.validityType as 'days' | 'exam_date',
-      status: 'active',
-      targetExamDateSnapshot: pkg.validityType === 'exam_date' ? examDateConfig.targetExamDate : undefined,
-      createdAt: activatedAt
-    };
-
-    setSubscriptions(prev => [newSubscription, ...prev]);
-    saveSubscriptionToFirestore(newSubscription).catch(e => console.warn('Firestore subscription save notice:', e));
-
-    const updatedPaymentApproval = {
-      status: 'approved' as const,
-      verifiedAt: activatedAt,
-      verifiedBy: currentUser.name,
-      subscriptionId: newSubscription.id
-    };
-    updatePaymentRequestStatusInFirestore(id, updatedPaymentApproval).catch(e => console.warn('Firestore payment status notice:', e));
-
-    // Update payment request status
-    setPaymentRequests(prev => prev.map(r => {
-      if (r.id === id) {
-        return {
-          ...r,
-          ...updatedPaymentApproval
-        };
+      // Also ensure Firestore client mirror is updated if Admin SDK IAM isn't active on dev backend
+      saveSubscriptionToFirestore(newSub).catch(() => {});
+      updatePaymentRequestStatusInFirestore(id, {
+        status: 'approved',
+        verifiedAt: updatedPay.verifiedAt,
+        verifiedBy: updatedPay.verifiedBy,
+        subscriptionId: newSub.id
+      }).catch(() => {});
+      if (updatedPay.userId) {
+        updateUserRoleOrSubscriptionInFirestore(updatedPay.userId, {
+          subscriptionStatus: 'pro',
+          subscriptionExpiresAt: newSub.expiresAt,
+          activePackageId: updatedPay.packageId,
+          activePackageNameBn: updatedPay.packageNameBn,
+          activePackageNameEn: updatedPay.packageNameEn
+        }).catch(() => {});
       }
-      return r;
-    }));
 
-    // Persist pro subscription status to student document in Firestore
-    if (req.userId) {
-      updateUserRoleOrSubscriptionInFirestore(req.userId, {
-        subscriptionStatus: 'pro',
-        subscriptionExpiresAt: expiresAt,
-        activePackageId: req.packageId,
-        activePackageNameBn: req.packageNameBn,
-        activePackageNameEn: req.packageNameEn
-      }).catch(e => console.warn('Firestore student pro update notice:', e));
+      if (updatedPay.userId === currentUser.uid) {
+        setCurrentUser(prev => ({
+          ...prev,
+          subscriptionStatus: 'pro',
+          subscriptionExpiresAt: newSub.expiresAt,
+          activePackageId: updatedPay.packageId,
+          activePackageNameBn: updatedPay.packageNameBn,
+          activePackageNameEn: updatedPay.packageNameEn
+        }));
+      }
+
+      return { success: true };
     }
 
-    // Grant Pro status to user if matching current session
-    if (req.userId === currentUser.uid || (req.studentPhone && req.studentPhone === currentUser.phone)) {
-      setCurrentUser(prev => ({
-        ...prev,
-        subscriptionStatus: 'pro',
-        subscriptionExpiresAt: expiresAt,
-        activePackageId: req.packageId,
-        activePackageNameBn: req.packageNameBn,
-        activePackageNameEn: req.packageNameEn
-      }));
-    }
-
-    setAuditLogs(prev => [
-      {
-        id: `log_${Date.now()}`,
-        userId: currentUser.uid,
-        userName: currentUser.name,
-        action: 'PAYMENT_APPROVED',
-        details: `Payment ID ${id} (TrxID: ${req.transactionId}) manually approved. Activated "${pkg.nameEn}" until ${new Date(expiresAt).toLocaleDateString()}.`,
-        timestamp: new Date().toISOString()
-      },
-      ...prev
-    ]);
-
-    return { success: true };
+    return {
+      success: false,
+      error: apiRes.message || 'পেমেন্ট অনুমোদন করা যায়নি।'
+    };
   };
 
-  const rejectPaymentRequest = (id: string, reason: string): { success: boolean; error?: string } => {
-    // 1. Authorization: Only Admin or khayrulalam88@gmail.com can reject payments
-    if (currentUser.role !== 'admin' && currentUser.email !== 'khayrulalam88@gmail.com') {
-      return { success: false, error: 'অননুমোদিত চেষ্টা: শুধুমাত্র অ্যাডমিন পেমেন্ট বাতিল করতে পারবেন।' };
+  const rejectPaymentRequest = async (id: string, reason: string): Promise<{ success: boolean; error?: string }> => {
+    if (!isVerifiedOwnerAccount(auth?.currentUser)) {
+      return { success: false, error: 'অননুমোদিত চেষ্টা: শুধুমাত্র যাচাইকৃত সুপার অ্যাডমিন পেমেন্ট বাতিল করতে পারবেন।' };
     }
 
-    const req = paymentRequests.find(r => r.id === id);
-    const rejectionUpdates = {
-      status: 'rejected' as const,
-      rejectionReason: reason,
-      verifiedAt: new Date().toISOString(),
-      verifiedBy: currentUser.name
+    const apiRes = await apiRejectPaymentRequest(id, reason, currentUser.name);
+    if (apiRes.ok && apiRes.data?.success) {
+      const updatedPay = apiRes.data.paymentRequest;
+      updatePaymentRequestStatusInFirestore(id, {
+        status: 'rejected',
+        rejectionReason: updatedPay.rejectionReason,
+        verifiedAt: updatedPay.verifiedAt,
+        verifiedBy: updatedPay.verifiedBy
+      }).catch(() => {});
+      setPaymentRequests(prev => prev.map(r => (r.id === id ? updatedPay : r)));
+      return { success: true };
+    }
+
+    return {
+      success: false,
+      error: apiRes.message || 'পেমেন্ট বাতিল করা যায়নি।'
     };
-
-    updatePaymentRequestStatusInFirestore(id, rejectionUpdates).catch(e => console.warn('Firestore payment reject notice:', e));
-
-    setPaymentRequests(prev => prev.map(r => {
-      if (r.id === id) {
-        return {
-          ...r,
-          ...rejectionUpdates
-        };
-      }
-      return r;
-    }));
-
-    setAuditLogs(prev => [
-      {
-        id: `log_${Date.now()}`,
-        userId: currentUser.uid,
-        userName: currentUser.name,
-        action: 'PAYMENT_REJECTED',
-        details: `Payment ID ${id} (TrxID: ${req?.transactionId || 'N/A'}) rejected: ${reason}`,
-        timestamp: new Date().toISOString()
-      },
-      ...prev
-    ]);
-
-    return { success: true };
   };
 
-  const adminUpdateUser = (params: {
+  const adminUpdateUser = async (params: {
     userId: string;
     subscriptionId?: string;
     name: string;
@@ -2026,15 +1946,43 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     packageNameEn?: string;
     expiresAt?: string;
     isSessionRevoked?: boolean;
-  }): { success: boolean; message: string } => {
-    // 1. Update currentUser if matching
-    if (params.userId === currentUser.uid || (params.email && params.email.toLowerCase() === currentUser.email.toLowerCase())) {
+  }): Promise<{ success: boolean; message: string }> => {
+    if (!isVerifiedOwnerAccount(auth?.currentUser)) {
+      return {
+        success: false,
+        message: 'অননুমোদিত চেষ্টা: শুধুমাত্র যাচাইকৃত সুপার অ্যাডমিন ব্যবহারকারীর তথ্য বা সাবস্ক্রিপশন পরিবর্তন করতে পারবেন।'
+      };
+    }
+
+    const safeRole: UserRole = params.role === 'admin' && params.userId !== OWNER_ADMIN_UID
+      ? 'student'
+      : params.role;
+
+    const apiRes = await apiAdminUpdateUser({ ...params, role: safeRole });
+    if (!apiRes.ok && apiRes.code !== 'NON_JSON_RESPONSE' && apiRes.code !== 'NETWORK_ERROR') {
+      return { success: false, message: apiRes.message || 'আপডেট ব্যর্থ হয়েছে।' };
+    }
+
+    if (params.userId) {
+      await updateUserRoleOrSubscriptionInFirestore(params.userId, {
+        name: params.name,
+        phone: params.phone,
+        role: safeRole,
+        subscriptionStatus: params.subscriptionStatus,
+        subscriptionExpiresAt: params.expiresAt,
+        activePackageId: params.packageId,
+        activePackageNameBn: params.packageNameBn,
+        activePackageNameEn: params.packageNameEn
+      }).catch(e => console.warn('Firestore user profile update notice:', e));
+    }
+
+    if (params.userId === currentUser.uid) {
       setCurrentUser(prev => ({
         ...prev,
         name: params.name,
         email: params.email,
         phone: params.phone,
-        role: params.role,
+        role: safeRole,
         subscriptionStatus: params.subscriptionStatus,
         subscriptionExpiresAt: params.expiresAt,
         activePackageId: params.packageId,
@@ -2052,7 +2000,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       }
     }
 
-    // 2. Update subscription record in subscriptions ledger
     setSubscriptions(prev => {
       let found = false;
       const updatedList = prev.map(sub => {
@@ -2074,7 +2021,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         return sub;
       });
 
-      // If user had no subscription record yet and is given Pro status
       if (!found && params.subscriptionStatus === 'pro') {
         const pkg = packages.find(p => p.id === params.packageId) || packages[0];
         const newSub: UserSubscription = {
@@ -2102,8 +2048,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       return updatedList;
     });
 
-    // 3. Update active session if present
-    if (currentSession && (currentSession.userId === params.userId || (params.email && currentSession.userEmail.toLowerCase() === params.email.toLowerCase()))) {
+    if (currentSession && currentSession.userId === params.userId) {
       setCurrentSession(prev => prev ? {
         ...prev,
         userName: params.name,
@@ -2112,7 +2057,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       } : null);
     }
 
-    // 4. Audit Log
     setAuditLogs(prev => [
       {
         id: `log_${Date.now()}`,
@@ -2180,6 +2124,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         clearActiveAnswer,
         toggleFlagQuestion,
         submitExamAttempt,
+        examLaunchError,
+        setExamLaunchError,
         activeResult,
         viewResult,
         leaderboardEntries,
@@ -2189,6 +2135,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         startSubjectPractice,
         answeredQuestions,
         recordQuestionAnswer,
+        checkPracticeAnswer,
         getSubjectProgress,
         addQuestion,
         updateQuestion,
@@ -2204,7 +2151,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         approvePaymentRequest,
         rejectPaymentRequest,
         isLoggedIn,
-        loginUser,
+        isVerifiedAdmin,
         loginWithGoogle,
         loginWithEmail,
         getIdToken,

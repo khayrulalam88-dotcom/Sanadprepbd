@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { useApp } from '../context/AppContext';
+import { auth, isVerifiedOwnerAccount } from '../lib/firebase';
 import { Logo } from './Logo';
 import { 
   Home, 
@@ -28,8 +29,8 @@ export const Navbar: React.FC = () => {
 
   const [adminDropdownOpen, setAdminDropdownOpen] = useState(false);
 
-  // Super Admin Check
-  const isAdmin = isLoggedIn && currentUser.role === 'admin' && currentUser.email === 'khayrulalam88@gmail.com';
+  // Super Admin Check (requires live Firebase Auth owner UID)
+  const isAdmin = isLoggedIn && isVerifiedOwnerAccount(auth?.currentUser) && currentUser.role === 'admin';
   const isStudentLoggedIn = isLoggedIn && !isAdmin;
 
   return (

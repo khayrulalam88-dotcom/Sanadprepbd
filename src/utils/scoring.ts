@@ -39,7 +39,7 @@ export function calculateExamScore(
     const selectedAnswer = answers[question.id];
     if (selectedAnswer === undefined || selectedAnswer === null || selectedAnswer === -1) {
       unansweredCount++;
-    } else if (selectedAnswer === question.correctOptionIndex) {
+    } else if (question.correctOptionIndex !== undefined && selectedAnswer === question.correctOptionIndex) {
       correctCount++;
     } else {
       incorrectCount++;

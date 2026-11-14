@@ -53,7 +53,8 @@ export const Dashboard: React.FC = () => {
     recoverSession,
     answeredQuestions,
     previousQuestions,
-    setSelectedPreviousYear
+    setSelectedPreviousYear,
+    isProSubscribed
   } = useApp();
 
   const [showPaymentHistoryModal, setShowPaymentHistoryModal] = React.useState<boolean>(false);
@@ -134,7 +135,7 @@ export const Dashboard: React.FC = () => {
   }, [examResults]);
 
   const daysRemaining = activeSubscription ? calculateDaysRemaining(activeSubscription.expiresAt) : 0;
-  const isSubscriptionActive = activeSubscription && daysRemaining > 0;
+  const isSubscriptionActive = isProSubscribed || (!!activeSubscription && daysRemaining > 0);
 
   // VISIBILITY LOGIC (USER REQUIREMENT):
   // 1. "শুধু ফ্রি মডেলে টেস্ট সবাই দেখতে পারবে" -> Free model test is visible to everyone
@@ -287,18 +288,26 @@ export const Dashboard: React.FC = () => {
 
             <h3 className="text-lg sm:text-xl font-black text-[#102A43]">
               {isSubscriptionActive 
-                ? (language === 'bn' ? activeSubscription.packageNameBn : activeSubscription.packageNameEn)
+                ? (activeSubscription
+                    ? (language === 'bn' ? activeSubscription.packageNameBn : activeSubscription.packageNameEn)
+                    : (currentUser.activePackageNameBn || t('অ্যাডমিন / প্রো সক্রিয় অ্যাক্সেস', 'Verified Pro Access')))
                 : currentUser.subscriptionStatus === 'expired'
                   ? t('আপনার পূর্ববর্তী পাসের মেয়াদ শেষ হয়েছে', 'Your Previous Pass Has Expired')
                   : t('সনদ প্রেপ বিডি ফ্রি এক্সেস', 'Sanad Prep BD Free Access')}
             </h3>
 
-            {isSubscriptionActive ? (
+            {isSubscriptionActive && activeSubscription ? (
               <div className="flex flex-wrap gap-4 text-xs text-slate-600 pt-1">
                 <span>{t('ক্রয়ের তারিখ:', 'Purchased:')} <strong>{new Date(activeSubscription.activatedAt).toLocaleDateString()}</strong></span>
                 <span>{t('মেয়াদোত্তীর্ণ তারিখ:', 'Expires:')} <strong className="text-emerald-800">{new Date(activeSubscription.expiresAt).toLocaleDateString()}</strong> ({examDateConfig.timezone})</span>
                 <span>{t('পেমেন্ট TrxID:', 'TrxID:')} <strong className="font-mono text-[#102A43]">{activeSubscription.transactionId}</strong></span>
               </div>
+            ) : isSubscriptionActive ? (
+              <p className="text-xs text-emerald-700 font-semibold pt-1">
+                {currentUser.subscriptionExpiresAt
+                  ? `${t('মেয়াদোত্তীর্ণ তারিখ:', 'Expires:')} ${new Date(currentUser.subscriptionExpiresAt).toLocaleDateString()}`
+                  : t('যাচাইকৃত প্রো ও অ্যাডমিন অ্যাক্সেস সক্রিয় রয়েছে।', 'Verified Pro access is active.')}
+              </p>
             ) : currentUser.subscriptionStatus === 'expired' ? (
               <p className="text-xs text-amber-900">
                 {t(
@@ -618,7 +627,7 @@ export const Dashboard: React.FC = () => {
         </div>
 
         {/* Free Tier Teaser Card */}
-        {(!isSubscriptionActive && currentUser.subscriptionStatus !== 'pro') && (
+        {!isSubscriptionActive && (
           <div className="p-5 rounded-3xl bg-gradient-to-r from-[#102A43] to-[#243B53] text-white border border-[#D4AF37]/40 shadow-sm flex flex-col sm:flex-row sm:items-center justify-between gap-4 mt-2">
             <div className="space-y-1">
               <div className="flex items-center gap-2">

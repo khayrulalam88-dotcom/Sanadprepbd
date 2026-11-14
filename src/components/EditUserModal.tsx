@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { useApp } from '../context/AppContext';
+import { OWNER_ADMIN_UID } from '../lib/firebase';
 import { 
   X, 
   UserCog, 
@@ -95,7 +96,7 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
     }
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg('');
     setSuccessMsg('');
@@ -112,34 +113,36 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
 
     setSaving(true);
 
-    const selectedPkg = packages.find(p => p.id === packageId);
-    const isoExpiry = new Date(expiryDateInput).toISOString();
+    try {
+      const selectedPkg = packages.find(p => p.id === packageId);
+      const isoExpiry = new Date(expiryDateInput).toISOString();
 
-    const result = adminUpdateUser({
-      userId: user.userId,
-      subscriptionId: user.subscriptionId,
-      name: name.trim(),
-      email: email.trim(),
-      phone: phone.trim(),
-      role,
-      subscriptionStatus,
-      packageId,
-      packageNameBn: selectedPkg?.nameBn || 'প্রো মডেল টেস্ট পাস',
-      packageNameEn: selectedPkg?.nameEn || 'Pro Model Test Pass',
-      expiresAt: isoExpiry,
-      isSessionRevoked
-    });
+      const result = await adminUpdateUser({
+        userId: user.userId,
+        subscriptionId: user.subscriptionId,
+        name: name.trim(),
+        email: email.trim(),
+        phone: phone.trim(),
+        role,
+        subscriptionStatus,
+        packageId,
+        packageNameBn: selectedPkg?.nameBn || 'প্রো মডেল টেস্ট পাস',
+        packageNameEn: selectedPkg?.nameEn || 'Pro Model Test Pass',
+        expiresAt: isoExpiry,
+        isSessionRevoked
+      });
 
-    setSaving(false);
-
-    if (result.success) {
-      setSuccessMsg(t('ইউজার ও সাবস্ক্রিপশন সফলভাবে আপডেট করা হয়েছে!', 'User and subscription updated successfully!'));
-      setTimeout(() => {
-        if (onSaved) onSaved();
-        onClose();
-      }, 1200);
-    } else {
-      setErrorMsg(result.message || 'Update failed');
+      if (result.success) {
+        setSuccessMsg(t('ইউজার ও সাবস্ক্রিপশন সফলভাবে আপডেট করা হয়েছে!', 'User and subscription updated successfully!'));
+        setTimeout(() => {
+          if (onSaved) onSaved();
+          onClose();
+        }, 1200);
+      } else {
+        setErrorMsg(result.message || 'Update failed');
+      }
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -256,7 +259,9 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
                 >
                   <option value="student">{t('শিক্ষার্থী (Student)', 'Student')}</option>
                   <option value="question_manager">{t('প্রশ্ন ব্যবস্থাপক (Question Manager)', 'Question Manager')}</option>
-                  <option value="admin">{t('অ্যাডমিন (Admin)', 'Administrator')}</option>
+                  {user.userId === OWNER_ADMIN_UID && (
+                    <option value="admin">{t('অ্যাডমিন (Admin)', 'Administrator')}</option>
+                  )}
                 </select>
               </div>
             </div>

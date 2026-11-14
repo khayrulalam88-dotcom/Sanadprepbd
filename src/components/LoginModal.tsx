@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { useApp } from '../context/AppContext';
+import { OWNER_ADMIN_UID, auth, isVerifiedOwnerAccount } from '../lib/firebase';
 import { Logo } from './Logo';
 import { 
   X, 
@@ -22,7 +23,6 @@ export const LoginModal: React.FC = () => {
     setShowLoginModal, 
     isLoggedIn, 
     currentUser, 
-    loginUser, 
     loginWithGoogle,
     loginWithEmail,
     logoutUser, 
@@ -174,7 +174,7 @@ export const LoginModal: React.FC = () => {
               </div>
 
               <div className="flex items-center gap-2 pt-2 border-t border-slate-200">
-                {currentUser.email === 'khayrulalam88@gmail.com' && (
+                {isVerifiedOwnerAccount(auth?.currentUser) && currentUser.uid === OWNER_ADMIN_UID && (
                   <button
                     onClick={() => {
                       setActiveScreen('admin');

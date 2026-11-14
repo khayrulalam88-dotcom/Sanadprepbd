@@ -11,7 +11,7 @@
         "phone": { "type": "string", "maxLength": 20 },
         "role": { "type": "string", "enum": ["student", "question_manager", "admin"] },
         "subscriptionStatus": { "type": "string", "enum": ["free", "pro", "expired"] },
-        "subscriptionExpiresAt": { "type": "string" },
+        "subscriptionExpiresAt": { "type": "string", "description": "Firestore Timestamp (or ISO string during pre-migration)" },
         "createdAt": { "type": "string" }
       },
       "required": ["uid", "name", "role", "subscriptionStatus", "createdAt"]
@@ -32,15 +32,12 @@
     },
     "Question": {
       "title": "Question",
-      "description": "Authentic Bar Council exam question with 4 options, legal reference, and explanation",
+      "description": "Sanitized Bar Council exam question with 4 options and legal reference (answer keys stored separately in /questionKeys)",
       "type": "object",
       "properties": {
         "subjectId": { "type": "string", "maxLength": 64 },
         "questionBn": { "type": "string", "maxLength": 1000 },
         "questionEn": { "type": "string", "maxLength": 1000 },
-        "correctOptionIndex": { "type": "number" },
-        "explanationBn": { "type": "string", "maxLength": 2000 },
-        "explanationEn": { "type": "string", "maxLength": 2000 },
         "legalReference": { "type": "string", "maxLength": 200 },
         "difficulty": { "type": "string", "enum": ["easy", "medium", "hard"] },
         "status": { "type": "string", "enum": ["draft", "reviewed", "published"] },
@@ -48,7 +45,20 @@
         "createdAt": { "type": "string" },
         "updatedAt": { "type": "string" }
       },
-      "required": ["subjectId", "questionBn", "correctOptionIndex", "difficulty", "status"]
+      "required": ["subjectId", "questionBn", "difficulty", "status"]
+    },
+    "QuestionKey": {
+      "title": "QuestionKey",
+      "description": "Restricted answer key and explanation document accessible only to scoring backend and verified Owner Admin",
+      "type": "object",
+      "properties": {
+        "correctOptionIndex": { "type": "number" },
+        "explanationBn": { "type": "string", "maxLength": 2000 },
+        "explanationEn": { "type": "string", "maxLength": 2000 },
+        "legalReference": { "type": "string", "maxLength": 200 },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["correctOptionIndex"]
     },
     "Exam": {
       "title": "Exam",
@@ -217,7 +227,11 @@
     },
     "/questions/{questionId}": {
       "schema": { "$ref": "#/entities/Question" },
-      "description": "Statutory multiple choice questions"
+      "description": "Statutory multiple choice questions (sanitized stems & options)"
+    },
+    "/questionKeys/{questionId}": {
+      "schema": { "$ref": "#/entities/QuestionKey" },
+      "description": "Restricted MCQ answer keys & explanations (Owner Admin & server only)"
     },
     "/exams/{examId}": {
       "schema": { "$ref": "#/entities/Exam" },
@@ -229,7 +243,7 @@
     },
     "/examResults/{resultId}": {
       "schema": { "$ref": "#/entities/ExamResult" },
-      "description": "Computed final scores and question evaluation"
+      "description": "Server-computed final scores and question evaluation"
     },
     "/leaderboard/{entryId}": {
       "schema": { "$ref": "#/entities/LeaderboardEntry" },
@@ -249,7 +263,11 @@
     },
     "/previous_questions/{questionId}": {
       "schema": { "$ref": "#/entities/PreviousQuestion" },
-      "description": "Authentic previous year exam questions with statutory solutions"
+      "description": "Authentic previous year exam questions (sanitized stems & options)"
+    },
+    "/previousQuestionKeys/{questionId}": {
+      "schema": { "$ref": "#/entities/PreviousQuestion" },
+      "description": "Restricted previous year answer keys & explanations (Owner Admin & server only)"
     }
   }
 }

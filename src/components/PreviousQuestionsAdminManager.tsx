@@ -427,7 +427,7 @@ export const PreviousQuestionsAdminManager: React.FC = () => {
                         <div 
                           key={oIdx} 
                           className={`p-2 rounded-lg border text-xs ${
-                            opt.trim() === q.correctAnswer.trim()
+                            Boolean(q.correctAnswer && opt.trim() === q.correctAnswer.trim())
                               ? 'bg-emerald-50 border-emerald-300 font-bold text-emerald-950'
                               : 'bg-white border-slate-200 text-slate-700'
                           }`}

@@ -1,0 +1,68 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-bengali: 'Hind Siliguri', 'Inter', system-ui, -apple-system, sans-serif;
+    --color-primary: #102A43;
+    --color-secondary: #243B53;
+    --color-gold: #D4AF37;
+    --color-bg: #F5F7FA;
+    --color-text: #243447;
+    --color-success: #218838;
+    --color-error: #C62828;
+  }
+  
+  body {
+    font-family: var(--font-bengali);
+    background-color: var(--color-bg);
+    color: var(--color-text);
+  }
+
+  .font-mono-numbers {
+    font-family: 'JetBrains Mono', monospace;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Custom Sanad Prep BD brand helpers */
+.bg-navy-900 { background-color: #102A43; }
+.bg-navy-800 { background-color: #1A365D; }
+.bg-navy-700 { background-color: #243B53; }
+.text-navy-900 { color: #102A43; }
+.text-navy-800 { color: #1A365D; }
+.text-navy-700 { color: #243B53; }
+.border-navy-700 { border-color: #243B53; }
+.border-navy-900 { border-color: #102A43; }
+
+.bg-gold-500 { background-color: #D4AF37; }
+.text-gold-500 { color: #D4AF37; }
+.text-gold-600 { color: #B38E22; }
+.border-gold-500 { border-color: #D4AF37; }
+.border-gold-400 { border-color: #E6C86E; }
+
+.bg-brand-bg { background-color: #F5F7FA; }
+.text-brand-main { color: #243447; }
+
+.text-success-700 { color: #218838; }
+.bg-success-600 { background-color: #218838; }
+.border-success-500 { border-color: #218838; }
+
+.text-error-700 { color: #C62828; }
+.bg-error-600 { background-color: #C62828; }
+.border-error-500 { border-color: #C62828; }
+
+/* Custom scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #f1f5f9;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}

@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState } from 'react';
+import React, { Suspense, lazy, useState } from 'react';
 import { AppProvider, useApp } from './context/AppContext';
 import { Navbar } from './components/Navbar';
 import { LandingPage } from './components/LandingPage';
@@ -13,25 +13,58 @@ import { PracticeScreen } from './components/PracticeScreen';
 import { ResultsScreen } from './components/ResultsScreen';
 import { SubjectsView } from './components/SubjectsView';
 import { HistoryView } from './components/HistoryView';
-import { AdminPanel } from './components/AdminPanel';
 import { QuestionBankView } from './components/QuestionBankView';
 import { PreviousQuestionsView } from './components/PreviousQuestionsView';
 import { CustomTestModal } from './components/CustomTestModal';
 import { SubscriptionModal } from './components/SubscriptionModal';
-import { TestingSuiteModal } from './components/TestingSuiteModal';
 import { FirebaseGuideModal } from './components/FirebaseGuideModal';
 import { LoginModal } from './components/LoginModal';
 import { InfoAndSearchModals } from './components/InfoAndSearchModals';
 import { Logo } from './components/Logo';
-import { Scale, Mail, Shield, FileText, CheckCircle2 } from 'lucide-react';
+import { Scale, Mail, Shield, FileText, CheckCircle2, AlertTriangle, X } from 'lucide-react';
+
+const TestingSuiteModal = lazy(() =>
+  import('./components/TestingSuiteModal').then(m => ({ default: m.TestingSuiteModal }))
+);
+const AdminPanel = lazy(() =>
+  import('./components/AdminPanel').then(m => ({ default: m.AdminPanel }))
+);
 
 const MainContent: React.FC = () => {
-  const { activeScreen, language, t, setActiveScreen } = useApp();
+  const {
+    activeScreen,
+    language,
+    t,
+    setActiveScreen,
+    showCustomTestModal,
+    setShowCustomTestModal,
+    examLaunchError,
+    setExamLaunchError
+  } = useApp();
   const [showPolicyModal, setShowPolicyModal] = useState<'privacy' | 'terms' | null>(null);
 
   return (
     <div className="min-h-screen flex flex-col bg-[#F5F7FA] text-[#243447]">
       <Navbar />
+
+      {examLaunchError && (
+        <div className="max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 pt-4">
+          <div className="p-3.5 rounded-2xl bg-rose-50 border border-rose-200 text-rose-800 text-xs sm:text-sm font-semibold flex items-center justify-between gap-3 shadow-xs">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+              <span>{examLaunchError}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setExamLaunchError(null)}
+              className="p-1 rounded-lg hover:bg-rose-100 text-rose-700 cursor-pointer shrink-0"
+              aria-label="Dismiss error"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
 
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 pt-6 sm:pt-8">
         {activeScreen === 'landing' && <LandingPage />}
@@ -43,18 +76,24 @@ const MainContent: React.FC = () => {
         {activeScreen === 'question_bank' && <QuestionBankView />}
         {activeScreen === 'previous_questions' && <PreviousQuestionsView />}
         {activeScreen === 'history' && <HistoryView />}
-        {activeScreen === 'admin' && <AdminPanel />}
+        {activeScreen === 'admin' && (
+          <Suspense fallback={<div className="py-20 text-center text-sm text-slate-500">Loading Admin Console...</div>}>
+            <AdminPanel />
+          </Suspense>
+        )}
       </main>
 
       {/* Global Modals */}
       <SubscriptionModal />
-      <TestingSuiteModal />
+      <Suspense fallback={null}>
+        <TestingSuiteModal />
+      </Suspense>
       <FirebaseGuideModal />
       <LoginModal />
       <InfoAndSearchModals />
       <CustomTestModal 
-        isOpen={useApp().showCustomTestModal} 
-        onClose={() => useApp().setShowCustomTestModal(false)} 
+        isOpen={showCustomTestModal} 
+        onClose={() => setShowCustomTestModal(false)} 
       />
 
       {/* Privacy / Terms Modal */}

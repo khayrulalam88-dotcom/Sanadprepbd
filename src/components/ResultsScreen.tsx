@@ -54,12 +54,13 @@ export const ResultsScreen: React.FC = () => {
     }));
   };
 
-  // Filter questions
-  const filteredQuestions = activeResult.questions.filter(q => {
+  // Filter questions safely
+  const resultQuestions = activeResult.questions || [];
+  const filteredQuestions = resultQuestions.filter(q => {
     const studentAns = activeResult.answers[q.id];
     if (filter === 'all') return true;
-    if (filter === 'correct') return studentAns === q.correctOptionIndex;
-    if (filter === 'incorrect') return studentAns !== undefined && studentAns !== q.correctOptionIndex;
+    if (filter === 'correct') return q.correctOptionIndex !== undefined && studentAns === q.correctOptionIndex;
+    if (filter === 'incorrect') return studentAns !== undefined && q.correctOptionIndex !== undefined && studentAns !== q.correctOptionIndex;
     if (filter === 'unanswered') return studentAns === undefined;
     return true;
   });
@@ -254,7 +255,7 @@ export const ResultsScreen: React.FC = () => {
                 filter === 'all' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
               }`}
             >
-              {t('সকল', 'All')} ({activeResult.questions.length})
+              {t('সকল', 'All')} ({resultQuestions.length})
             </button>
             <button
               onClick={() => setFilter('correct')}
@@ -287,7 +288,7 @@ export const ResultsScreen: React.FC = () => {
         <div className="space-y-6">
           {filteredQuestions.map((q, idx) => {
             const studentAns = activeResult.answers[q.id];
-            const isCorrect = studentAns === q.correctOptionIndex;
+            const isCorrect = q.correctOptionIndex !== undefined && studentAns === q.correctOptionIndex;
             const isUnanswered = studentAns === undefined;
             const isExpanded = expandedExplanations[q.id] ?? true; // expanded by default
 

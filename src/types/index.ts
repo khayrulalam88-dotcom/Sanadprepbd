@@ -100,9 +100,9 @@ export interface Question {
   questionEn: string;
   optionsBn: string[];
   optionsEn: string[];
-  correctOptionIndex: number; // 0, 1, 2, 3
-  explanationBn: string;
-  explanationEn: string;
+  correctOptionIndex?: number; // Restricted to scoring backend, owner admin, and post-submission review
+  explanationBn?: string;
+  explanationEn?: string;
   legalReference?: string; // e.g., "Section 9, Code of Civil Procedure, 1908"
   difficulty: QuestionDifficulty;
   status: QuestionStatus;
@@ -110,6 +110,12 @@ export interface Question {
   createdAt: string;
   updatedAt: string;
   createdBy?: string;
+}
+
+export interface ServerQuestion extends Question {
+  correctOptionIndex: number;
+  explanationBn: string;
+  explanationEn: string;
 }
 
 export type PreviousYear = 2020 | 2022 | 2023 | 2025 | number;
@@ -120,8 +126,8 @@ export interface PreviousQuestion {
   subject: string;
   question: string;
   options: string[];
-  correctAnswer: string;
-  explanation: string;
+  correctAnswer?: string; // Restricted to backend checking, owner admin, and post-submission review
+  explanation?: string;
   legalSection?: string;
   source?: string;
   subjectId?: string;
@@ -139,6 +145,11 @@ export interface PreviousQuestion {
   createdAt?: string;
   updatedAt?: string;
   createdBy?: string;
+}
+
+export interface ServerPreviousQuestion extends PreviousQuestion {
+  correctAnswer: string;
+  explanation: string;
 }
 
 export type ExamType = 'full_mock' | 'subject_test' | 'practice_quiz' | 'custom_test';

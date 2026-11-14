@@ -1,0 +1,223 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Default Deny All Catch-All
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ---------------------------------------------------------
+    // HELPER FUNCTIONS (Zero-Trust Attribute-Based Security)
+    // ---------------------------------------------------------
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Primary Owner Account: Verified by immutable Firebase Auth UID + email
+    function isOwnerAccount() {
+      return isAuthenticated() &&
+             request.auth.uid == 'PjBRV7LAQ8cIwOdM3z474A16dWg2' &&
+             request.auth.token.email == 'khayrulalam88@gmail.com';
+    }
+
+    // Admin Authority: Owner account OR owner-approved entry in /admins/{uid}
+    function isAdmin() {
+      return isAuthenticated() && (
+        isOwnerAccount() ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    // Verified Paid Access Gate: User must have active pro status AND valid non-null unexpired subscriptionExpiresAt
+    // Safely handles both ISO 8601 string and Firestore Timestamp types
+    function hasActiveSubscription() {
+      return isAuthenticated() && (
+        isOwnerAccount() ||
+        isAdmin() ||
+        (
+          exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.subscriptionStatus == 'pro' &&
+          'subscriptionExpiresAt' in get(/databases/$(database)/documents/users/$(request.auth.uid)).data &&
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.subscriptionExpiresAt != null &&
+          (
+            (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.subscriptionExpiresAt is string &&
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.subscriptionExpiresAt > string(request.time)) ||
+            (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.subscriptionExpiresAt is timestamp &&
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.subscriptionExpiresAt > request.time)
+          )
+        )
+      );
+    }
+
+    // ---------------------------------------------------------
+    // 1. ADMIN AUTHORIZATION RECORD (/admins/{adminId})
+    // ---------------------------------------------------------
+    // CRITICAL: Only the verified owner UID can create, update, or revoke admin privileges.
+    match /admins/{adminId} {
+      allow read: if isAuthenticated() && (request.auth.uid == adminId || isOwnerAccount());
+      allow write: if isOwnerAccount();
+    }
+
+    // ---------------------------------------------------------
+    // 2. USER PROFILES (/users/{userId})
+    // ---------------------------------------------------------
+    // Ordinary students CANNOT grant themselves admin role or pro subscription status.
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isOwnerAccount() || isAdmin();
+      allow create: if isAuthenticated() && request.auth.uid == userId && (
+        isOwnerAccount() || (
+          request.resource.data.role == 'student' &&
+          request.resource.data.subscriptionStatus == 'free' &&
+          (!('subscriptionExpiresAt' in request.resource.data) || request.resource.data.subscriptionExpiresAt == null)
+        )
+      );
+      allow update: if isOwnerAccount() || (
+        isAdmin() && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'uid', 'createdAt'])
+      ) || (
+        isOwner(userId) &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+          'uid',
+          'createdAt',
+          'role',
+          'subscriptionStatus',
+          'subscriptionExpiresAt',
+          'activePackageId',
+          'activePackageNameBn',
+          'activePackageNameEn'
+        ])
+      );
+      allow delete: if isOwnerAccount();
+    }
+
+    // ---------------------------------------------------------
+    // 3. PAYMENT REQUESTS (/paymentRequests/{paymentId})
+    // ---------------------------------------------------------
+    // Students can ONLY create requests with status 'pending' for their own UID.
+    // Document ID MUST match trx_{transactionId} to prevent duplicate transaction IDs across all accounts.
+    // Only the verified owner UID can approve, reject, or delete requests.
+    match /paymentRequests/{paymentId} {
+      allow read: if (isAuthenticated() && resource.data.userId == request.auth.uid) || isOwnerAccount();
+      allow create: if isAuthenticated() &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.status == 'pending' &&
+        request.resource.data.verifiedAt == null &&
+        request.resource.data.verifiedBy == null &&
+        (!('rejectionReason' in request.resource.data) || request.resource.data.rejectionReason == null) &&
+        request.resource.data.subscriptionId == null &&
+        request.resource.data.transactionId is string &&
+        request.resource.data.transactionId.size() >= 4 &&
+        request.resource.data.transactionId.size() <= 64 &&
+        paymentId == ('trx_' + request.resource.data.transactionId) &&
+        request.resource.data.amount is number &&
+        request.resource.data.amount > 0;
+      allow update: if isOwnerAccount();
+      allow delete: if isOwnerAccount();
+    }
+
+    // ---------------------------------------------------------
+    // 4. SUBSCRIPTIONS (/subscriptions/{subscriptionId})
+    // ---------------------------------------------------------
+    // Strictly created and managed by the verified owner UID upon manual payment approval.
+    // Students can ONLY read their own subscription document.
+    match /subscriptions/{subscriptionId} {
+      allow read: if (isAuthenticated() && resource.data.userId == request.auth.uid) || isOwnerAccount();
+      allow create, update, delete: if isOwnerAccount();
+    }
+
+    // ---------------------------------------------------------
+    // 5. EXAMINATIONS (/exams/{examId})
+    // ---------------------------------------------------------
+    // Free exams readable by all; Paid 60-min model tests require active Pro subscription or Admin.
+    match /exams/{examId} {
+      allow read: if (!('isPaid' in resource.data) || resource.data.isPaid == false || resource.data.get('isFree', false) == true) || hasActiveSubscription();
+      allow write: if isOwnerAccount() || isAdmin();
+    }
+
+    // ---------------------------------------------------------
+    // 6. QUESTION BANK & SYLLABUS
+    // ---------------------------------------------------------
+    match /subjects/{subjectId} {
+      allow read: if true;
+      allow write: if isOwnerAccount() || isAdmin();
+    }
+
+    match /questions/{questionId} {
+      allow read: if true;
+      allow write: if isOwnerAccount() || isAdmin();
+    }
+
+    match /previous_questions/{questionId} {
+      allow read: if true;
+      allow write: if isOwnerAccount() || isAdmin();
+    }
+
+    // ---------------------------------------------------------
+    // 7. EXAM ATTEMPTS & RESULTS
+    // ---------------------------------------------------------
+    match /examAttempts/{attemptId} {
+      allow read: if isOwner(resource.data.userId) || isOwnerAccount();
+      allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
+      allow update: if (isOwner(resource.data.userId) && request.resource.data.userId == request.auth.uid) || isOwnerAccount();
+      allow delete: if isOwnerAccount();
+    }
+
+    match /examResults/{resultId} {
+      allow read: if isOwner(resource.data.userId) || isOwnerAccount();
+      // Validates finalScore (standard model) and score (compat), and totalQuestions boundaries. Immutable once created.
+      allow create: if isAuthenticated() &&
+                    request.resource.data.userId == request.auth.uid &&
+                    request.resource.data.totalQuestions is number &&
+                    request.resource.data.totalQuestions > 0 &&
+                    request.resource.data.totalQuestions <= 200 &&
+                    (('finalScore' in request.resource.data && request.resource.data.finalScore is number &&
+                      request.resource.data.finalScore <= request.resource.data.totalQuestions &&
+                      request.resource.data.finalScore >= -50) ||
+                     ('score' in request.resource.data && request.resource.data.score is number &&
+                      request.resource.data.score <= request.resource.data.totalQuestions &&
+                      request.resource.data.score >= -50));
+      allow update: if isOwnerAccount();
+      allow delete: if isOwnerAccount();
+    }
+
+    // ---------------------------------------------------------
+    // 8. LEADERBOARD (Public merit list)
+    // ---------------------------------------------------------
+    match /leaderboard/{entryId} {
+      allow read: if true;
+      // Validates both totalMarks (standard LeaderboardEntry) and totalQuestions (compat). Immutable to students after submission.
+      allow create: if isAuthenticated() &&
+                    request.resource.data.userId == request.auth.uid &&
+                    request.resource.data.score is number &&
+                    request.resource.data.score >= -50 &&
+                    request.resource.data.score <= 100 &&
+                    (('totalMarks' in request.resource.data && request.resource.data.totalMarks is number) ||
+                     ('totalQuestions' in request.resource.data && request.resource.data.totalQuestions is number));
+      allow update: if isOwnerAccount();
+      allow delete: if isOwnerAccount();
+    }
+
+    // ---------------------------------------------------------
+    // 9. PACKAGES, CONFIG & AUDIT LOGS
+    // ---------------------------------------------------------
+    match /packages/{packageId} {
+      allow read: if true;
+      allow write: if isOwnerAccount();
+    }
+
+    match /config/{configId} {
+      allow read: if true;
+      allow write: if isOwnerAccount();
+    }
+
+    match /auditLogs/{logId} {
+      allow read: if isOwnerAccount() || isAdmin();
+      allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if isOwnerAccount();
+    }
+  }
+}

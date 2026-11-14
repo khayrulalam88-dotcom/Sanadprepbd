@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { useApp } from '../context/AppContext';
+import { auth, isVerifiedOwnerAccount } from '../lib/firebase';
 import { 
   X, 
   Sparkles, 
@@ -36,7 +37,7 @@ export const CustomTestModal: React.FC<CustomTestModalProps> = ({
     setActiveScreen 
   } = useApp();
 
-  const isAdmin = currentUser.role === 'admin' || currentUser.email === 'khayrulalam88@gmail.com';
+  const isAdmin = isVerifiedOwnerAccount(auth?.currentUser) && currentUser.role === 'admin';
 
   // Mode: 'auto_mix' (All 7 subjects), 'select_subjects' (Custom subjects), or 'pre_selected' (if user selected in bank)
   const [selectedSubjectIds, setSelectedSubjectIds] = useState<string[]>([]);
@@ -45,6 +46,8 @@ export const CustomTestModal: React.FC<CustomTestModalProps> = ({
   const [negativeMarkRatio, setNegativeMarkRatio] = useState<number>(0.25);
   const [testTitle, setTestTitle] = useState<string>('');
   const [difficultyFilter, setDifficultyFilter] = useState<'all' | 'easy' | 'medium' | 'hard'>('all');
+  const [isStarting, setIsStarting] = useState<boolean>(false);
+  const [errorMsg, setErrorMsg] = useState<string>('');
 
   if (!isOpen || !isAdmin) return null;
 
@@ -66,7 +69,9 @@ export const CustomTestModal: React.FC<CustomTestModalProps> = ({
     }
   };
 
-  const handleStartExam = () => {
+  const handleStartExam = async () => {
+    if (isStarting) return;
+    setErrorMsg('');
     let chosenIds: string[] = [];
 
     if (hasPreSelected) {
@@ -93,25 +98,30 @@ export const CustomTestModal: React.FC<CustomTestModalProps> = ({
     }
 
     if (chosenIds.length === 0) {
-      alert(t('অনুগ্রহ করে অন্তত ১টি প্রশ্ন নির্বাচন করুন', 'Please select at least 1 question.'));
+      setErrorMsg(t('অনুগ্রহ করে অন্তত ১টি প্রশ্ন নির্বাচন করুন', 'Please select at least 1 question.'));
       return;
     }
 
     const titleBn = testTitle.trim() || `কাস্টম মডেল টেস্ট (${chosenIds.length} টি প্রশ্ন)`;
     const titleEn = testTitle.trim() || `Custom Model Test (${chosenIds.length} MCQs)`;
 
-    const res = createAndStartCustomExam({
-      titleBn,
-      titleEn,
-      durationMinutes,
-      questionIds: chosenIds,
-      negativeMarkRatio
-    });
+    setIsStarting(true);
+    try {
+      const res = await createAndStartCustomExam({
+        titleBn,
+        titleEn,
+        durationMinutes,
+        questionIds: chosenIds,
+        negativeMarkRatio
+      });
 
-    if (res.success) {
-      onClose();
-    } else if (res.reason) {
-      alert(res.reason);
+      if (res.success) {
+        onClose();
+      } else if (res.reason) {
+        setErrorMsg(res.reason);
+      }
+    } finally {
+      setIsStarting(false);
     }
   };
 
@@ -148,6 +158,11 @@ export const CustomTestModal: React.FC<CustomTestModalProps> = ({
 
         {/* Content Body */}
         <div className="p-6 space-y-6 max-h-[75vh] overflow-y-auto text-xs sm:text-sm">
+          {errorMsg && (
+            <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 font-semibold text-xs">
+              {errorMsg}
+            </div>
+          )}
           
           {/* Custom Test Name */}
           <div className="space-y-1.5">
@@ -376,11 +391,16 @@ export const CustomTestModal: React.FC<CustomTestModalProps> = ({
 
           <button
             type="button"
-            onClick={handleStartExam}
-            className="px-6 py-2.5 rounded-xl bg-[#102A43] hover:bg-[#243B53] text-[#D4AF37] border border-[#D4AF37] font-black text-xs sm:text-sm transition flex items-center gap-2 shadow-md cursor-pointer"
+            disabled={isStarting}
+            onClick={() => void handleStartExam()}
+            className="px-6 py-2.5 rounded-xl bg-[#102A43] hover:bg-[#243B53] disabled:opacity-60 text-[#D4AF37] border border-[#D4AF37] font-black text-xs sm:text-sm transition flex items-center gap-2 shadow-md cursor-pointer"
           >
             <Play className="w-4 h-4 fill-current text-[#D4AF37]" />
-            <span>{t('মডেল টেস্ট শুরু করুন', 'Start Model Test Now')}</span>
+            <span>
+              {isStarting
+                ? t('প্রস্তুত হচ্ছে...', 'Starting...')
+                : t('মডেল টেস্ট শুরু করুন', 'Start Model Test Now')}
+            </span>
           </button>
         </div>
 

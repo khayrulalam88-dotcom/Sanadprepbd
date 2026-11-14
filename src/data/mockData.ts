@@ -1,7 +1,4 @@
 import type { Subject, Question } from '../types/index.ts';
-import questionBankRaw from './questionBank3000.json' with { type: 'json' };
-
-export const QUESTION_BANK_3000: Question[] = questionBankRaw as unknown as Question[];
 
 export const INITIAL_SUBJECTS: Subject[] = [
   {
@@ -83,8 +80,8 @@ export const INITIAL_SUBJECTS: Subject[] = [
   }
 ];
 
+// Sanitized demo preview items ONLY (all answer keys & explanations live on the backend / questionKeys collection)
 const SAMPLE_QUESTIONS: Question[] = [
-  // --- CPC (The Code of Civil Procedure, 1908) ---
   {
     id: 'q_cpc_1',
     subjectId: 'sub_cpc',
@@ -92,9 +89,6 @@ const SAMPLE_QUESTIONS: Question[] = [
     questionEn: 'Under which section of the Code of Civil Procedure, 1908, do civil courts have jurisdiction to try all civil suits unless barred?',
     optionsBn: ['ধারা ৬ (Section 6)', 'ধারা ৯ (Section 9)', 'ধারা ১০ (Section 10)', 'ধারা ১১ (Section 11)'],
     optionsEn: ['Section 6', 'Section 9', 'Section 10', 'Section 11'],
-    correctOptionIndex: 1,
-    explanationBn: 'দেওয়ানী কার্যবিধির ৯ ধারা অনুযায়ী, দেওয়ানী আদালতসমূহের সমস্ত দেওয়ানী প্রকৃতির মোকদ্দমা বিচার করার সাধারণ এখতিয়ার রয়েছে, যদি না তা স্পষ্টভাবে বা পরোক্ষভাবে বারিত হয়।',
-    explanationEn: 'Section 9 of the Code of Civil Procedure provides that the Courts shall have jurisdiction to try all suits of a civil nature excepting suits of which their cognizance is either expressly or impliedly barred.',
     legalReference: 'The Code of Civil Procedure, 1908 - Section 9',
     difficulty: 'easy',
     status: 'published',
@@ -103,68 +97,12 @@ const SAMPLE_QUESTIONS: Question[] = [
     updatedAt: '2026-01-01T00:00:00Z'
   },
   {
-    id: 'q_cpc_2',
-    subjectId: 'sub_cpc',
-    questionBn: 'দেওয়ানী কার্যবিধির কোন নীতি অনুযায়ী একই পক্ষদ্বয়ের মধ্যে পূর্বে চূড়ান্ত নিষ্পত্তি হওয়া বিষয় নিয়ে নতুন মোকদ্দমা দায়ের বারিত হয়?',
-    questionEn: 'Which principle of the Code of Civil Procedure bars a fresh suit on a matter directly and substantially in issue heard and finally decided between the same parties?',
-    optionsBn: ['রেস সাব-জুডিস (Res Sub-judice)', 'রেস জুডিকাটা (Res Judicata)', 'পারচেনশন (Pre-emption)', 'এস্টোপেল (Estoppel)'],
-    optionsEn: ['Res Sub-judice', 'Res Judicata', 'Pre-emption', 'Estoppel'],
-    correctOptionIndex: 1,
-    explanationBn: 'দেওয়ানী কার্যবিধির ১১ ধারায় দোবারা দোষ বা রেস জুডিকাটা (Res Judicata) বিধান বর্ণিত হয়েছে, যা পূর্ব নিষ্পত্তিকৃত বিষয়ে পুনরায় মামলা দায়ের বারিত করে।',
-    explanationEn: 'Section 11 of the CPC incorporates the doctrine of Res Judicata, which bars the court from trying any suit or issue which has already been heard and finally decided by a competent court between the same parties.',
-    legalReference: 'The Code of Civil Procedure, 1908 - Section 11',
-    difficulty: 'medium',
-    status: 'published',
-    isDemoSample: true,
-    createdAt: '2026-01-01T00:00:00Z',
-    updatedAt: '2026-01-01T00:00:00Z'
-  },
-  {
-    id: 'q_cpc_3',
-    subjectId: 'sub_cpc',
-    questionBn: 'দেওয়ানী কার্যবিধির কোন আদেশ এবং বিধিমতে অস্থায়ী নিষেধাজ্ঞা (Temporary Injunction) প্রার্থনা করা হয়?',
-    questionEn: 'Under which Order and Rules of the CPC is an application for temporary injunction filed?',
-    optionsBn: ['আদেশ ২৬ (Order 26)', 'আদেশ ৩৯, বিধি ১ ও ২ (Order 39, Rules 1 & 2)', 'আদেশ ৪০, বিধি ১ (Order 40, Rule 1)', 'আদেশ ২১ (Order 21)'],
-    optionsEn: ['Order 26', 'Order 39, Rules 1 & 2', 'Order 40, Rule 1', 'Order 21'],
-    correctOptionIndex: 1,
-    explanationBn: 'দেওয়ানী কার্যবিধির ৩৯ আদেশের ১ ও ২ বিধি মোতাবেক সম্পত্তিতে অপচয়, ক্ষয়ক্ষতি বা অন্যায় হস্তান্তর রোধের উদ্দেশ্যে আদালত অস্থায়ী নিষেধাজ্ঞা মঞ্জুর করতে পারেন।',
-    explanationEn: 'Order XXXIX, Rules 1 and 2 of the Code of Civil Procedure govern the grant of temporary injunctions to protect disputed property from being wasted, damaged, or alienated.',
-    legalReference: 'The Code of Civil Procedure, 1908 - Order 39, Rules 1-2',
-    difficulty: 'easy',
-    status: 'published',
-    isDemoSample: true,
-    createdAt: '2026-01-01T00:00:00Z',
-    updatedAt: '2026-01-01T00:00:00Z'
-  },
-  {
-    id: 'q_cpc_4',
-    subjectId: 'sub_cpc',
-    questionBn: 'দেওয়ানী কার্যবিধির কত ধারার অধীনে আদালতের সহজাত ক্ষমতা (Inherent Powers of Court) সংরক্ষিত রয়েছে?',
-    questionEn: 'Which section of the Code of Civil Procedure saves the inherent powers of the civil court?',
-    optionsBn: ['ধারা ১১৫ (Section 115)', 'ধারা ১৪৪ (Section 144)', 'ধারা ১৫১ (Section 151)', 'ধারা ১৫২ (Section 152)'],
-    optionsEn: ['Section 115', 'Section 144', 'Section 151', 'Section 152'],
-    correctOptionIndex: 2,
-    explanationBn: 'দেওয়ানী কার্যবিধির ধারা ১৫১ আদালতের ন্যায়বিচার নিশ্চিতকরণ এবং প্রক্রিয়ার অপব্যবহার রোধে সহজাত ক্ষমতাকে সংরক্ষণ করে।',
-    explanationEn: 'Section 151 of the CPC explicitly preserves the inherent power of the court to make such orders as may be necessary for the ends of justice or to prevent abuse of the process of the court.',
-    legalReference: 'The Code of Civil Procedure, 1908 - Section 151',
-    difficulty: 'easy',
-    status: 'published',
-    isDemoSample: true,
-    createdAt: '2026-01-01T00:00:00Z',
-    updatedAt: '2026-01-01T00:00:00Z'
-  },
-
-  // --- SRA (The Specific Relief Act, 1877) ---
-  {
     id: 'q_sra_1',
     subjectId: 'sub_sra',
     questionBn: 'সুনির্দিষ্ট প্রতিকার আইনের ৯ ধারা মতে দখলচ্যুত ব্যক্তি কত সময়ের মধ্যে দখল পুনরুদ্ধারের মোকদ্দমা দায়ের করতে পারেন?',
     questionEn: 'Under Section 9 of the Specific Relief Act, 1877, within what period must a dispossessed person file a suit for recovery of possession?',
     optionsBn: ['৩ মাস (3 months)', '৬ মাস (6 months)', '১ বছর (1 year)', '৩ বছর (3 years)'],
     optionsEn: ['3 months', '6 months', '1 year', '3 years'],
-    correctOptionIndex: 1,
-    explanationBn: 'সুনির্দিষ্ট প্রতিকার আইনের ৯ ধারার বিধান অনুযায়ী সম্মতি ব্যতীত এবং আইনসঙ্গত পন্থা ছাড়া স্থাবর সম্পত্তি হতে বেদখল হলে বেদখলের তারিখ থেকে ৬ মাসের মধ্যে মোকদ্দমা দায়ের করতে হয়।',
-    explanationEn: 'Under Section 9 of the Specific Relief Act, 1877, a suit for recovery of immovable property by a person dispossessed without his consent otherwise than in due course of law must be brought within six months from dispossession.',
     legalReference: 'The Specific Relief Act, 1877 - Section 9',
     difficulty: 'easy',
     status: 'published',
@@ -173,51 +111,12 @@ const SAMPLE_QUESTIONS: Question[] = [
     updatedAt: '2026-01-01T00:00:00Z'
   },
   {
-    id: 'q_sra_2',
-    subjectId: 'sub_sra',
-    questionBn: 'সুনির্দিষ্ট প্রতিকার আইনের ৪২ ধারার অধীনে কোন প্রকৃতির প্রতিকার চাওয়া হয়?',
-    questionEn: 'What remedy is sought under Section 42 of the Specific Relief Act, 1877?',
-    optionsBn: ['চুক্তি বাস্তবায়ন (Specific Performance)', 'ঘোষণামূলক ডিক্রি (Declaratory Decree)', 'দলিল বাতিল (Cancellation of Instruments)', 'স্থায়ী নিষেধাজ্ঞা (Perpetual Injunction)'],
-    optionsEn: ['Specific Performance', 'Declaratory Decree', 'Cancellation of Instruments', 'Perpetual Injunction'],
-    correctOptionIndex: 1,
-    explanationBn: 'সুনির্দিষ্ট প্রতিকার আইনের ধারা ৪২ আইনগত চরিত্র বা কোনো সম্পত্তিতে স্বত্ব ঘোষণার জন্য ডিক্রি প্রদানের এখতিয়ার প্রদান করে।',
-    explanationEn: 'Section 42 of the Specific Relief Act, 1877 provides discretionary relief through a declaration of status or legal character or right to property.',
-    legalReference: 'The Specific Relief Act, 1877 - Section 42',
-    difficulty: 'easy',
-    status: 'published',
-    isDemoSample: true,
-    createdAt: '2026-01-01T00:00:00Z',
-    updatedAt: '2026-01-01T00:00:00Z'
-  },
-  {
-    id: 'q_sra_3',
-    subjectId: 'sub_sra',
-    questionBn: 'সুনির্দিষ্ট প্রতিকার আইনের কোন ধারায় চুক্তি বলবৎকরণের ক্ষেত্রে আদালতের বিবেচনামূলক ক্ষমতা (Discretion as to decreeing specific performance) আলোচিত হয়েছে?',
-    questionEn: 'Which section of the Specific Relief Act discusses the court’s discretion in decreeing specific performance of contract?',
-    optionsBn: ['ধারা ১২ (Section 12)', 'ধারা ২১ (Section 21)', 'ধারা ২২ (Section 22)', 'ধারা ৩৫ (Section 35)'],
-    optionsEn: ['Section 12', 'Section 21', 'Section 22', 'Section 35'],
-    correctOptionIndex: 2,
-    explanationBn: 'সুনির্দিষ্ট প্রতিকার আইনের ধারা ২২ অনুসারে চুক্তি সুনির্দিষ্টভাবে বলবৎকরণের আদালতের ক্ষমতা সম্পূর্ণ বিবেচনামূলক (discretionary), যা আইনগত ও যুক্তিসঙ্গত ভিত্তির উপর প্রয়োগ করা আবশ্যক।',
-    explanationEn: 'Section 22 provides that the jurisdiction to decree specific performance is discretionary, and the court is not bound to grant such relief merely because it is lawful to do so.',
-    legalReference: 'The Specific Relief Act, 1877 - Section 22',
-    difficulty: 'medium',
-    status: 'published',
-    isDemoSample: true,
-    createdAt: '2026-01-01T00:00:00Z',
-    updatedAt: '2026-01-01T00:00:00Z'
-  },
-
-  // --- CrPC (The Code of Criminal Procedure, 1898) ---
-  {
     id: 'q_crpc_1',
     subjectId: 'sub_crpc',
-    questionBn: 'ফৌজদারী কার্যবিধির কোন ধারা অনুসারে কোনো ব্যক্তি মৃত্যুর সম্মুখীন হলে বা তাৎক্ষণিক শান্তি ভঙ্গের আশঙ্কায় ১৪৪ ধারা জারির ক্ষমতা প্রয়োগ করা হয়?',
+    questionBn: 'ফৌজদারী কার্যবিধির কোন ধারা অনুসারে তাৎক্ষণিক শান্তি ভঙ্গের আশঙ্কায় ১৪৪ ধারা জারির ক্ষমতা প্রয়োগ করা হয়?',
     questionEn: 'Under which section of the Code of Criminal Procedure, 1898, is an order issued to prevent urgent cases of nuisance or apprehended danger?',
     optionsBn: ['ধারা ১৩৩ (Section 133)', 'ধারা ১৪৪ (Section 144)', 'ধারা ১৪৫ (Section 145)', 'ধারা ১০৭ (Section 107)'],
     optionsEn: ['Section 133', 'Section 144', 'Section 145', 'Section 107'],
-    correctOptionIndex: 1,
-    explanationBn: 'ফৌজদারী কার্যবিধির ধারা ১৪৪ এ জরুরী অবস্থায় উপদ্রব বা বিপদের আশঙ্কায় সাময়িক আদেশ বা নিষেধাজ্ঞা প্রদানের ক্ষমতা নির্বাহী ম্যাজিস্ট্রেটকে প্রদান করা হয়েছে।',
-    explanationEn: 'Section 144 of the Code of Criminal Procedure empowers an Executive Magistrate to issue immediate orders in urgent cases of nuisance or apprehended danger to public tranquility.',
     legalReference: 'The Code of Criminal Procedure, 1898 - Section 144',
     difficulty: 'easy',
     status: 'published',
@@ -226,68 +125,12 @@ const SAMPLE_QUESTIONS: Question[] = [
     updatedAt: '2026-01-01T00:00:00Z'
   },
   {
-    id: 'q_crpc_2',
-    subjectId: 'sub_crpc',
-    questionBn: 'ফৌজদারী কার্যবিধির কোন ধারার অধীনে হাইকোর্ট বিভাগ আগাম জামিন (Anticipatory Bail) মঞ্জুর করতে পারে?',
-    questionEn: 'Under which section of the CrPC does the High Court Division grant Anticipatory Bail?',
-    optionsBn: ['ধারা ৪৯৬ (Section 496)', 'ধারা ৪৯৭ (Section 497)', 'ধারা ৪৯৮ (Section 498)', 'ধারা ৫০২ (Section 502)'],
-    optionsEn: ['Section 496', 'Section 497', 'Section 498', 'Section 502'],
-    correctOptionIndex: 2,
-    explanationBn: 'ফৌজদারী কার্যবিধির ৪৯৮ ধারার বিশেষ ক্ষমতাবলে দায়রা জজ আদালত ও হাইকোর্ট বিভাগ অভিযুক্ত ব্যক্তির গ্রেপ্তার পূর্ববর্তী আগাম জামিন বা জামিনের শর্ত শিথিল করতে পারেন।',
-    explanationEn: 'Section 498 grants wide power to the High Court Division and Court of Session to direct admission to bail or reduction of bail at any stage, including anticipatory bail before actual arrest.',
-    legalReference: 'The Code of Criminal Procedure, 1898 - Section 498',
-    difficulty: 'medium',
-    status: 'published',
-    isDemoSample: true,
-    createdAt: '2026-01-01T00:00:00Z',
-    updatedAt: '2026-01-01T00:00:00Z'
-  },
-  {
-    id: 'q_crpc_3',
-    subjectId: 'sub_crpc',
-    questionBn: 'ফৌজদারী কার্যবিধির কোন ধারায় হাইকোর্ট বিভাগের সহজাত ক্ষমতা (Inherent Power of High Court Division) সংরক্ষিত আছে?',
-    questionEn: 'Which section of the CrPC saves the inherent powers of the High Court Division to prevent abuse of the process of any court?',
-    optionsBn: ['ধারা ৪৩৯ (Section 439)', 'ধারা ৫৬১ক (Section 561A)', 'ধারা ৪১৭ (Section 417)', 'ধারা ৫২৬ (Section 526)'],
-    optionsEn: ['Section 439', 'Section 561A', 'Section 417', 'Section 526'],
-    correctOptionIndex: 1,
-    explanationBn: 'ফৌজদারী কার্যবিধির ধারা ৫৬১ক (Section 561A) হাইকোর্ট বিভাগের সহজাত ক্ষমতা সংরক্ষণ করে, যা আদালতের কার্যধারার অপব্যবহার রোধ এবং ন্যায়বিচার প্রতিষ্ঠার জন্য ব্যবহৃত হয়।',
-    explanationEn: 'Section 561A of the CrPC preserves the inherent power of the High Court Division to make such orders as may be necessary to give effect to any order under this Code, or to prevent abuse of the process of any court or otherwise to secure the ends of justice.',
-    legalReference: 'The Code of Criminal Procedure, 1898 - Section 561A',
-    difficulty: 'easy',
-    status: 'published',
-    isDemoSample: true,
-    createdAt: '2026-01-01T00:00:00Z',
-    updatedAt: '2026-01-01T00:00:00Z'
-  },
-  {
-    id: 'q_crpc_4',
-    subjectId: 'sub_crpc',
-    questionBn: 'ফৌজদারী কার্যবিধির ধারা ১৫৪ অনুসারে থানার ভারপ্রাপ্ত কর্মকর্তার নিকট প্রদত্ত আমলযোগ্য অপরাধের প্রথম বিবরণীকে কী বলা হয়?',
-    questionEn: 'What is the report of information regarding a cognizable offense lodged under Section 154 of the CrPC commonly called?',
-    optionsBn: ['জিডিআর (General Diary)', 'এজাহার বা এফআইআর (First Information Report)', 'চার্জশিট (Charge Sheet)', 'ফরেনসিক রিপোর্ট (Forensic Report)'],
-    optionsEn: ['General Diary', 'FIR (First Information Report)', 'Charge Sheet', 'Forensic Report'],
-    correctOptionIndex: 1,
-    explanationBn: 'আমলযোগ্য অপরাধের সংবাদ মৌখিক বা লিখিতভাবে প্রদান করা হলে ১৫৪ ধারা মোতাবেক তা এজাহার বা ফার্স্ট ইনফরমেশন রিপোর্ট (FIR) হিসেবে নথিভুক্ত হয়।',
-    explanationEn: 'Information relating to the commission of a cognizable offence given to an officer in charge of a police station under Section 154 is recorded as the First Information Report (FIR).',
-    legalReference: 'The Code of Criminal Procedure, 1898 - Section 154',
-    difficulty: 'easy',
-    status: 'published',
-    isDemoSample: true,
-    createdAt: '2026-01-01T00:00:00Z',
-    updatedAt: '2026-01-01T00:00:00Z'
-  },
-
-  // --- Penal Code (The Penal Code, 1860) ---
-  {
     id: 'q_penal_1',
     subjectId: 'sub_penal',
     questionBn: 'দণ্ডবিধির কোন ধারায় অপরাধমূলক নরহত্যা (Culpable Homicide) সংজ্ঞায়িত করা হয়েছে?',
     questionEn: 'In which section of the Penal Code, 1860, is Culpable Homicide defined?',
     optionsBn: ['ধারা ২৯৯ (Section 299)', 'ধারা ৩০০ (Section 300)', 'ধারা ৩০২ (Section 302)', 'ধারা ৩০৪ (Section 304)'],
     optionsEn: ['Section 299', 'Section 300', 'Section 302', 'Section 304'],
-    correctOptionIndex: 0,
-    explanationBn: 'দণ্ডবিধির ২৯৯ ধারায় অপরাধমূলক নরহত্যা (Culpable Homicide) সংজ্ঞায়িত করা হয়েছে এবং ধারা ৩০০ তে খুন (Murder) সংজ্ঞায়িত করা হয়েছে। ধারা ৩০২ তে খুনের শাস্তি বর্ণিত।',
-    explanationEn: 'Section 299 of the Penal Code defines Culpable Homicide, while Section 300 defines when culpable homicide amounts to Murder.',
     legalReference: 'The Penal Code, 1860 - Section 299',
     difficulty: 'easy',
     status: 'published',
@@ -296,68 +139,12 @@ const SAMPLE_QUESTIONS: Question[] = [
     updatedAt: '2026-01-01T00:00:00Z'
   },
   {
-    id: 'q_penal_2',
-    subjectId: 'sub_penal',
-    questionBn: 'দণ্ডবিধির ৩৪ ধারা কোন সাধারণ নীতির সাথে সম্পর্কযুক্ত?',
-    questionEn: 'Section 34 of the Penal Code is associated with which legal principle?',
-    optionsBn: ['সাধারণ আশয় (Common Intention)', 'সাধারণ উদ্দেশ্য (Common Object)', 'আত্মরক্ষা (Private Defence)', 'দুর্ঘটনা (Accident)'],
-    optionsEn: ['Common Intention', 'Common Object', 'Private Defence', 'Accident'],
-    correctOptionIndex: 0,
-    explanationBn: 'দণ্ডবিধির ৩৪ ধারায় একাধিক ব্যক্তি কর্তৃক সাধারণ আশয় পূরণে কৃত কার্যের যৌথ দায় (Joint liability based on Common Intention) বর্ণিত হয়েছে। সাধারণ উদ্দেশ্য ১৪৯ ধারায় আছে।',
-    explanationEn: 'Section 34 establishes the principle of joint liability where a criminal act is done by several persons in furtherance of the common intention of all.',
-    legalReference: 'The Penal Code, 1860 - Section 34',
-    difficulty: 'easy',
-    status: 'published',
-    isDemoSample: true,
-    createdAt: '2026-01-01T00:00:00Z',
-    updatedAt: '2026-01-01T00:00:00Z'
-  },
-  {
-    id: 'q_penal_3',
-    subjectId: 'sub_penal',
-    questionBn: 'দণ্ডবিধি অনুযায়ী প্রতারণা (Cheating) কোন ধারায় সংজ্ঞায়িত করা হয়েছে?',
-    questionEn: 'Which section of the Penal Code defines Cheating?',
-    optionsBn: ['ধারা ৪১৫ (Section 415)', 'ধারা ৪২০ (Section 420)', 'ধারা ৪০৫ (Section 405)', 'ধারা ৪৬৩ (Section 463)'],
-    optionsEn: ['Section 415', 'Section 420', 'Section 405', 'Section 463'],
-    correctOptionIndex: 0,
-    explanationBn: 'দণ্ডবিধির ৪১৫ ধারায় প্রতারণা (Cheating) সংজ্ঞায়িত এবং ৪২০ ধারায় প্রতারণা করে সম্পত্তি হস্তান্তরে বাধ্য করার শাস্তি (সর্বোচ্চ ৭ বছর কারাদণ্ড) বর্ণিত।',
-    explanationEn: 'Section 415 defines Cheating, while Section 420 provides punishment for cheating and dishonestly inducing delivery of property.',
-    legalReference: 'The Penal Code, 1860 - Section 415',
-    difficulty: 'medium',
-    status: 'published',
-    isDemoSample: true,
-    createdAt: '2026-01-01T00:00:00Z',
-    updatedAt: '2026-01-01T00:00:00Z'
-  },
-  {
-    id: 'q_penal_4',
-    subjectId: 'sub_penal',
-    questionBn: 'দণ্ডবিধিতে ব্যক্তিগত প্রতিরক্ষার অধিকার (Right of Private Defence) কোন ধারা থেকে কোন ধারায় বর্ণিত?',
-    questionEn: 'In the Penal Code, which range of sections deals with the Right of Private Defence?',
-    optionsBn: ['ধারা ৭৬ থেকে ১০৬ (Sections 76 to 106)', 'ধারা ৯৬ থেকে ১০৬ (Sections 96 to 106)', 'ধারা ১২০ থেকে ১২০খ (Sections 120 to 120B)', 'ধারা ১৪১ থেকে ১৬০ (Sections 141 to 160)'],
-    optionsEn: ['Sections 76 to 106', 'Sections 96 to 106', 'Sections 120 to 120B', 'Sections 141 to 160'],
-    correctOptionIndex: 1,
-    explanationBn: 'দণ্ডবিধির ৯৬ থেকে ১০৬ ধারা পর্যন্ত শরীর ও সম্পত্তির ব্যক্তিগত প্রতিরক্ষার অধিকার এবং এর সীমাবদ্ধতা স্পষ্টভাবে বর্ণিত হয়েছে।',
-    explanationEn: 'Sections 96 through 106 of the Penal Code deal exhaustively with the right of private defence of body and property.',
-    legalReference: 'The Penal Code, 1860 - Sections 96-106',
-    difficulty: 'medium',
-    status: 'published',
-    isDemoSample: true,
-    createdAt: '2026-01-01T00:00:00Z',
-    updatedAt: '2026-01-01T00:00:00Z'
-  },
-
-  // --- Evidence Act (The Evidence Act, 1872) ---
-  {
     id: 'q_evi_1',
     subjectId: 'sub_evidence',
     questionBn: 'মৃত্যুকালীন ঘোষণা (Dying Declaration) সাক্ষ্য আইনের কোন ধারায় গ্রহণযোগ্য করা হয়েছে?',
     questionEn: 'Under which section of the Evidence Act, 1872, is a Dying Declaration admissible in evidence?',
     optionsBn: ['ধারা ২৫ (Section 25)', 'ধারা ২৭ (Section 27)', 'ধারা ৩২(১) (Section 32(1))', 'ধারা ৩৪ (Section 34)'],
     optionsEn: ['Section 25', 'Section 27', 'Section 32(1)', 'Section 34'],
-    correctOptionIndex: 2,
-    explanationBn: 'সাক্ষ্য আইনের ৩২(১) ধারা অনুসারে মৃত ব্যক্তির মৃত্যুর কারণ সম্পর্কিত মৌখিক বা লিখিত বিবৃতি মৃত্যুকালীন ঘোষণা হিসেবে প্রাসঙ্গিক ও গ্রহণযোগ্য।',
-    explanationEn: 'Section 32(1) of the Evidence Act provides for the admissibility of statements made by a person as to the cause of his death or circumstances resulting in death, known as a dying declaration.',
     legalReference: 'The Evidence Act, 1872 - Section 32(1)',
     difficulty: 'easy',
     status: 'published',
@@ -366,51 +153,12 @@ const SAMPLE_QUESTIONS: Question[] = [
     updatedAt: '2026-01-01T00:00:00Z'
   },
   {
-    id: 'q_evi_2',
-    subjectId: 'sub_evidence',
-    questionBn: 'পুলিশ অফিসারের নিকট প্রদত্ত কোনো অপরাধীর স্বীকারোক্তি আদালতে প্রমাণ করা যাবে না—এটি সাক্ষ্য আইনের কোন ধারায় উল্লেখিত?',
-    questionEn: 'Confession to a police officer shall not be proved against an accused person—in which section is this barred?',
-    optionsBn: ['ধারা ২৪ (Section 24)', 'ধারা ২৫ (Section 25)', 'ধারা ২৬ (Section 26)', 'ধারা ২৭ (Section 27)'],
-    optionsEn: ['Section 24', 'Section 25', 'Section 26', 'Section 27'],
-    correctOptionIndex: 1,
-    explanationBn: 'সাক্ষ্য আইনের ধারা ২৫ স্পষ্ট করে যে কোনো পুলিশ অফিসারের নিকট প্রদত্ত দোষ স্বীকারোক্তি কোনো অভিযুক্ত ব্যক্তির বিরুদ্ধে আদালতে প্রমাণ করা যাবে না।',
-    explanationEn: 'Section 25 of the Evidence Act lays down that no confession made to a police officer shall be proved as against a person accused of any offence.',
-    legalReference: 'The Evidence Act, 1872 - Section 25',
-    difficulty: 'easy',
-    status: 'published',
-    isDemoSample: true,
-    createdAt: '2026-01-01T00:00:00Z',
-    updatedAt: '2026-01-01T00:00:00Z'
-  },
-  {
-    id: 'q_evi_3',
-    subjectId: 'sub_evidence',
-    questionBn: 'প্রমাণের দায়িত্ব (Burden of Proof) সম্পর্কিত মৌলিক নিয়ম সাক্ষ্য আইনের কোন ধারায় শুরু হয়েছে?',
-    questionEn: 'In which section of the Evidence Act does the general provision on Burden of Proof begin?',
-    optionsBn: ['ধারা ১০১ (Section 101)', 'ধারা ১০৫ (Section 105)', 'ধারা ১১৪ (Section 114)', 'ধারা ১১৫ (Section 115)'],
-    optionsEn: ['Section 101', 'Section 105', 'Section 114', 'Section 115'],
-    correctOptionIndex: 0,
-    explanationBn: 'সাক্ষ্য আইনের ধারা ১০১ অনুযায়ী যে ব্যক্তি আদালতের কাছে কোনো ঘটনার উপর ভিত্তি করে তার অনুকূলে রায় দাবি করে, ঘটনার অস্তিত্ব প্রমাণের দায়িত্ব সেই ব্যক্তির উপর বর্তায়।',
-    explanationEn: 'Section 101 states that whoever desires any Court to give judgment as to any legal right or liability dependent on the existence of facts which he asserts, must prove that those facts exist.',
-    legalReference: 'The Evidence Act, 1872 - Section 101',
-    difficulty: 'easy',
-    status: 'published',
-    isDemoSample: true,
-    createdAt: '2026-01-01T00:00:00Z',
-    updatedAt: '2026-01-01T00:00:00Z'
-  },
-
-  // --- Limitation Act (The Limitation Act, 1908) ---
-  {
     id: 'q_lim_1',
     subjectId: 'sub_limitation',
     questionBn: 'বিলম্ব মওকুফ (Condonation of Delay) তামাদি আইনের কোন ধারার অধীনে আবেদন করা হয়?',
     questionEn: 'Under which section of the Limitation Act, 1908, can an application for condonation of delay be made?',
     optionsBn: ['ধারা ৩ (Section 3)', 'ধারা ৫ (Section 5)', 'ধারা ১২ (Section 12)', 'ধারা ১৪ (Section 14)'],
     optionsEn: ['Section 3', 'Section 5', 'Section 12', 'Section 14'],
-    correctOptionIndex: 1,
-    explanationBn: 'তামাদি আইনের ধারা ৫ অনুযায়ী আপিল বা কোনো দরখাস্ত দাখিলের ক্ষেত্রে উপযুক্ত কারণ দর্শানো হলে আদালত নির্ধারিত তামাদির মেয়াদ অতিক্রান্ত হওয়ার পরও তা গ্রহণ করতে পারেন। তবে মূল মোকদ্দমায় ধারা ৫ প্রযোজ্য হয় না।',
-    explanationEn: 'Section 5 of the Limitation Act provides for condonation of delay in appeals and applications upon showing sufficient cause. Notably, Section 5 does not apply to original suits.',
     legalReference: 'The Limitation Act, 1908 - Section 5',
     difficulty: 'easy',
     status: 'published',
@@ -419,87 +167,14 @@ const SAMPLE_QUESTIONS: Question[] = [
     updatedAt: '2026-01-01T00:00:00Z'
   },
   {
-    id: 'q_lim_2',
-    subjectId: 'sub_limitation',
-    questionBn: 'তামাদি আইনে আইনগত অক্ষমতা (Legal Disability) যেমন নাবালকতা, উন্মত্ততা বা জড়বুদ্ধিতা কোন ধারায় আলোচনা করা হয়েছে?',
-    questionEn: 'Which section of the Limitation Act provides protection for legal disabilities (minority, insanity, or idiocy)?',
-    optionsBn: ['ধারা ৪ (Section 4)', 'ধারা ৬ (Section 6)', 'ধারা ৯ (Section 9)', 'ধারা ১৮ (Section 18)'],
-    optionsEn: ['Section 4', 'Section 6', 'Section 9', 'Section 18'],
-    correctOptionIndex: 1,
-    explanationBn: 'তামাদি আইনের ৬ ধারা অনুযায়ী যদি কোনো ব্যক্তি মোকদ্দমা দায়ের বা দরখাস্ত করার অধিকারী হওয়ার সময় নাবালক, উন্মাদ বা জড়বুদ্ধিসম্পন্ন থাকে, তবে সেই অক্ষমতা অবসানের পর হতে তামাদির সময় গণনা শুরু হবে।',
-    explanationEn: 'Section 6 of the Limitation Act deals with legal disability, stating that where a person entitled to institute a suit or application is a minor, insane, or an idiot, time runs only after the disability ceases.',
-    legalReference: 'The Limitation Act, 1908 - Section 6',
-    difficulty: 'medium',
-    status: 'published',
-    isDemoSample: true,
-    createdAt: '2026-01-01T00:00:00Z',
-    updatedAt: '2026-01-01T00:00:00Z'
-  },
-  {
-    id: 'q_lim_3',
-    subjectId: 'sub_limitation',
-    questionBn: 'একবার তামাদির সময় গণনা শুরু হলে কোনো পরবর্তী অক্ষমতা বা প্রতিবন্ধকতা তা থামাতে পারে না—এটি তামাদি আইনের কোন ধারার মূলনীতি?',
-    questionEn: 'Once time has begun to run, no subsequent disability or inability stops it—in which section is this rule stated?',
-    optionsBn: ['ধারা ৭ (Section 7)', 'ধারা ৯ (Section 9)', 'ধারা ১০ (Section 10)', 'ধারা ২২ (Section 22)'],
-    optionsEn: ['Section 7', 'Section 9', 'Section 10', 'Section 22'],
-    correctOptionIndex: 1,
-    explanationBn: 'তামাদি আইনের ৯ ধারার স্বর্ণালী নীতি: "Where once time has begun to run, no subsequent disability or inability to sue stops it."',
-    explanationEn: 'Section 9 embodies the continuous running of time rule: once limitation begins to run, no subsequent disability or inability stops the period.',
-    legalReference: 'The Limitation Act, 1908 - Section 9',
-    difficulty: 'medium',
-    status: 'published',
-    isDemoSample: true,
-    createdAt: '2026-01-01T00:00:00Z',
-    updatedAt: '2026-01-01T00:00:00Z'
-  },
-
-  // --- Legal Practitioners & Bar Council Rules & Ethics ---
-  {
     id: 'q_bco_1',
     subjectId: 'sub_bar_ethics',
     questionBn: 'বাংলাদেশ বার কাউন্সিলের চেয়ারম্যান হিসেবে পদাধিকার বলে কে দায়িত্ব পালন করেন?',
     questionEn: 'Who serves as the Chairman of the Bangladesh Bar Council by virtue of his office (ex-officio)?',
     optionsBn: ['প্রধান বিচারপতি (Chief Justice)', 'অ্যাটর্নি জেনারেল (Attorney General for Bangladesh)', 'আইন মন্ত্রী (Minister for Law)', 'বার কাউন্সিলের নির্বাচিত জ্যেষ্ঠ সদস্য'],
     optionsEn: ['Chief Justice of Bangladesh', 'Attorney General for Bangladesh', 'Law Minister', 'Senior Elected Member of Bar Council'],
-    correctOptionIndex: 1,
-    explanationBn: 'লিগ্যাল প্র্যাকটিশনার্স অ্যান্ড বার কাউন্সিল অর্ডার, ১৯৭২ এর অনুচ্ছেদ ৬(১) অনুসারে বাংলাদেশের অ্যাটর্নি জেনারেল পদাধিকারবলে বার কাউন্সিলের চেয়ারম্যান হন।',
-    explanationEn: 'Under Article 6(1) of the Legal Practitioners and Bar Council Order, 1972, the Attorney General for Bangladesh is the ex-officio Chairman of the Bar Council.',
     legalReference: 'Legal Practitioners and Bar Council Order, 1972 - Article 6(1)',
     difficulty: 'easy',
-    status: 'published',
-    isDemoSample: true,
-    createdAt: '2026-01-01T00:00:00Z',
-    updatedAt: '2026-01-01T00:00:00Z'
-  },
-  {
-    id: 'q_bco_2',
-    subjectId: 'sub_bar_ethics',
-    questionBn: 'বার কাউন্সিল ক্যাননস অব প্রফেশনাল কন্ডাক্ট অ্যান্ড এটিকেট (Canons of Professional Conduct and Etiquette) কয়টি অধ্যায়ে বিভক্ত?',
-    questionEn: 'Into how many chapters are the Canons of Professional Conduct and Etiquette divided?',
-    optionsBn: ['২টি (2 Chapters)', '৩টি (3 Chapters)', '৪টি (4 Chapters)', '৫টি (5 Chapters)'],
-    optionsEn: ['2 Chapters', '3 Chapters', '4 Chapters', '5 Chapters'],
-    correctOptionIndex: 2,
-    explanationBn: 'বার কাউন্সিলের পেশাগত আচরণ ও শিষ্টাচার বিধিমালা ৪টি অধ্যায়ে বিভক্ত: (১) মক্কেলের প্রতি আচরণ, (২) আদালতের প্রতি আচরণ, (৩) সহকর্মী আইনজীবীর প্রতি আচরণ এবং (৪) জনগণের প্রতি আচরণ।',
-    explanationEn: 'The Canons of Professional Conduct and Etiquette are divided into 4 chapters: (1) Conduct with regard to other advocates, (2) Conduct with regard to clients, (3) Duty to the Court, and (4) Conduct with regard to the public generally.',
-    legalReference: 'Bangladesh Bar Council Rules - Canons of Professional Conduct and Etiquette',
-    difficulty: 'medium',
-    status: 'published',
-    isDemoSample: true,
-    createdAt: '2026-01-01T00:00:00Z',
-    updatedAt: '2026-01-01T00:00:00Z'
-  },
-  {
-    id: 'q_bco_3',
-    subjectId: 'sub_bar_ethics',
-    questionBn: 'বাংলাদেশ বার কাউন্সিলের ট্রাইব্যুনাল (Tribunal) গঠিত হয় কতজন সদস্য নিয়ে?',
-    questionEn: 'How many members constitute a Tribunal of the Bangladesh Bar Council for disciplinary proceedings?',
-    optionsBn: ['২ জন (2 members)', '৩ জন (3 members)', '৫ জন (5 members)', '৭ জন (7 members)'],
-    optionsEn: ['2 members', '3 members', '5 members', '7 members'],
-    correctOptionIndex: 1,
-    explanationBn: 'বার কাউন্সিল অর্ডার, ১৯৭২ এর অনুচ্ছেদ ৩৩ মোতাবেক ৩ জন সদস্য নিয়ে ট্রাইব্যুনাল গঠিত হয়, যার মধ্যে ২ জন বার কাউন্সিলের সদস্য এবং ১ জন অ্যাডভোকেটদের মধ্য থেকে নিযুক্ত হন।',
-    explanationEn: 'Article 33 of the Bar Council Order, 1972 specifies that a Bar Council Tribunal consists of 3 members, of whom two are members of the Bar Council and one is an advocate co-opted.',
-    legalReference: 'Legal Practitioners and Bar Council Order, 1972 - Article 33',
-    difficulty: 'medium',
     status: 'published',
     isDemoSample: true,
     createdAt: '2026-01-01T00:00:00Z',
@@ -507,8 +182,4 @@ const SAMPLE_QUESTIONS: Question[] = [
   }
 ];
 
-export const INITIAL_QUESTIONS: Question[] = (
-  QUESTION_BANK_3000 && QUESTION_BANK_3000.length > 0
-    ? [...QUESTION_BANK_3000]
-    : SAMPLE_QUESTIONS
-);
+export const INITIAL_QUESTIONS: Question[] = SAMPLE_QUESTIONS;

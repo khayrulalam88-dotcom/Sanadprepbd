@@ -1,0 +1,459 @@
+import { PreviousQuestion } from '../types';
+
+export const INITIAL_PREVIOUS_QUESTIONS: PreviousQuestion[] = [
+  // ================= 2025 Bar Council Examination =================
+  {
+    id: 'pq_2025_01',
+    year: 2025,
+    subject: 'The Code of Civil Procedure, 1908',
+    question: 'দেওয়ানী কার্যবিধির কোন ধারা অনুযায়ী "রেস জুডিকাটা" (Res Judicata) বা দোবারা দোষের নীতি বর্ণিত হয়েছে?',
+    options: [
+      'ধারা ৯',
+      'ধারা ১০',
+      'ধারা ১১',
+      'ধারা ১২'
+    ],
+    correctAnswer: 'ধারা ১১',
+    explanation: 'দেওয়ানী কার্যবিধি ১৯০৮-এর ১১ ধারা অনুসারে, কোনো আদালত এমন কোনো মামলা বা বিচার্য বিষয়ের বিচার করবেন না যাতে প্রত্যক্ষ ও সারগতভাবে পূর্বে কোনো উপযুক্ত এখতিয়ারসম্পন্ন আদালত দ্বারা পক্ষগণের মধ্যে চূড়ান্তভাবে নিষ্পত্তি হয়েছে।',
+    legalSection: 'Section 11, The Code of Civil Procedure, 1908',
+    source: 'Bangladesh Bar Council MCQ Exam 2025'
+  },
+  {
+    id: 'pq_2025_02',
+    year: 2025,
+    subject: 'The Penal Code, 1860',
+    question: 'দণ্ডবিধির ৩৪ ধারায় উল্লিখিত নীতির মূল ভিত্তি কী?',
+    options: [
+      'অভিন্ন অভিপ্রায় (Common Intention)',
+      'একই উদ্দেশ্য (Same Object)',
+      'সাধারণ জ্ঞান (Common Knowledge)',
+      'পূর্বশত্রুতা (Premeditation)'
+    ],
+    correctAnswer: 'অভিন্ন অভিপ্রায় (Common Intention)',
+    explanation: 'দণ্ডবিধির ৩৪ ধারা যৌথ দায়ের (Joint Liability) নীতি প্রতিষ্ঠা করে, যেখানে একাধিক ব্যক্তি সাধারণ বা অভিন্ন অভিপ্রায় পূরণে কোনো অপরাধমূলক কাজ করলে প্রত্যেকের ব্যক্তিগতভাবে দায়ী করা হয়।',
+    legalSection: 'Section 34, The Penal Code, 1860',
+    source: 'Bangladesh Bar Council MCQ Exam 2025'
+  },
+  {
+    id: 'pq_2025_03',
+    year: 2025,
+    subject: 'The Code of Criminal Procedure, 1898',
+    question: 'ফৌজদারী কার্যবিধির ১৬৪ ধারায় কার নিকট দোষ স্বীকারোক্তিমূলক জবানবন্দি বা বিবৃতি রেকর্ড করার বিধান রয়েছে?',
+    options: [
+      'তদন্তকারী পুলিশ কর্মকর্তা',
+      'মেট্রোপলিটন বা ১ম শ্রেণীর ম্যাজিস্ট্রেট',
+      'নির্বাহী ম্যাজিস্ট্রেট',
+      'পাবলিক প্রসিকিউটর'
+    ],
+    correctAnswer: 'মেট্রোপলিটন বা ১ম শ্রেণীর ম্যাজিস্ট্রেট',
+    explanation: 'ফৌজদারী কার্যবিধির ১৬৪ ধারা অনুসারে মেট্রোপলিটন ম্যাজিস্ট্রেট বা প্রথম শ্রেণীর কোনো ম্যাজিস্ট্রেট তদন্ত চলাকালীন বা বিচার শুরুর পূর্বে যেকোনো সময় কোনো জবানবন্দি বা স্বীকারোক্তি লিপিবদ্ধ করতে পারেন।',
+    legalSection: 'Section 164, The Code of Criminal Procedure, 1898',
+    source: 'Bangladesh Bar Council MCQ Exam 2025'
+  },
+  {
+    id: 'pq_2025_04',
+    year: 2025,
+    subject: 'Specific Relief Act, 1877',
+    question: 'সুনির্দিষ্ট প্রতিকার আইনের ৯ ধারা অনুসারে কোনো ব্যক্তি দখলচ্যুত হলে কত দিনের মধ্যে মোকদ্দমা দায়ের করতে হবে?',
+    options: [
+      '৩ মাস',
+      '৬ মাস',
+      '১ বছর',
+      '১২ বছর'
+    ],
+    correctAnswer: '৬ মাস',
+    explanation: 'সুনির্দিষ্ট প্রতিকার আইনের ৯ ধারা মোতাবেক স্থাবর সম্পত্তির দখলচ্যুত কোনো ব্যক্তি তার বেদখল হওয়ার তারিখ হতে ৬ মাসের মধ্যে স্বত্ব বা মালিকানা প্রমাণ ব্যতিরেকেই কেবল পূর্ববর্তী দখলের ভিত্তিতে মোকদ্দমা দায়ের করতে পারেন। সরকারের বিরুদ্ধে এ ধারা প্রয়োগ হয় না।',
+    legalSection: 'Section 9, The Specific Relief Act, 1877',
+    source: 'Bangladesh Bar Council MCQ Exam 2025'
+  },
+  {
+    id: 'pq_2025_05',
+    year: 2025,
+    subject: 'The Evidence Act, 1872',
+    question: 'মৃত্যুকালীন ঘোষণা (Dying Declaration) সাক্ষ্য আইনের কোন ধারায় প্রাসঙ্গিক ও গ্রহণযোগ্য?',
+    options: [
+      '৩২(১) ধারা',
+      '৩৩ ধারা',
+      '৪৫ ধারা',
+      '১১৪ ধারা'
+    ],
+    correctAnswer: '৩২(১) ধারা',
+    explanation: 'সাক্ষ্য আইনের ৩২(১) ধারা অনুসারে যে ব্যক্তি মৃত্যুবরণ করেছেন তার মৃত্যুর কারণ অথবা যে পরিস্থিতিতে তার মৃত্যু ঘটেছিল সে সংক্রান্ত প্রদত্ত বিবৃতি বা মৃত্যুকালীন ঘোষণা প্রাসঙ্গিক।',
+    legalSection: 'Section 32(1), The Evidence Act, 1872',
+    source: 'Bangladesh Bar Council MCQ Exam 2025'
+  },
+  {
+    id: 'pq_2025_06',
+    year: 2025,
+    subject: 'The Limitation Act, 1908',
+    question: 'তামাদি আইনের ৫ ধারা নিচের কোনটিতে প্রযোজ্য নয়?',
+    options: [
+      'আপিল',
+      'রিভিশন',
+      'মূল মোকদ্দমা বা আরজি দাখিল',
+      'রিভিউ আবেদন'
+    ],
+    correctAnswer: 'মূল মোকদ্দমা বা আরজি দাখিল',
+    explanation: 'তামাদি আইন ১৯০৮-এর ৫ ধারা (বিলম্ব মওকুফ) আপিল, রিভিউ বা রিভিশনের ক্ষেত্রে প্রযোজ্য হলেও মূল মোকদ্দমা বা মামলার আরজি দাখিলের ক্ষেত্রে প্রযোজ্য নয়।',
+    legalSection: 'Section 5, The Limitation Act, 1908',
+    source: 'Bangladesh Bar Council MCQ Exam 2025'
+  },
+  {
+    id: 'pq_2025_07',
+    year: 2025,
+    subject: 'Bar Council Order & Rules',
+    question: 'বাংলাদেশ বার কাউন্সিলের চেয়ারম্যান পদাধিকার বলে কে হন?',
+    options: [
+      'আইনমন্ত্রী',
+      'বাংলাদেশের প্রধান বিচারপতি',
+      'অ্যাটর্নি জেনারেল',
+      'সুপ্রিম কোর্ট বার সভাপতি'
+    ],
+    correctAnswer: 'অ্যাটর্নি জেনারেল',
+    explanation: 'বাংলাদেশ লিগ্যাল প্র্যাকটিশনার্স অ্যান্ড বার কাউন্সিল অর্ডার ১৯৭২ এর অনুচ্ছেদ ৩(৩) মোতাবেক বাংলাদেশের অ্যাটর্নি জেনারেল পদাধিকারবলে (Ex-officio) বার কাউন্সিলের চেয়ারম্যান হন।',
+    legalSection: 'Article 3(3), The Bangladesh Legal Practitioners & Bar Council Order, 1972',
+    source: 'Bangladesh Bar Council MCQ Exam 2025'
+  },
+
+  // ================= 2023 Bar Council Examination =================
+  {
+    id: 'pq_2023_01',
+    year: 2023,
+    subject: 'The Code of Civil Procedure, 1908',
+    question: 'দেওয়ানী কার্যবিধির কোন আদেশে অস্থায়ী নিষেধাজ্ঞা (Temporary Injunction) সংক্রান্ত বিধান রয়েছে?',
+    options: [
+      'আদেশ ২৬',
+      'আদেশ ৩৯',
+      'আদেশ ৪০',
+      'আদেশ ৪১'
+    ],
+    correctAnswer: 'আদেশ ৩৯',
+    explanation: 'দেওয়ানী কার্যবিধির ৩৯ আদেশের ১ ও ২ নিয়মে অস্থায়ী নিষেধাজ্ঞা এবং অন্তর্বর্তীকালীন নিষেধাজ্ঞা জারির শর্তাবলী বিশদভাবে উল্লেখ রয়েছে।',
+    legalSection: 'Order XXXIX, Rules 1 & 2, The Code of Civil Procedure, 1908',
+    source: 'Bangladesh Bar Council MCQ Exam 2023'
+  },
+  {
+    id: 'pq_2023_02',
+    year: 2023,
+    subject: 'The Code of Criminal Procedure, 1898',
+    question: 'ফৌজদারী কার্যবিধির ৪৯৭ ধারা অনুসারে কোন অপরাধের ক্ষেত্রে আদালত জামিন প্রদান করতে পারেন?',
+    options: [
+      'অ-জামিনযোগ্য অপরাধে (Non-bailable offence)',
+      'কেবল জামিনযোগ্য অপরাধে',
+      'শুধুমাত্র জরিমানাযোগ্য অপরাধে',
+      'মৃত্যুদণ্ডে দণ্ডিত হওয়ার পর'
+    ],
+    correctAnswer: 'অ-জামিনযোগ্য অপরাধে (Non-bailable offence)',
+    explanation: 'ফৌজদারী কার্যবিধির ৪৯৬ ধারা জামিনযোগ্য অপরাধে জামিন এবং ৪৯৭ ধারা অজামিনযোগ্য অপরাধের ক্ষেত্রে আদালতের জামিন প্রদানের বিবেচনামূলক ক্ষমতা প্রদান করে (বিশেষত নারী, অসুস্থ বা নাবালক হলে)।',
+    legalSection: 'Section 497, The Code of Criminal Procedure, 1898',
+    source: 'Bangladesh Bar Council MCQ Exam 2023'
+  },
+  {
+    id: 'pq_2023_03',
+    year: 2023,
+    subject: 'The Penal Code, 1860',
+    question: 'দণ্ডবিধির ৯৬ থেকে ১০৬ ধারাসমূহ কোন বিষয়ে আলোচনা করে?',
+    options: [
+      'আত্মসমর্পণ',
+      'ব্যক্তিগত আত্মরক্ষার অধিকার (Right of Private Defence)',
+      'দুষ্কর্মের সহায়তা',
+      'অপরাধমূলক ষড়যন্ত্র'
+    ],
+    correctAnswer: 'ব্যক্তিগত আত্মরক্ষার অধিকার (Right of Private Defence)',
+    explanation: 'দণ্ডবিধির ৯৬ ধারা অনুসারে আত্মরক্ষার ব্যক্তিগত অধিকার প্রয়োগে যা কিছু করা হয় তা কোনো অপরাধ নয়। ৯৭ থেকে ১০৬ ধারা পর্যন্ত এর পরিধি ও ক্ষেত্র নির্ধারিত রয়েছে।',
+    legalSection: 'Sections 96-106, The Penal Code, 1860',
+    source: 'Bangladesh Bar Council MCQ Exam 2023'
+  },
+  {
+    id: 'pq_2023_04',
+    year: 2023,
+    subject: 'Specific Relief Act, 1877',
+    question: 'সুনির্দিষ্ট প্রতিকার আইনের ৪২ ধারার অধীনে কী ধরনের প্রতিকারের মোকদ্দমা দায়ের করা হয়?',
+    options: [
+      'চুক্তি রদ',
+      'ঘোষণামূলক ডিক্রি (Declaratory Decree)',
+      'দলিল সংশোধন',
+      'স্থায়ী নিষেধাজ্ঞা'
+    ],
+    correctAnswer: 'ঘোষণামূলক ডিক্রি (Declaratory Decree)',
+    explanation: 'সুনির্দিষ্ট প্রতিকার আইনের ৪২ ধারায় যে কোনো ব্যক্তি তার কোনো আইনগত চরিত্র (legal character) বা কোনো সম্পত্তিতে তার অধিকার ঘোষণা চেয়ে আদালতের নিকট ডিক্রি প্রার্থনায় মোকদ্দমা করতে পারেন।',
+    legalSection: 'Section 42, The Specific Relief Act, 1877',
+    source: 'Bangladesh Bar Council MCQ Exam 2023'
+  },
+  {
+    id: 'pq_2023_05',
+    year: 2023,
+    subject: 'The Evidence Act, 1872',
+    question: 'সাক্ষ্য আইনের ১১৫ ধারায় কোন নীতি বিবৃত হয়েছে?',
+    options: [
+      'রেস জুডিকাটা',
+      'এস্টোপেল বা স্বীকৃতিজনিত বাধা (Estoppel)',
+      'অজুহাত প্রমাণ',
+      'সাক্ষীর বৈরিতা'
+    ],
+    correctAnswer: 'এস্টোপেল বা স্বীকৃতিজনিত বাধা (Estoppel)',
+    explanation: 'সাক্ষ্য আইনের ১১৫ ধারায় এস্টোপেল বা স্বীকৃতির বাধা নীতি বর্ণনা করা হয়েছে, যার ফলে একজন ব্যক্তি কোনো ঘোষণা বা কাজের দ্বারা অন্যকে কোনো বিষয় বিশ্বাস করালে পরবর্তীতে তা অস্বীকার করতে পারেন না।',
+    legalSection: 'Section 115, The Evidence Act, 1872',
+    source: 'Bangladesh Bar Council MCQ Exam 2023'
+  },
+  {
+    id: 'pq_2023_06',
+    year: 2023,
+    subject: 'The Limitation Act, 1908',
+    question: 'তামাদি আইনের ১৮ ধারা কোন বিষয়ের প্রতিকার প্রদান করে?',
+    options: [
+      'আইনগত অক্ষমতা',
+      'প্রতারণা বা ফ্রড (Fraud)',
+      'বিদেশ ভ্রমণকালীন সময়',
+      'সরকারি ছুটি'
+    ],
+    correctAnswer: 'প্রতারণা বা ফ্রড (Fraud)',
+    explanation: 'তামাদি আইনের ১৮ ধারা অনুসারে, যে ক্ষেত্রে কোনো ব্যক্তির মামলা করার অধিকার বা নালিশের ভিত্তি প্রতারণামূলকভাবে গোপন রাখা হয়েছে, প্রতারণা উদঘাটনের পূর্ব পর্যন্ত তামাদির সময় গণনা স্থগিত থাকে।',
+    legalSection: 'Section 18, The Limitation Act, 1908',
+    source: 'Bangladesh Bar Council MCQ Exam 2023'
+  },
+  {
+    id: 'pq_2023_07',
+    year: 2023,
+    subject: 'Bar Council Order & Rules',
+    question: 'বার কাউন্সিলের নির্বাচিত সদস্য সংখ্যা কতজন?',
+    options: [
+      '১০ জন',
+      '১৪ জন',
+      '১৫ জন',
+      '২১ জন'
+    ],
+    correctAnswer: '১৪ জন',
+    explanation: 'বার কাউন্সিলের মোট সদস্য ১৫ জন, যার মধ্যে অ্যাটর্নি জেনারেল পদাধিকারবলে ১ জন এবং সারা দেশের আইনজীবীদের ভোটে ১৪ জন সদস্য ৩ বছরের জন্য নির্বাচিত হন।',
+    legalSection: 'Article 5, Bangladesh Legal Practitioners & Bar Council Order, 1972',
+    source: 'Bangladesh Bar Council MCQ Exam 2023'
+  },
+
+  // ================= 2022 Bar Council Examination =================
+  {
+    id: 'pq_2022_01',
+    year: 2022,
+    subject: 'The Code of Civil Procedure, 1908',
+    question: 'দেওয়ানী কার্যবিধির ২৬ ধারায় মোকদ্দমা সূচনার কোন মাধ্যমের কথা বলা হয়েছে?',
+    options: [
+      'দরখাস্তের মাধ্যমে',
+      'আরজি উপস্থাপনের মাধ্যমে (Presentation of Plaint)',
+      'হলফনামা দাখিলের মাধ্যমে',
+      'মৌখিক আবেদনের মাধ্যমে'
+    ],
+    correctAnswer: 'আরজি উপস্থাপনের মাধ্যমে (Presentation of Plaint)',
+    explanation: 'দেওয়ানী কার্যবিধির ২৬ ধারা অনুসারে প্রতিটি মোকদ্দমা আরজি (Plaint) উপস্থাপনের মাধ্যমে বা নির্ধারিত অন্য কোনো পদ্ধতিতে দায়ের করতে হবে।',
+    legalSection: 'Section 26, The Code of Civil Procedure, 1908',
+    source: 'Bangladesh Bar Council MCQ Exam 2022'
+  },
+  {
+    id: 'pq_2022_02',
+    year: 2022,
+    subject: 'The Code of Criminal Procedure, 1898',
+    question: 'ফৌজদারী কার্যবিধির ১০৩ ধারা কোন বিষয়ে পদ্ধতি নির্ধারণ করে?',
+    options: [
+      'গ্রেফতার',
+      'তল্লাশি (Search) এবং সাক্ষীদের উপস্থিতি',
+      'হুলিয়া ও ক্রোক',
+      'তদন্ত প্রতিবেদন'
+    ],
+    correctAnswer: 'তল্লাশি (Search) এবং সাক্ষীদের উপস্থিতি',
+    explanation: 'ফৌজদারী কার্যবিধির ১০৩ ধারা অনুসারে কোনো স্থান তল্লাশির পূর্বে উক্ত এলাকার দুই বা ততোধিক গণ্যমান্য ব্যক্তিকে সাক্ষী হিসেবে উপস্থিত থাকার আহ্বান জানাতে হবে এবং জব্দতালিকা তাদের উপস্থিতিতে প্রস্তুত করতে হবে।',
+    legalSection: 'Section 103, The Code of Criminal Procedure, 1898',
+    source: 'Bangladesh Bar Council MCQ Exam 2022'
+  },
+  {
+    id: 'pq_2022_03',
+    year: 2022,
+    subject: 'The Penal Code, 1860',
+    question: 'দণ্ডবিধির ২৯৯ ও ৩০০ ধারায় যথাক্রমে কোন অপরাধের সংজ্ঞা রয়েছে?',
+    options: [
+      'চুরি ও দস্যুতা',
+      'অপরাধজনক নরহত্যা (Culpable Homicide) ও খুন (Murder)',
+      'অপহরণ ও অপনয়ন',
+      'আঘাত ও গুরুতর আঘাত'
+    ],
+    correctAnswer: 'অপরাধজনক নরহত্যা (Culpable Homicide) ও খুন (Murder)',
+    explanation: 'দণ্ডবিধির ২৯৯ ধারায় অপরাধজনক নরহত্যার সংজ্ঞা এবং ৩০০ ধারায় খুনের বিস্তারিত উপাদান ও ৫টি ব্যতিক্রম উল্লেখিত রয়েছে।',
+    legalSection: 'Sections 299 & 300, The Penal Code, 1860',
+    source: 'Bangladesh Bar Council MCQ Exam 2022'
+  },
+  {
+    id: 'pq_2022_04',
+    year: 2022,
+    subject: 'Specific Relief Act, 1877',
+    question: 'সুনির্দিষ্ট প্রতিকার আইনের ৫২ ও ৫৩ ধারায় কোন ধরনের নিষেধাজ্ঞার প্রকারভেদ বর্ণিত হয়েছে?',
+    options: [
+      'স্থায়ী ও অস্থায়ী নিষেধাজ্ঞা (Perpetual & Temporary Injunction)',
+      'বাধ্যতামূলক নিষেধাজ্ঞা ও আদেশ',
+      'অর্থদণ্ড',
+      'চুক্তি সম্পাদন'
+    ],
+    correctAnswer: 'স্থায়ী ও অস্থায়ী নিষেধাজ্ঞা (Perpetual & Temporary Injunction)',
+    explanation: 'সুনির্দিষ্ট প্রতিকার আইনের ৫২ ধারায় নিবারকমূলক প্রতিকার হিসেবে নিষেধাজ্ঞার উল্লেখ এবং ৫৩ ধারায় অস্থায়ী ও চিরস্থায়ী নিষেধাজ্ঞার সংজ্ঞা দেওয়া হয়েছে।',
+    legalSection: 'Sections 52 & 53, The Specific Relief Act, 1877',
+    source: 'Bangladesh Bar Council MCQ Exam 2022'
+  },
+  {
+    id: 'pq_2022_05',
+    year: 2022,
+    subject: 'The Evidence Act, 1872',
+    question: 'সাক্ষ্য আইনের কত ধারা অনুসারে একজন আসামির সহযোগী বা দোসর (Accomplice) একজন যোগ্য সাক্ষী?',
+    options: [
+      '১১৮ ধারা',
+      '১১৯ ধারা',
+      '১৩৩ ধারা',
+      '১৪৫ ধারা'
+    ],
+    correctAnswer: '১৩৩ ধারা',
+    explanation: 'সাক্ষ্য আইনের ১৩৩ ধারা অনুযায়ী কোনো অপরাধের সহযোগী অভিযুক্ত ব্যক্তির বিরুদ্ধে একজন উপযুক্ত ও নির্ভরযোগ্য সাক্ষী হতে পারেন এবং কেবল তার অসমর্থিত সাক্ষ্যের ভিত্তিতে দণ্ড বেআইনি হবে না (তবে ১১৪(খ) ধারায় সাবধানতা বজায় রাখা হয়)।',
+    legalSection: 'Section 133, The Evidence Act, 1872',
+    source: 'Bangladesh Bar Council MCQ Exam 2022'
+  },
+  {
+    id: 'pq_2022_06',
+    year: 2022,
+    subject: 'The Limitation Act, 1908',
+    question: 'তামাদি আইনের ৩ ধারা অনুযায়ী তামাদির মেয়াদ অতিক্রান্ত হওয়ার পর দায়েরকৃত মোকদ্দমার পরিণতি কী হবে?',
+    options: [
+      'আদালত জরিমানা করবেন',
+      'বিবাদী আপত্তি না জানালেও আদালত তা খারিজ (Dismiss) করে দেবেন',
+      'পরবর্তী তারিখে শুনবেন',
+      'স্থগিত রাখবেন'
+    ],
+    correctAnswer: 'বিবাদী আপত্তি না জানালেও আদালত তা খারিজ (Dismiss) করে দেবেন',
+    explanation: 'তামাদি আইন ১৯০৮-এর ৩ ধারা বাধ্যতামূলক (Mandatory)। মেয়াদোত্তীর্ণ মোকদ্দমা বা আবেদন বিবাদী তামাদির আপত্তি উত্থাপন না করলেও আদালত তা খারিজ করতে বাধ্য।',
+    legalSection: 'Section 3, The Limitation Act, 1908',
+    source: 'Bangladesh Bar Council MCQ Exam 2022'
+  },
+  {
+    id: 'pq_2022_07',
+    year: 2022,
+    subject: 'Bar Council Order & Rules',
+    question: 'বার কাউন্সিলের একজন তালিকাভুক্ত অ্যাডভোকেট তার সহকর্মীর মক্কেলকে আকৃষ্ট করার জন্য দালালি বা বিজ্ঞাপন ব্যবহার করতে পারেন কি না?',
+    options: [
+      'হ্যাঁ, পারেন',
+      'না, এটি অসদাচরণ (Professional Misconduct) এবং নিষিদ্ধ',
+      'শুধুমাত্র বার কাউন্সিলের বিশেষ অনুমতি নিয়ে পারেন',
+      'পত্রিকায় বিজ্ঞপ্তি দিয়ে পারেন'
+    ],
+    correctAnswer: 'না, এটি অসদাচরণ (Professional Misconduct) এবং নিষিদ্ধ',
+    explanation: 'ক্যাননস অব প্রফেশনাল কন্ডাক্ট অ্যান্ড এথিক্সের ২য় অধ্যায় অনুসারে মক্কেল সংগ্রহে বিজ্ঞাপন, প্রচারপত্র বা দালালের আশ্রয় গ্রহণ সম্পূর্ণ অনৈতিক এবং অসদাচরণ হিসেবে গণ্য।',
+    legalSection: 'Chapter II, Canons of Professional Conduct and Etiquette',
+    source: 'Bangladesh Bar Council MCQ Exam 2022'
+  },
+
+  // ================= 2020 Bar Council Examination =================
+  {
+    id: 'pq_2020_01',
+    year: 2020,
+    subject: 'The Code of Civil Procedure, 1908',
+    question: 'দেওয়ানী কার্যবিধির কোন আদেশে আরজি প্রত্যাখ্যান বা নাকচ (Rejection of Plaint) সম্পর্কিত গ্রাউন্ডসমূহ বর্ণিত রয়েছে?',
+    options: [
+      'আদেশ ৬, নিয়ম ১৭',
+      'আদেশ ৭, নিয়ম ১১',
+      'আদেশ ৮, নিয়ম ১',
+      'আদেশ ৯, নিয়ম ৯'
+    ],
+    correctAnswer: 'আদেশ ৭, নিয়ম ১১',
+    explanation: 'দেওয়ানী কার্যবিধির ৭ আদেশ ১১ নিয়ম অনুসারে ৪টি প্রধান কারণে আরজি নাকচ করা যায়: (ক) মামলার কারণ প্রকাশ না করলে, (খ) মূল্যায়ণ কম হলে এবং তা সংশোধন না করলে, (গ) প্রয়োজনীয় স্ট্যাম্প না দিলে, এবং (ঘ) মামলাটি আইন দ্বারা বারিত হলে।',
+    legalSection: 'Order VII, Rule 11, The Code of Civil Procedure, 1908',
+    source: 'Bangladesh Bar Council MCQ Exam 2020'
+  },
+  {
+    id: 'pq_2020_02',
+    year: 2020,
+    subject: 'The Code of Criminal Procedure, 1898',
+    question: 'ফৌজদারী কার্যবিধির ১৪৪ ধারা জারি করার ক্ষমতা কার রয়েছে?',
+    options: [
+      'থানার অফিসার ইনচার্জ (OC)',
+      'জেলা ম্যাজিস্ট্রেট বা ক্ষমতাপ্রাপ্ত নির্বাহী ম্যাজিস্ট্রেট',
+      'দায়রা জজ',
+      'চিফ জুডিশিয়াল ম্যাজিস্ট্রেট'
+    ],
+    correctAnswer: 'জেলা ম্যাজিস্ট্রেট বা ক্ষমতাপ্রাপ্ত নির্বাহী ম্যাজিস্ট্রেট',
+    explanation: 'ফৌজদারী কার্যবিধির ১৪৪ ধারা জরুরি পরিস্থিতিতে শান্তিভঙ্গ প্রতিরোধে জেলা ম্যাজিস্ট্রেট বা সরকার কর্তৃক ক্ষমতাপ্রাপ্ত কোনো নির্বাহী ম্যাজিস্ট্রেট জারি করতে পারেন।',
+    legalSection: 'Section 144, The Code of Criminal Procedure, 1898',
+    source: 'Bangladesh Bar Council MCQ Exam 2020'
+  },
+  {
+    id: 'pq_2020_03',
+    year: 2020,
+    subject: 'The Penal Code, 1860',
+    question: 'দণ্ডবিধির ১২০ক এবং ১২০খ ধারা কোন অপরাধের সাথে সম্পর্কিত?',
+    options: [
+      'রাষ্ট্রদ্রোহিতা',
+      'অপরাধমূলক ষড়যন্ত্র (Criminal Conspiracy)',
+      'দাঙ্গা-হাঙ্গামা',
+      'অবৈধ সমাবেশ'
+    ],
+    correctAnswer: 'অপরাধমূলক ষড়যন্ত্র (Criminal Conspiracy)',
+    explanation: 'দণ্ডবিধির ১২০ক ধারায় অপরাধমূলক ষড়যন্ত্রের সংজ্ঞা এবং ১২০খ ধারায় এর শাস্তির বিধান লিপিবদ্ধ রয়েছে।',
+    legalSection: 'Sections 120A & 120B, The Penal Code, 1860',
+    source: 'Bangladesh Bar Council MCQ Exam 2020'
+  },
+  {
+    id: 'pq_2020_04',
+    year: 2020,
+    subject: 'Specific Relief Act, 1877',
+    question: 'সুনির্দিষ্ট প্রতিকার আইনের ১২ ধারা অনুসারে আদালত কোন ক্ষেত্রে চুক্তির সুনির্দিষ্ট কার্যসম্পাদনের আদেশ দিতে পারেন?',
+    options: [
+      'যখন আর্থিক ক্ষতিপূরণ পর্যাপ্ত প্রতিকার নয়',
+      'যখন অর্থ পরিশোধই যথেষ্ট',
+      'যখন চুক্তিটি মৌখিক এবং অনির্দিষ্ট',
+      'যখন পক্ষগণের মধ্যে কোনো বিশ্বাসভঙ্গ হয় না'
+    ],
+    correctAnswer: 'যখন আর্থিক ক্ষতিপূরণ পর্যাপ্ত প্রতিকার নয়',
+    explanation: 'সুনির্দিষ্ট প্রতিকার আইনের ১২ ধারা অনুসারে যে ক্ষেত্রে চুক্তির কাজ সম্পাদিত না হলে আর্থিক ক্ষতি নির্ধারণের কোনো নির্দিষ্ট মানদণ্ড থাকে না অথবা আর্থিক ক্ষতিপূরণ অপর্যাপ্ত হয়, আদালত চুক্তির সুনির্দিষ্ট বাস্তবায়নের নির্দেশ দিতে পারেন।',
+    legalSection: 'Section 12, The Specific Relief Act, 1877',
+    source: 'Bangladesh Bar Council MCQ Exam 2020'
+  },
+  {
+    id: 'pq_2020_05',
+    year: 2020,
+    subject: 'The Evidence Act, 1872',
+    question: 'সাক্ষ্য আইনের কত ধারায় বিশেষজ্ঞের মতামতের (Opinion of Experts) প্রাসঙ্গিকতা নিয়ে আলোচনা করা হয়েছে?',
+    options: [
+      '৪৫ ধারা',
+      '৪৭ ধারা',
+      '৫২ ধারা',
+      '৬০ ধারা'
+    ],
+    correctAnswer: '৪৫ ধারা',
+    explanation: 'সাক্ষ্য আইনের ৪৫ ধারা অনুযায়ী কোনো বিদেশী আইন, বিজ্ঞান, শিল্পকলা বা হস্তলিপি বা আঙুলের ছাপ চিহ্নিতকরণে আদালতের সিদ্ধান্ত গ্রহণের জন্য সংশ্লিষ্ট বিষয়ে অভিজ্ঞ ব্যক্তির মতামত প্রাসঙ্গিক।',
+    legalSection: 'Section 45, The Evidence Act, 1872',
+    source: 'Bangladesh Bar Council MCQ Exam 2020'
+  },
+  {
+    id: 'pq_2020_06',
+    year: 2020,
+    subject: 'The Limitation Act, 1908',
+    question: 'তামাদি আইনের ৬ ধারায় আইনগত অক্ষমতা (Legal Disability) হিসেবে নিচের কোনটিকে অন্তর্ভুক্ত করা হয়েছে?',
+    options: [
+      'দারিদ্র্য',
+      'নাবালকত্ব (Minority), অপ্রকৃতিস্থতা (Insanity) ও জড়বুদ্ধিতা (Idiot)',
+      'কারাদণ্ড ভোগ',
+      'অসুস্থতা'
+    ],
+    correctAnswer: 'নাবালকত্ব (Minority), অপ্রকৃতিস্থতা (Insanity) ও জড়বুদ্ধিতা (Idiot)',
+    explanation: 'তামাদি আইনের ৬ ধারায় কেবলমাত্র ৩টি ক্ষেত্রকে আইনগত অক্ষমতা হিসেবে গণ্য করা হয়: নাবালক, অপ্রকৃতিস্থ এবং জড়বুদ্ধিসম্পন্ন ব্যক্তি। অক্ষমতা দূর হওয়ার পর তামাদির মেয়াদ শুরু হয়।',
+    legalSection: 'Section 6, The Limitation Act, 1908',
+    source: 'Bangladesh Bar Council MCQ Exam 2020'
+  },
+  {
+    id: 'pq_2020_07',
+    year: 2020,
+    subject: 'Bar Council Order & Rules',
+    question: 'আইনজীবীদের পেশাগত অসদাচরণের বিচার নিষ্পত্তির জন্য বার কাউন্সিলের কোন সংস্থা কাজ করে?',
+    options: [
+      'কার্যনির্বাহী কমিটি',
+      'ট্রাইব্যুনাল (Tribunal)',
+      'এনরোলমেন্ট কমিটি',
+      'অর্থ কমিটি'
+    ],
+    correctAnswer: 'ট্রাইব্যুনাল (Tribunal)',
+    explanation: 'বার কাউন্সিল অর্ডার ১৯৭২ এর ৩৩ অনুচ্ছেদ অনুসারে আইনজীবীদের পেশাগত অসদাচরণের অভিযোগের তদন্ত ও বিচারের জন্য এক বা একাধিক ট্রাইব্যুনাল গঠিত হয়।',
+    legalSection: 'Article 33, Bangladesh Legal Practitioners & Bar Council Order, 1972',
+    source: 'Bangladesh Bar Council MCQ Exam 2020'
+  }
+];

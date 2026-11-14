@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { useApp } from '../context/AppContext';
+import { auth, isVerifiedOwnerAccount } from '../lib/firebase';
 import { 
   BookOpen, 
   CheckCircle2, 
@@ -29,7 +30,7 @@ export const PracticeScreen: React.FC = () => {
     setActiveScreen, 
     startSubjectPractice,
     answeredQuestions,
-    recordQuestionAnswer,
+    checkPracticeAnswer,
     getSubjectProgress,
     activeSubscription,
     calculateDaysRemaining,
@@ -44,6 +45,20 @@ export const PracticeScreen: React.FC = () => {
   const [currentIndex, setCurrentIndex] = useState<number>(0);
   const [selectedAnswers, setSelectedAnswers] = useState<Record<string, number>>({});
   const [showExplanation, setShowExplanation] = useState<Record<string, boolean>>({});
+  const [checkedResults, setCheckedResults] = useState<
+    Record<
+      string,
+      {
+        isCorrect: boolean;
+        correctOptionIndex: number;
+        explanationBn?: string;
+        explanationEn?: string;
+        legalReference?: string;
+      }
+    >
+  >({});
+  const [checkingId, setCheckingId] = useState<string | null>(null);
+  const [practiceError, setPracticeError] = useState<string | null>(null);
 
   // Filter practice questions for selected subject
   const practiceQuestions = questions.filter(
@@ -54,22 +69,46 @@ export const PracticeScreen: React.FC = () => {
   const previousRecord = currentQ ? answeredQuestions[currentQ.id] : undefined;
   const answeredIdx = currentQ ? (selectedAnswers[currentQ.id] ?? previousRecord?.selectedOption) : undefined;
   const isAnswered = answeredIdx !== undefined;
+  const checkedInfo = currentQ ? checkedResults[currentQ.id] : undefined;
+  const resolvedCorrectIdx = checkedInfo?.correctOptionIndex ?? currentQ?.correctOptionIndex;
+  const resolvedExpBn = checkedInfo?.explanationBn ?? currentQ?.explanationBn;
+  const resolvedExpEn = checkedInfo?.explanationEn ?? currentQ?.explanationEn;
+  const resolvedLegalRef = checkedInfo?.legalReference ?? currentQ?.legalReference;
 
   const currentSubject = selectedSubjectForPractice || (currentQ ? subjects.find(s => s.id === currentQ.subjectId) || null : null);
   const currentSubjectProgress = currentSubject ? getSubjectProgress(currentSubject.id) : null;
 
-  const handleSelectOption = (idx: number) => {
-    if (!currentQ || isAnswered) return;
-    const isCorrect = idx === currentQ.correctOptionIndex;
-    recordQuestionAnswer(currentQ.id, currentQ.subjectId, idx, isCorrect);
-    setSelectedAnswers(prev => ({
-      ...prev,
-      [currentQ.id]: idx
-    }));
-    setShowExplanation(prev => ({
-      ...prev,
-      [currentQ.id]: true
-    }));
+  const handleSelectOption = async (idx: number) => {
+    if (!currentQ || isAnswered || checkingId === currentQ.id) return;
+    setPracticeError(null);
+    setCheckingId(currentQ.id);
+    try {
+      const res = await checkPracticeAnswer(currentQ.id, idx);
+      if (!res.success || res.correctOptionIndex === undefined) {
+        setPracticeError(res.error || t('উত্তর যাচাই করা যায়নি।', 'Unable to verify answer.'));
+        return;
+      }
+      setCheckedResults(prev => ({
+        ...prev,
+        [currentQ.id]: {
+          isCorrect: !!res.isCorrect,
+          correctOptionIndex: res.correctOptionIndex!,
+          explanationBn: res.explanationBn,
+          explanationEn: res.explanationEn,
+          legalReference: res.legalReference
+        }
+      }));
+      setSelectedAnswers(prev => ({
+        ...prev,
+        [currentQ.id]: idx
+      }));
+      setShowExplanation(prev => ({
+        ...prev,
+        [currentQ.id]: true
+      }));
+    } finally {
+      setCheckingId(null);
+    }
   };
 
   const handleNext = () => {
@@ -88,7 +127,8 @@ export const PracticeScreen: React.FC = () => {
   const optionPrefixesEn = ['A', 'B', 'C', 'D'];
 
   // Gate: Paid subscription requirement for Subject Practice
-  if (!isSubscriptionActive && currentUser.role !== 'admin') {
+  const isVerifiedAdmin = isVerifiedOwnerAccount(auth?.currentUser) && currentUser.role === 'admin';
+  if (!isSubscriptionActive && !isVerifiedAdmin) {
     return (
       <div className="max-w-2xl mx-auto py-12 px-4">
         <div className="bg-white rounded-3xl p-8 border-2 border-[#D4AF37] shadow-lg text-center space-y-6">
@@ -362,11 +402,21 @@ export const PracticeScreen: React.FC = () => {
             {language === 'bn' ? currentQ.questionBn : currentQ.questionEn}
           </h2>
 
+          {practiceError && (
+            <div className="mb-4 p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs sm:text-sm font-semibold flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 shrink-0" />
+              <span>{practiceError}</span>
+            </div>
+          )}
+
           {/* Options */}
           <div className="space-y-3 mb-6">
             {(language === 'bn' ? currentQ.optionsBn : currentQ.optionsEn).map((optText, optIdx) => {
               const isSelected = answeredIdx === optIdx;
-              const isTheCorrectOption = currentQ.correctOptionIndex === optIdx;
+              const isTheCorrectOption =
+                resolvedCorrectIdx !== undefined
+                  ? resolvedCorrectIdx === optIdx
+                  : isSelected && previousRecord?.isCorrect === true;
               const prefix = language === 'bn' ? optionPrefixesBn[optIdx] : optionPrefixesEn[optIdx];
 
               let optionStyle = 'border-slate-200 hover:border-slate-300 hover:bg-slate-50 bg-white text-slate-800';
@@ -383,7 +433,7 @@ export const PracticeScreen: React.FC = () => {
               return (
                 <button
                   key={optIdx}
-                  disabled={isAnswered}
+                  disabled={isAnswered || checkingId === currentQ.id}
                   onClick={() => handleSelectOption(optIdx)}
                   className={`w-full p-4 rounded-xl text-left border-2 transition-all flex items-start gap-4 ${optionStyle}`}
                 >
@@ -416,7 +466,7 @@ export const PracticeScreen: React.FC = () => {
           </div>
 
           {/* Immediate Explanation Card */}
-          {isAnswered && (
+          {isAnswered && (resolvedExpBn || resolvedExpEn) && (
             <div className="p-5 rounded-2xl bg-slate-50 border border-[#D4AF37]/60 text-slate-800 space-y-2 mb-6 animate-in fade-in">
               <div className="flex items-center gap-2 font-bold text-[#102A43] text-sm">
                 <Lightbulb className="w-4 h-4 text-[#D4AF37]" />
@@ -424,12 +474,12 @@ export const PracticeScreen: React.FC = () => {
               </div>
 
               <p className="text-xs sm:text-sm leading-relaxed text-slate-700">
-                {language === 'bn' ? currentQ.explanationBn : currentQ.explanationEn}
+                {language === 'bn' ? (resolvedExpBn || resolvedExpEn) : (resolvedExpEn || resolvedExpBn)}
               </p>
 
-              {currentQ.legalReference && (
+              {resolvedLegalRef && (
                 <p className="text-xs text-slate-500 font-mono pt-2 border-t border-slate-200">
-                  <strong>{t('রেফারেন্স:', 'Reference:')}</strong> {currentQ.legalReference}
+                  <strong>{t('রেফারেন্স:', 'Reference:')}</strong> {resolvedLegalRef}
                 </p>
               )}
             </div>

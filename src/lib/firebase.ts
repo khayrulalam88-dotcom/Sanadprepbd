@@ -58,6 +58,18 @@ try {
   isInitializedSuccessfully = false;
 }
 
+export const OWNER_ADMIN_UID = 'PjBRV7LAQ8cIwOdM3z474A16dWg2';
+export const OWNER_ADMIN_EMAIL = 'khayrulalam88@gmail.com';
+
+export function isVerifiedOwnerAccount(
+  user?: { uid?: string | null; email?: string | null } | null
+): boolean {
+  if (!user || !user.uid) return false;
+  if (user.uid !== OWNER_ADMIN_UID) return false;
+  if (user.email && user.email.toLowerCase().trim() !== OWNER_ADMIN_EMAIL) return false;
+  return true;
+}
+
 export const app = appInstance!;
 export const auth = authInstance!;
 export const db = firestoreInstance!;

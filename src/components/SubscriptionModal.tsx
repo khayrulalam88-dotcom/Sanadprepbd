@@ -43,7 +43,7 @@ export const SubscriptionModal: React.FC = () => {
   const [studentPhone, setStudentPhone] = useState<string>(currentUser.phone || '');
   const [senderNumber, setSenderNumber] = useState<string>(currentUser.phone || '');
   const [transactionId, setTransactionId] = useState<string>('');
-  const [amountPaid, setAmountPaid] = useState<number>(300);
+  const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [copiedMethod, setCopiedMethod] = useState<'bKash' | 'Nagad' | null>(null);
   const [submitted, setSubmitted] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string>('');
@@ -52,21 +52,25 @@ export const SubscriptionModal: React.FC = () => {
   useEffect(() => {
     if (selectedPackageForPayment) {
       setActivePkg(selectedPackageForPayment);
-      setAmountPaid(selectedPackageForPayment.price);
     } else if (packages.length > 0) {
       setActivePkg(packages[0]);
-      setAmountPaid(packages[0].price);
     }
   }, [selectedPackageForPayment, packages]);
+
+  // Authoritative package price (read-only on client; backend also enforces package price)
+  const authoritativeAmount = activePkg
+    ? activePkg.id === 'pkg_exam_pass'
+      ? examDateConfig.examPassPrice
+      : activePkg.price
+    : 300;
 
   // When changing package inside modal
   const handleSelectPackage = (pkg: SubscriptionPackage) => {
     setActivePkg(pkg);
     setSelectedPackageForPayment(pkg);
-    setAmountPaid(pkg.price);
   };
 
-  if (!showPaymentModal) return null;
+  if (!showPaymentModal || !activePkg) return null;
 
   const handleCopy = (numberToCopy: string, method: 'bKash' | 'Nagad') => {
     navigator.clipboard.writeText(numberToCopy);
@@ -76,8 +80,9 @@ export const SubscriptionModal: React.FC = () => {
     }, 2500);
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmitting) return;
     setErrorMsg('');
 
     if (!studentPhone.trim()) {
@@ -90,25 +95,24 @@ export const SubscriptionModal: React.FC = () => {
       return;
     }
 
-    if (!amountPaid || amountPaid <= 0) {
-      setErrorMsg(t('সঠিক পরিশোধিত টাকার পরিমাণ দিন।', 'Please provide a valid amount paid.'));
-      return;
-    }
+    setIsSubmitting(true);
+    try {
+      const res = await createPaymentRequest({
+        method: selectedMethod,
+        studentPhone: studentPhone.trim(),
+        senderNumber: senderNumber.trim() || studentPhone.trim(),
+        transactionId: transactionId.trim().toUpperCase(),
+        packageId: activePkg.id,
+        packageTitle: `${activePkg.nameBn} (৳${authoritativeAmount})`
+      });
 
-    const res = createPaymentRequest({
-      method: selectedMethod,
-      studentPhone: studentPhone.trim(),
-      senderNumber: senderNumber.trim() || studentPhone.trim(),
-      transactionId: transactionId.trim().toUpperCase(),
-      amount: Number(amountPaid),
-      packageId: activePkg.id,
-      packageTitle: `${activePkg.nameBn} (৳${amountPaid})`
-    });
-
-    if (res.success) {
-      setSubmitted(true);
-    } else {
-      setErrorMsg(res.error || t('পেমেন্ট রিকোয়েস্ট পাঠাতে ব্যর্থ হয়েছে।', 'Failed to submit payment request.'));
+      if (res.success) {
+        setSubmitted(true);
+      } else {
+        setErrorMsg(res.error || t('পেমেন্ট রিকোয়েস্ট পাঠাতে ব্যর্থ হয়েছে।', 'Failed to submit payment request.'));
+      }
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -171,7 +175,7 @@ export const SubscriptionModal: React.FC = () => {
               </div>
               <div className="flex justify-between py-1">
                 <span className="text-slate-500">{t('পরিশোধিত ফি:', 'Amount Paid:')}</span>
-                <span className="font-bold text-[#102A43]">৳ {amountPaid} BDT</span>
+                <span className="font-bold text-[#102A43]">৳ {authoritativeAmount} BDT</span>
               </div>
             </div>
 
@@ -193,7 +197,7 @@ export const SubscriptionModal: React.FC = () => {
               <WhatsAppSupportButton
                 variant="button"
                 customText={language === 'bn' ? 'হোয়াটসঅ্যাপে জানান' : 'Notify on WhatsApp'}
-                specificContextMessage={`Hello Sanad Prep BD Support, I submitted payment for ${activePkg.nameEn} (৳${amountPaid}) via ${selectedMethod}. My TrxID is ${transactionId.toUpperCase()} and registered phone is ${studentPhone}. Please verify.`}
+                specificContextMessage={`Hello Sanad Prep BD Support, I submitted payment for ${activePkg.nameEn} (৳${authoritativeAmount}) via ${selectedMethod}. My TrxID is ${transactionId.toUpperCase()} and registered phone is ${studentPhone}. Please verify.`}
                 className="w-full sm:w-auto py-2.5"
               />
             </div>
@@ -510,16 +514,17 @@ export const SubscriptionModal: React.FC = () => {
 
                 <div>
                   <label className="font-bold text-slate-700 block mb-1">
-                    {t('পরিশোধিত টাকার পরিমাণ (৳)', 'Amount Paid (BDT)')} <span className="text-rose-500">*</span>
+                    {t('নির্ধারিত প্যাকেজ ফি (৳)', 'Official Package Fee (BDT)')}
                   </label>
-                  <input
-                    type="number"
-                    required
-                    min={100}
-                    value={amountPaid}
-                    onChange={(e) => setAmountPaid(Number(e.target.value))}
-                    className="w-full px-3 py-2 rounded-xl border border-slate-300 font-mono font-bold text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-[#102A43]"
-                  />
+                  <div
+                    aria-readonly="true"
+                    className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-slate-100 text-[#102A43] font-mono font-black text-xs sm:text-sm flex items-center justify-between select-none"
+                  >
+                    <span>৳ {authoritativeAmount}</span>
+                    <span className="text-[10px] font-sans font-semibold text-slate-500">
+                      {t('নির্ধারিত মূল্য', 'Fixed')}
+                    </span>
+                  </div>
                 </div>
               </div>
 
@@ -556,10 +561,15 @@ export const SubscriptionModal: React.FC = () => {
               <div className="pt-2">
                 <button
                   type="submit"
-                  className="w-full py-3 rounded-xl bg-[#102A43] hover:bg-[#243B53] text-[#D4AF37] border border-[#D4AF37] font-bold text-xs sm:text-sm transition shadow-sm flex items-center justify-center gap-2 cursor-pointer"
+                  disabled={isSubmitting}
+                  className="w-full py-3 rounded-xl bg-[#102A43] hover:bg-[#243B53] disabled:opacity-60 text-[#D4AF37] border border-[#D4AF37] font-bold text-xs sm:text-sm transition shadow-sm flex items-center justify-center gap-2 cursor-pointer"
                 >
                   <Send className="w-4 h-4" />
-                  <span>{t('পেমেন্ট যাচাইয়ের অনুরোধ পাঠান', 'Submit Payment for Verification')}</span>
+                  <span>
+                    {isSubmitting
+                      ? t('যাচাই ও সংরক্ষণ হচ্ছে...', 'Verifying & Submitting...')
+                      : t('পেমেন্ট যাচাইয়ের অনুরোধ পাঠান', 'Submit Payment for Verification')}
+                  </span>
                 </button>
               </div>
             </form>

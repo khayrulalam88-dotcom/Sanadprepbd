@@ -45,6 +45,8 @@ import { BulkImportModal } from './BulkImportModal';
 import { EditUserModal, EditableUserData } from './EditUserModal';
 import { AdminCreateExamModal } from './AdminCreateExamModal';
 import { PreviousQuestionsAdminManager } from './PreviousQuestionsAdminManager';
+import { auth, OWNER_ADMIN_UID, OWNER_ADMIN_EMAIL, isVerifiedOwnerAccount } from '../lib/firebase';
+import { checkIsAdminInFirestore } from '../lib/firestoreService';
 
 export const AdminPanel: React.FC = () => {
   const { 
@@ -53,6 +55,7 @@ export const AdminPanel: React.FC = () => {
     currentUser, 
     switchRole,
     loginWithEmail,
+    loginWithGoogle,
     questions, 
     addQuestion, 
     deleteQuestion, 
@@ -167,8 +170,8 @@ export const AdminPanel: React.FC = () => {
     return Array.from(map.values()).sort((a, b) => b.monthKey.localeCompare(a.monthKey));
   }, [paymentRequests]);
 
-  // Admin Login Portal state
-  const [adminEmailInput, setAdminEmailInput] = useState<string>('khayrulalam88@gmail.com');
+  // Admin Login Portal state (no prefilled credentials)
+  const [adminEmailInput, setAdminEmailInput] = useState<string>('');
   const [adminPasswordInput, setAdminPasswordInput] = useState<string>('');
   const [adminLoginError, setAdminLoginError] = useState<string>('');
   const [adminLoginLoading, setAdminLoginLoading] = useState<boolean>(false);
@@ -281,9 +284,9 @@ export const AdminPanel: React.FC = () => {
   };
 
   // Payment approval with safety check
-  const handleApprovePayment = (id: string) => {
+  const handleApprovePayment = async (id: string) => {
     setPaymentActionError('');
-    const res = approvePaymentRequest(id);
+    const res = await approvePaymentRequest(id);
     if (!res.success) {
       setPaymentActionError(res.error || 'Approval failed');
     }
@@ -381,29 +384,74 @@ export const AdminPanel: React.FC = () => {
     document.body.removeChild(link);
   };
 
-  const handleConfirmReject = () => {
+  const handleConfirmReject = async () => {
     if (rejectingPaymentId) {
-      rejectPaymentRequest(rejectingPaymentId, rejectionReasonInput);
+      setPaymentActionError('');
+      const res = await rejectPaymentRequest(rejectingPaymentId, rejectionReasonInput);
+      if (!res.success) {
+        setPaymentActionError(res.error || 'Rejection failed');
+      }
       setRejectingPaymentId(null);
     }
   };
 
-  const handleAdminLogin = (e: React.FormEvent) => {
+  const handleAdminLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setAdminLoginError('');
     setAdminLoginLoading(true);
 
-    const cleanEmail = adminEmailInput.trim().toLowerCase();
-    const cleanPass = adminPasswordInput.trim();
+    try {
+      const cleanEmail = adminEmailInput.trim().toLowerCase();
+      const cleanPass = adminPasswordInput;
 
-    if (
-      (cleanEmail === 'khayrulalam88@gmail.com' || cleanEmail.includes('admin')) &&
-      (cleanPass === 'AdminSanadPrep2026!' || cleanPass === 'sanadprep2026' || cleanPass.length >= 6)
-    ) {
+      if (!cleanPass) {
+        setAdminLoginError(t('পাসওয়ার্ড প্রদান করুন অথবা গুগল দিয়ে সাইন ইন করুন।', 'Please enter your password or sign in with Google.'));
+        return;
+      }
+
+      const res = await loginWithEmail(cleanEmail, cleanPass, false);
+      if (!res.success) {
+        setAdminLoginError(res.error || t('ভুল ইমেইল অথবা পাসওয়ার্ড। সঠিক তথ্য প্রদান করুন।', 'Invalid admin credentials. Please enter authorized credentials.'));
+        return;
+      }
+
+      const fbUser = auth?.currentUser;
+      const isVerifiedAdmin = fbUser && isVerifiedOwnerAccount(fbUser)
+        ? await checkIsAdminInFirestore(fbUser.uid)
+        : false;
+      if (!isVerifiedAdmin) {
+        setAdminLoginError(t('আপনার অ্যাকাউন্টে অ্যাডমিন অনুমতি নেই।', 'This account does not have verified administrator privileges.'));
+        return;
+      }
+
       switchRole('admin');
+      setAdminPasswordInput('');
+    } catch (err: any) {
+      setAdminLoginError(err?.message || t('প্রমাণীকরণ ব্যর্থ হয়েছে।', 'Authentication failed.'));
+    } finally {
       setAdminLoginLoading(false);
-    } else {
-      setAdminLoginError(t('ভুল ইমেইল অথবা পাসওয়ার্ড। সঠিক তথ্য প্রদান করুন।', 'Invalid admin credentials. Please enter authorized credentials.'));
+    }
+  };
+
+  const handleAdminGoogleVerify = async () => {
+    setAdminLoginError('');
+    setAdminLoginLoading(true);
+    try {
+      const res = await loginWithGoogle();
+      if (!res.success) {
+        setAdminLoginError(res.error || t('গুগল সাইন ইন ব্যর্থ হয়েছে।', 'Google sign-in failed.'));
+        return;
+      }
+      const fbUser = auth?.currentUser;
+      const isVerifiedAdmin = fbUser && isVerifiedOwnerAccount(fbUser)
+        ? await checkIsAdminInFirestore(fbUser.uid)
+        : false;
+      if (!isVerifiedAdmin) {
+        setAdminLoginError(t('শুধুমাত্র অনুমোদিত সুপার অ্যাডমিন প্রবেশ করতে পারবেন।', 'Access restricted to verified Super Administrator only.'));
+        return;
+      }
+      switchRole('admin');
+    } finally {
       setAdminLoginLoading(false);
     }
   };
@@ -412,8 +460,11 @@ export const AdminPanel: React.FC = () => {
     switchRole('student');
   };
 
-  // Access Control: Only khayrulalam88@gmail.com is allowed to access Admin Panel & Question Management
-  if (currentUser.email !== 'khayrulalam88@gmail.com') {
+  // Access Control: Only verified Firebase authenticated super admin UID is allowed
+  const hasRealFirebaseAuth = Boolean(auth?.currentUser);
+  const isOwnerAuthenticated = hasRealFirebaseAuth && isVerifiedOwnerAccount(auth?.currentUser) && currentUser.uid === OWNER_ADMIN_UID;
+
+  if (!isOwnerAuthenticated) {
     return (
       <div className="max-w-md mx-auto py-16 px-4 text-center">
         <div className="bg-white rounded-3xl border border-slate-200 shadow-xl p-8 space-y-4">
@@ -428,14 +479,21 @@ export const AdminPanel: React.FC = () => {
           </h2>
           <p className="text-xs text-slate-500 leading-relaxed">
             {t(
-              'এই প্রশাসনিক প্যানেল ও প্রশ্ন ব্যবস্থাপনা শুধুমাত্র প্রধান প্রশাসকের জন্য সংরক্ষিত। অন্যান্য শিক্ষার্থী বা পরীক্ষার্থীদের জন্য এই অংশে প্রবেশের অনুমতি নেই।',
-              'This admin panel and question manager are strictly restricted to the Super Administrator. Access is forbidden for other accounts.'
+              'এই প্রশাসনিক প্যানেল ও প্রশ্ন ব্যবস্থাপনা শুধুমাত্র প্রধান প্রশাসকের যাচাইকৃত ফায়ারবেস অ্যাকাউন্টের জন্য সংরক্ষিত। অন্যান্য শিক্ষার্থী বা পরীক্ষার্থীদের জন্য এই অংশে প্রবেশের অনুমতি নেই।',
+              'This admin panel and question manager are strictly restricted to the Firebase-verified Super Administrator. Access is forbidden for other accounts.'
             )}
           </p>
-          <div className="pt-2">
+          <div className="pt-2 space-y-2">
+            <button
+              onClick={handleAdminGoogleVerify}
+              disabled={adminLoginLoading}
+              className="w-full py-3 rounded-xl bg-[#102A43] hover:bg-[#243B53] text-[#D4AF37] border border-[#D4AF37] font-bold text-xs transition cursor-pointer shadow-sm"
+            >
+              {t('অ্যাডমিন গুগল অ্যাকাউন্ট দিয়ে যাচাই করুন', 'Verify Super Admin via Google')}
+            </button>
             <button
               onClick={() => setActiveScreen('dashboard')}
-              className="w-full py-3 rounded-xl bg-[#102A43] hover:bg-[#243B53] text-[#D4AF37] border border-[#D4AF37] font-bold text-xs transition cursor-pointer shadow-sm"
+              className="w-full py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs transition cursor-pointer"
             >
               {t('ড্যাশবোর্ডে ফিরে যান', 'Return to Student Dashboard')}
             </button>
@@ -462,7 +520,7 @@ export const AdminPanel: React.FC = () => {
                 {t('প্রশাসনিক নিয়ন্ত্রণ কেন্দ্র', 'Admin Control Portal')}
               </h2>
               <p className="text-xs text-slate-500 mt-1">
-                {t('স্বাগতম মো: খাইরুল আলম। অ্যাডমিন প্যানেলে প্রবেশ করতে পাসওয়ার্ড যাচাই করুন।', 'Welcome Khayrul Alam. Please authenticate to access the admin console.')}
+                {t('স্বাগতম মো: খাইরুল আলম। অ্যাডমিন প্যানেলে প্রবেশ করতে ফায়ারবেস অ্যাকাউন্ট যাচাই করুন।', 'Welcome Khayrul Alam. Please re-authenticate via Firebase to access the admin console.')}
               </p>
             </div>
           </div>
@@ -474,7 +532,17 @@ export const AdminPanel: React.FC = () => {
             </div>
           )}
 
-          <form onSubmit={handleAdminLogin} className="space-y-4 text-xs sm:text-sm">
+          <button
+            type="button"
+            onClick={handleAdminGoogleVerify}
+            disabled={adminLoginLoading}
+            className="w-full py-3 rounded-xl border border-slate-300 bg-white hover:bg-slate-50 text-slate-800 font-bold text-xs transition flex items-center justify-center gap-2 shadow-xs cursor-pointer disabled:opacity-50"
+          >
+            <ShieldCheck className="w-4 h-4 text-emerald-600" />
+            <span>{t('গুগল (Firebase Auth) দিয়ে অ্যাডমিন মোড চালু করুন', 'Enter Admin Mode with Google')}</span>
+          </button>
+
+          <form onSubmit={handleAdminLogin} className="space-y-4 text-xs sm:text-sm pt-2 border-t border-slate-100">
             <div>
               <label className="font-bold text-slate-700 block mb-1">
                 {t('অ্যাডমিন ইমেইল', 'Admin Email')}
@@ -482,15 +550,16 @@ export const AdminPanel: React.FC = () => {
               <input
                 type="email"
                 required
-                readOnly
                 value={adminEmailInput}
-                className="w-full p-3 rounded-xl border border-slate-200 bg-slate-50 font-mono text-xs text-slate-700 focus:outline-hidden"
+                onChange={(e) => setAdminEmailInput(e.target.value)}
+                placeholder="admin@example.com"
+                className="w-full p-3 rounded-xl border border-slate-300 bg-white font-mono text-xs text-slate-800 focus:ring-2 focus:ring-[#102A43]"
               />
             </div>
 
             <div>
               <label className="font-bold text-slate-700 block mb-1">
-                {t('অ্যাডমিন পাসওয়ার্ড (Admin Password)', 'Admin Password')}
+                {t('ফায়ারবেস অ্যাকাউন্ট পাসওয়ার্ড', 'Firebase Account Password')}
               </label>
               <input
                 type="password"
@@ -698,7 +767,7 @@ export const AdminPanel: React.FC = () => {
               <div className="bg-slate-800/80 p-4 rounded-2xl border border-slate-700/80 text-xs space-y-1.5 shrink-0">
                 <div className="flex items-center justify-between gap-4">
                   <span className="text-slate-400 font-medium">{t('প্রধান অ্যাডমিন ইমেইল:', 'Super Admin Email:')}</span>
-                  <span className="font-mono text-emerald-400 font-bold">khayrulalam88@gmail.com</span>
+                  <span className="font-mono text-emerald-400 font-bold">{OWNER_ADMIN_EMAIL}</span>
                 </div>
                 <div className="flex items-center justify-between gap-4">
                   <span className="text-slate-400 font-medium">{t('বর্তমান ইউজার UID:', 'Active Account UID:')}</span>
@@ -1239,7 +1308,7 @@ export const AdminPanel: React.FC = () => {
                             name: sub.studentName,
                             email: sub.userId === currentUser.uid ? currentUser.email : `${sub.studentPhone.replace(/[^0-9]/g, '')}@student.sanadprep.com`,
                             phone: sub.studentPhone,
-                            role: sub.userId === currentUser.uid ? currentUser.role : 'student',
+                            role: sub.userId === OWNER_ADMIN_UID ? 'admin' : 'student',
                             subscriptionStatus: !isExpired ? 'pro' : 'expired',
                             packageId: sub.packageId,
                             packageNameBn: sub.packageNameBn,
@@ -1823,7 +1892,10 @@ export const AdminPanel: React.FC = () => {
                     </h4>
 
                     <p className="text-xs text-slate-500">
-                      {t('সঠিক উত্তর:', 'Correct Ans:')} <strong className="text-emerald-700">{q.optionsBn[q.correctOptionIndex]}</strong>
+                      {t('সঠিক উত্তর:', 'Correct Ans:')}{' '}
+                      <strong className="text-emerald-700">
+                        {q.correctOptionIndex !== undefined ? q.optionsBn[q.correctOptionIndex] : '—'}
+                      </strong>
                     </p>
                   </div>
                 </div>

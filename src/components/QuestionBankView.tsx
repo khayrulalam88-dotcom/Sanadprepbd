@@ -1,5 +1,6 @@
 import React, { useState, useMemo } from 'react';
 import { useApp } from '../context/AppContext';
+import { auth, isVerifiedOwnerAccount } from '../lib/firebase';
 import { CustomTestModal } from './CustomTestModal';
 import { 
   BookOpen, 
@@ -42,7 +43,7 @@ export const QuestionBankView: React.FC = () => {
     setActiveScreen 
   } = useApp();
 
-  const isAdmin = currentUser.role === 'admin' || currentUser.email === 'khayrulalam88@gmail.com';
+  const isAdmin = isVerifiedOwnerAccount(auth?.currentUser) && currentUser.role === 'admin';
 
   const [activeTab, setActiveTab] = useState<'browse' | 'generator' | 'my_tests'>('browse');
   const [searchQuery, setSearchQuery] = useState<string>('');
@@ -147,7 +148,7 @@ export const QuestionBankView: React.FC = () => {
   };
 
   // Launch test from Generator Tab
-  const handleStartGeneratorTest = () => {
+  const handleStartGeneratorTest = async () => {
     let pool = questions.filter(q => {
       if (genSubjectIds.length > 0 && !genSubjectIds.includes(q.subjectId)) {
         return false;
@@ -166,17 +167,13 @@ export const QuestionBankView: React.FC = () => {
     const titleBn = genTitle.trim() || `কাস্টম মডেল টেস্ট (${chosen.length} টি প্রশ্ন)`;
     const titleEn = genTitle.trim() || `Custom Model Test (${chosen.length} MCQs)`;
 
-    const res = createAndStartCustomExam({
+    await createAndStartCustomExam({
       titleBn,
       titleEn,
       durationMinutes: genDuration,
       questionIds: chosen,
       negativeMarkRatio: genNegativeMark
     });
-
-    if (!res.success && res.reason) {
-      alert(res.reason);
-    }
   };
 
   // Previous custom exams
@@ -556,7 +553,7 @@ export const QuestionBankView: React.FC = () => {
                   {/* Options Grid */}
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pl-9 mb-3">
                     {q.optionsBn.map((opt, optIdx) => {
-                      const isCorrect = optIdx === q.correctOptionIndex;
+                      const isCorrect = q.correctOptionIndex !== undefined && optIdx === q.correctOptionIndex;
                       return (
                         <div
                           key={optIdx}
@@ -597,8 +594,7 @@ export const QuestionBankView: React.FC = () => {
                     <button
                       type="button"
                       onClick={() => {
-                        // Quick 1-question model test
-                        createAndStartCustomExam({
+                        void createAndStartCustomExam({
                           titleBn: `দ্রুত টেস্ট - ${sub?.nameBn || 'আইন'}`,
                           titleEn: `Quick Test - ${sub?.nameEn || 'Law'}`,
                           durationMinutes: 5,
@@ -617,7 +613,12 @@ export const QuestionBankView: React.FC = () => {
                   {isExpOpen && (
                     <div className="mt-3 ml-9 p-3.5 rounded-xl bg-slate-50 border border-slate-200 text-xs space-y-2 animate-in fade-in">
                       <div className="flex items-center justify-between text-emerald-800 font-bold">
-                        <span>সঠিক উত্তর: {optionPrefixesBn[q.correctOptionIndex]} ({q.optionsBn[q.correctOptionIndex]})</span>
+                        <span>
+                          সঠিক উত্তর:{' '}
+                          {q.correctOptionIndex !== undefined
+                            ? `${optionPrefixesBn[q.correctOptionIndex]} (${q.optionsBn[q.correctOptionIndex]})`
+                            : '—'}
+                        </span>
                         {q.legalReference && (
                           <span className="px-2 py-0.5 bg-white border border-slate-200 rounded text-slate-700 font-mono text-[11px]">
                             {q.legalReference}

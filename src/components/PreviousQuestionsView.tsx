@@ -1,5 +1,6 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { useApp } from '../context/AppContext';
+import { apiCheckPreviousQuestion, apiGradePreviousQuestions } from '../lib/api';
 import { PreviousQuestion, PreviousYear } from '../types';
 import { 
   History, 
@@ -22,6 +23,27 @@ import {
   FileCheck
 } from 'lucide-react';
 
+interface PreviousQuestionSolution {
+  isCorrect?: boolean;
+  correctAnswer: string;
+  explanation: string;
+  legalSection?: string;
+  source?: string;
+}
+
+interface PreviousExamEvaluation {
+  totalQuestions: number;
+  correctCount: number;
+  incorrectCount: number;
+  unansweredCount: number;
+  positiveMarks: number;
+  negativeMarks: number;
+  finalScore: number;
+  percentage: number;
+  isPassed: boolean;
+  incorrectList: { question: PreviousQuestion; selectedAnswer?: string }[];
+}
+
 export const PreviousQuestionsView: React.FC = () => {
   const { 
     previousQuestions, 
@@ -42,12 +64,18 @@ export const PreviousQuestionsView: React.FC = () => {
   // Practice Mode state
   const [practiceAnswers, setPracticeAnswers] = useState<Record<string, string>>({});
   const [showExplanationIds, setShowExplanationIds] = useState<Set<string>>(new Set());
+  const [checkedSolutions, setCheckedSolutions] = useState<Record<string, PreviousQuestionSolution>>({});
+  const [loadingSolutionIds, setLoadingSolutionIds] = useState<Set<string>>(new Set());
+  const [practiceNotice, setPracticeNotice] = useState<string | null>(null);
 
   // Exam Mode state
   const [examAnswers, setExamAnswers] = useState<Record<string, string>>({});
   const [examTimeRemaining, setExamTimeRemaining] = useState<number>(30 * 60); // 30 minutes
   const [examStartedAt, setExamStartedAt] = useState<number>(0);
   const [isExamActive, setIsExamActive] = useState<boolean>(false);
+  const [examEvaluation, setExamEvaluation] = useState<PreviousExamEvaluation | null>(null);
+  const [isGradingExam, setIsGradingExam] = useState<boolean>(false);
+  const [examError, setExamError] = useState<string | null>(null);
 
   // Available Years
   const availableYears: PreviousYear[] = [2025, 2023, 2022, 2020];
@@ -78,28 +106,58 @@ export const PreviousQuestionsView: React.FC = () => {
     });
   }, [previousQuestions, selectedPreviousYear, selectedSubject, searchQuery]);
 
+  // Keep refs updated so timer auto-submit reads latest answers & questions
+  const examAnswersRef = useRef<Record<string, string>>(examAnswers);
+  examAnswersRef.current = examAnswers;
+  const filteredQuestionsRef = useRef<PreviousQuestion[]>(filteredQuestions);
+  filteredQuestionsRef.current = filteredQuestions;
+
+  // Finish / Submit Exam via Backend Grading API
+  const finishExam = async () => {
+    setIsExamActive(false);
+    setIsGradingExam(true);
+    setExamError(null);
+    try {
+      const qIds = filteredQuestionsRef.current.map(q => q.id);
+      const res = await apiGradePreviousQuestions(qIds, examAnswersRef.current);
+      if (res.ok && res.data?.success && res.data.evaluation) {
+        setExamEvaluation(res.data.evaluation);
+        setActiveMode('exam_result');
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      } else {
+        setExamError(res.message || t('ফলাফল মূল্যায়ন করা যায়নি।', 'Failed to grade previous-year exam.'));
+      }
+    } finally {
+      setIsGradingExam(false);
+    }
+  };
+
   // Exam Timer
   useEffect(() => {
-    let interval: NodeJS.Timeout;
+    let interval: ReturnType<typeof setInterval> | undefined;
     if (isExamActive && examTimeRemaining > 0) {
       interval = setInterval(() => {
         setExamTimeRemaining(prev => {
           if (prev <= 1) {
-            clearInterval(interval);
-            finishExam();
+            if (interval) clearInterval(interval);
+            void finishExam();
             return 0;
           }
           return prev - 1;
         });
       }, 1000);
     }
-    return () => clearInterval(interval);
+    return () => {
+      if (interval) clearInterval(interval);
+    };
   }, [isExamActive, examTimeRemaining]);
 
   // Start Exam
   const startExamMode = () => {
     if (filteredQuestions.length === 0) return;
     setExamAnswers({});
+    setExamEvaluation(null);
+    setExamError(null);
     const duration = Math.max(10, Math.min(60, filteredQuestions.length)) * 60; // 1 min per question
     setExamTimeRemaining(duration);
     setExamStartedAt(Date.now());
@@ -108,34 +166,104 @@ export const PreviousQuestionsView: React.FC = () => {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  // Finish / Submit Exam
-  const finishExam = () => {
-    setIsExamActive(false);
-    setActiveMode('exam_result');
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  };
-
   // Reset Practice
   const resetPractice = () => {
     setPracticeAnswers({});
     setShowExplanationIds(new Set());
+    setCheckedSolutions({});
+    setPracticeNotice(null);
   };
 
-  // Handle Practice Answer Selection
-  const handlePracticeSelect = (questionId: string, option: string) => {
+  // Handle Practice Answer Selection via Server Check
+  const handlePracticeSelect = async (questionId: string, option: string) => {
+    setPracticeNotice(null);
     setPracticeAnswers(prev => ({ ...prev, [questionId]: option }));
-    // Automatically show explanation upon answering
     setShowExplanationIds(prev => new Set(prev).add(questionId));
+
+    const existingQ = previousQuestions.find(item => item.id === questionId);
+    if (existingQ?.correctAnswer && existingQ.explanation) {
+      setCheckedSolutions(prev => ({
+        ...prev,
+        [questionId]: {
+          isCorrect: option.trim() === existingQ.correctAnswer!.trim(),
+          correctAnswer: existingQ.correctAnswer!,
+          explanation: existingQ.explanation!,
+          legalSection: existingQ.legalSection,
+          source: existingQ.source
+        }
+      }));
+      return;
+    }
+
+    setLoadingSolutionIds(prev => new Set(prev).add(questionId));
+    try {
+      const res = await apiCheckPreviousQuestion(questionId, option);
+      if (res.ok && res.data?.success) {
+        setCheckedSolutions(prev => ({
+          ...prev,
+          [questionId]: {
+            isCorrect: res.data!.isCorrect,
+            correctAnswer: res.data!.correctAnswer,
+            explanation: res.data!.explanation,
+            legalSection: res.data!.legalSection,
+            source: res.data!.source
+          }
+        }));
+      } else {
+        setPracticeNotice(res.message || t('সার্ভার থেকে উত্তর যাচাই করা যায়নি।', 'Could not verify answer from server.'));
+      }
+    } finally {
+      setLoadingSolutionIds(prev => {
+        const next = new Set(prev);
+        next.delete(questionId);
+        return next;
+      });
+    }
   };
 
-  // Toggle Single Explanation Visibility
-  const toggleExplanation = (questionId: string) => {
-    setShowExplanationIds(prev => {
-      const next = new Set(prev);
-      if (next.has(questionId)) next.delete(questionId);
-      else next.add(questionId);
-      return next;
-    });
+  // Toggle Single Explanation Visibility (fetches key on-demand if needed)
+  const toggleExplanation = async (questionId: string) => {
+    const isCurrentlyOpen = showExplanationIds.has(questionId);
+    if (isCurrentlyOpen) {
+      setShowExplanationIds(prev => {
+        const next = new Set(prev);
+        next.delete(questionId);
+        return next;
+      });
+      return;
+    }
+
+    setShowExplanationIds(prev => new Set(prev).add(questionId));
+    const existingQ = previousQuestions.find(item => item.id === questionId);
+    if (checkedSolutions[questionId] || (existingQ?.correctAnswer && existingQ.explanation)) {
+      return;
+    }
+
+    setLoadingSolutionIds(prev => new Set(prev).add(questionId));
+    try {
+      const chosen = practiceAnswers[questionId];
+      const res = await apiCheckPreviousQuestion(questionId, chosen);
+      if (res.ok && res.data?.success) {
+        setCheckedSolutions(prev => ({
+          ...prev,
+          [questionId]: {
+            isCorrect: res.data!.isCorrect,
+            correctAnswer: res.data!.correctAnswer,
+            explanation: res.data!.explanation,
+            legalSection: res.data!.legalSection,
+            source: res.data!.source
+          }
+        }));
+      } else {
+        setPracticeNotice(res.message || t('সার্ভার থেকে সমাধান পাওয়া যায়নি।', 'Could not load explanation from server.'));
+      }
+    } finally {
+      setLoadingSolutionIds(prev => {
+        const next = new Set(prev);
+        next.delete(questionId);
+        return next;
+      });
+    }
   };
 
   // Format seconds to mm:ss
@@ -144,47 +272,6 @@ export const PreviousQuestionsView: React.FC = () => {
     const s = secs % 60;
     return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
   };
-
-  // Compute Exam Results
-  const examEvaluation = useMemo(() => {
-    if (activeMode !== 'exam_result') return null;
-    let correctCount = 0;
-    let incorrectCount = 0;
-    const incorrectList: { question: PreviousQuestion; selectedAnswer?: string }[] = [];
-
-    filteredQuestions.forEach(q => {
-      const chosen = examAnswers[q.id];
-      if (!chosen) {
-        // unanswered
-      } else if (chosen.trim() === q.correctAnswer.trim()) {
-        correctCount++;
-      } else {
-        incorrectCount++;
-        incorrectList.push({ question: q, selectedAnswer: chosen });
-      }
-    });
-
-    const unansweredCount = filteredQuestions.length - (correctCount + incorrectCount);
-    // Standard Bar Council scoring: +1 for correct, -0.25 for incorrect
-    const positiveMarks = correctCount * 1.0;
-    const negativeMarks = incorrectCount * 0.25;
-    const finalScore = Math.max(0, positiveMarks - negativeMarks);
-    const percentage = filteredQuestions.length > 0 ? (finalScore / filteredQuestions.length) * 100 : 0;
-    const isPassed = percentage >= 50;
-
-    return {
-      totalQuestions: filteredQuestions.length,
-      correctCount,
-      incorrectCount,
-      unansweredCount,
-      positiveMarks,
-      negativeMarks,
-      finalScore: Number(finalScore.toFixed(2)),
-      percentage: Number(percentage.toFixed(1)),
-      isPassed,
-      incorrectList
-    };
-  }, [activeMode, filteredQuestions, examAnswers]);
 
   return (
     <div className="min-h-screen bg-slate-50 py-8 px-4 sm:px-6 lg:px-8">
@@ -356,6 +443,12 @@ export const PreviousQuestionsView: React.FC = () => {
               </div>
             </div>
 
+            {practiceNotice && (
+              <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs sm:text-sm font-semibold">
+                {practiceNotice}
+              </div>
+            )}
+
             {filteredQuestions.length === 0 ? (
               <div className="bg-white rounded-2xl p-12 text-center border border-slate-200">
                 <AlertCircle className="w-12 h-12 text-slate-300 mx-auto mb-3" />
@@ -366,9 +459,18 @@ export const PreviousQuestionsView: React.FC = () => {
             ) : (
               filteredQuestions.map((q, idx) => {
                 const userChoice = practiceAnswers[q.id];
-                const isAnswered = Boolean(userChoice);
-                const isCorrect = userChoice?.trim() === q.correctAnswer.trim();
+                const solution = checkedSolutions[q.id];
+                const resolvedCorrectAnswer = solution?.correctAnswer ?? q.correctAnswer;
+                const resolvedExplanation = solution?.explanation ?? q.explanation;
+                const resolvedLegalSection = solution?.legalSection ?? q.legalSection;
+                const resolvedSource = solution?.source ?? q.source;
+                const isAnswered = Boolean(userChoice) && resolvedCorrectAnswer !== undefined;
+                const isCorrect =
+                  solution?.isCorrect !== undefined
+                    ? solution.isCorrect
+                    : Boolean(userChoice && resolvedCorrectAnswer && userChoice.trim() === resolvedCorrectAnswer.trim());
                 const showExplanation = showExplanationIds.has(q.id);
+                const isLoadingSol = loadingSolutionIds.has(q.id);
 
                 return (
                   <div 
@@ -390,10 +492,10 @@ export const PreviousQuestionsView: React.FC = () => {
                           </span>
                         </div>
 
-                        {q.legalSection && (
+                        {resolvedLegalSection && (
                           <span className="text-xs font-medium text-slate-500 bg-white border border-slate-200 px-2 py-0.5 rounded-md flex items-center gap-1">
                             <Scale className="w-3 h-3 text-amber-500" />
-                            {q.legalSection}
+                            {resolvedLegalSection}
                           </span>
                         )}
                       </div>
@@ -408,7 +510,7 @@ export const PreviousQuestionsView: React.FC = () => {
                       {q.options.map((opt: string, optIdx: number) => {
                         const optLetter = ['ক', 'খ', 'গ', 'ঘ'][optIdx] || (optIdx + 1);
                         const isThisSelected = userChoice === opt;
-                        const isThisCorrect = q.correctAnswer.trim() === opt.trim();
+                        const isThisCorrect = resolvedCorrectAnswer ? resolvedCorrectAnswer.trim() === opt.trim() : false;
 
                         // Style determination
                         let containerStyle = 'bg-white border-slate-200 hover:border-slate-300 hover:bg-slate-50/70 text-slate-800';
@@ -429,7 +531,7 @@ export const PreviousQuestionsView: React.FC = () => {
                         return (
                           <div
                             key={optIdx}
-                            onClick={() => handlePracticeSelect(q.id, opt)}
+                            onClick={() => void handlePracticeSelect(q.id, opt)}
                             className={`p-3.5 sm:p-4 rounded-xl border flex items-center justify-between transition-all cursor-pointer ${containerStyle}`}
                           >
                             <div className="flex items-center gap-3">
@@ -456,7 +558,7 @@ export const PreviousQuestionsView: React.FC = () => {
                     <div className="px-5 sm:px-6 pb-5 pt-1">
                       <div className="flex items-center justify-between">
                         <button
-                          onClick={() => toggleExplanation(q.id)}
+                          onClick={() => void toggleExplanation(q.id)}
                           className="text-xs sm:text-sm font-semibold text-slate-600 hover:text-slate-900 flex items-center gap-1.5 cursor-pointer"
                         >
                           <Eye className="w-4 h-4 text-amber-600" />
@@ -474,26 +576,36 @@ export const PreviousQuestionsView: React.FC = () => {
 
                       {showExplanation && (
                         <div className="mt-4 p-4 rounded-xl bg-amber-50/70 border border-amber-200 space-y-2 text-sm text-slate-800 animate-fadeIn">
-                          <div className="flex items-center gap-2 text-amber-900 font-bold">
-                            <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                            <span>{t('সঠিক উত্তর:', 'Correct Answer:')} {q.correctAnswer}</span>
-                          </div>
+                          {isLoadingSol ? (
+                            <p className="text-xs text-slate-600">{t('সমাধান লোড হচ্ছে...', 'Loading statutory solution...')}</p>
+                          ) : (
+                            <>
+                              <div className="flex items-center gap-2 text-amber-900 font-bold">
+                                <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                                <span>{t('সঠিক উত্তর:', 'Correct Answer:')} {resolvedCorrectAnswer || '—'}</span>
+                              </div>
 
-                          {q.legalSection && (
-                            <div className="flex items-center gap-2 text-xs font-semibold text-slate-700 bg-white/80 p-2 rounded-lg border border-amber-100">
-                              <Scale className="w-3.5 h-3.5 text-amber-600" />
-                              <span>{t('আইনি ধারা / বিধিমালা:', 'Statutory Reference:')} {q.legalSection}</span>
-                            </div>
+                              {resolvedLegalSection && (
+                                <div className="flex items-center gap-2 text-xs font-semibold text-slate-700 bg-white/80 p-2 rounded-lg border border-amber-100">
+                                  <Scale className="w-3.5 h-3.5 text-amber-600" />
+                                  <span>{t('আইনি ধারা / বিধিমালা:', 'Statutory Reference:')} {resolvedLegalSection}</span>
+                                </div>
+                              )}
+
+                              {resolvedExplanation && (
+                                <div className="text-slate-700 leading-relaxed pt-1 border-t border-amber-100/60">
+                                  <span className="font-semibold text-slate-900">{t('ব্যাখ্যা ও আইনি যুক্তি:', 'Explanation & Legal Basis:')}</span>{' '}
+                                  {resolvedExplanation}
+                                </div>
+                              )}
+
+                              {resolvedSource && (
+                                <div className="text-[11px] text-slate-500 pt-1">
+                                  {t('উৎস:', 'Source:')} {resolvedSource}
+                                </div>
+                              )}
+                            </>
                           )}
-
-                          <div className="text-slate-700 leading-relaxed pt-1 border-t border-amber-100/60">
-                            <span className="font-semibold text-slate-900">{t('ব্যাখ্যা ও আইনি যুক্তি:', 'Explanation & Legal Basis:')}</span>{' '}
-                            {q.explanation}
-                          </div>
-
-                          <div className="text-[11px] text-slate-500 pt-1">
-                            {t('উৎস:', 'Source:')} {q.source}
-                          </div>
                         </div>
                       )}
                     </div>
@@ -536,14 +648,21 @@ export const PreviousQuestionsView: React.FC = () => {
                 </div>
 
                 <button
-                  onClick={finishExam}
-                  className="px-5 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-sm shadow-md transition-all cursor-pointer flex items-center gap-2"
+                  disabled={isGradingExam}
+                  onClick={() => void finishExam()}
+                  className="px-5 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 disabled:opacity-60 text-slate-950 font-bold text-sm shadow-md transition-all cursor-pointer flex items-center gap-2"
                 >
                   <FileCheck className="w-4 h-4" />
-                  {t('পরীক্ষা জমা দিন', 'Submit Exam')}
+                  {isGradingExam ? t('মূল্যায়ন হচ্ছে...', 'Grading...') : t('পরীক্ষা জমা দিন', 'Submit Exam')}
                 </button>
               </div>
             </div>
+
+            {examError && (
+              <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs sm:text-sm font-semibold">
+                {examError}
+              </div>
+            )}
 
             {/* Questions for Exam */}
             <div className="space-y-4">
@@ -613,11 +732,12 @@ export const PreviousQuestionsView: React.FC = () => {
                 </p>
               </div>
               <button
-                onClick={finishExam}
-                className="w-full sm:w-auto px-6 py-3 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-sm shadow-md transition-all cursor-pointer flex items-center justify-center gap-2"
+                disabled={isGradingExam}
+                onClick={() => void finishExam()}
+                className="w-full sm:w-auto px-6 py-3 rounded-xl bg-amber-500 hover:bg-amber-400 disabled:opacity-60 text-slate-950 font-bold text-sm shadow-md transition-all cursor-pointer flex items-center justify-center gap-2"
               >
                 <FileCheck className="w-4 h-4" />
-                {t('ফলাফল প্রকাশ করুন', 'Submit & View Report')}
+                {isGradingExam ? t('মূল্যায়ন হচ্ছে...', 'Grading...') : t('ফলাফল প্রকাশ করুন', 'Submit & View Report')}
               </button>
             </div>
           </div>

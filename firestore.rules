@@ -1,7 +1,7 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    
+
     // Default Deny All Catch-All
     match /{document=**} {
       allow read, write: if false;
@@ -13,19 +13,19 @@ service cloud.firestore {
     function isAuthenticated() {
       return request.auth != null;
     }
-    
+
     function isOwner(userId) {
       return isAuthenticated() && request.auth.uid == userId;
     }
 
-    // Primary Owner Account: Cryptographically verified Khayrul Alam's email
+    // Primary Owner Account: Verified by immutable Firebase Auth UID + email
     function isOwnerAccount() {
-      return isAuthenticated() && 
-             request.auth.token.email_verified == true && 
+      return isAuthenticated() &&
+             request.auth.uid == 'PjBRV7LAQ8cIwOdM3z474A16dWg2' &&
              request.auth.token.email == 'khayrulalam88@gmail.com';
     }
 
-    // Admin Authority: Owner account OR verified entry in /admins/{uid}
+    // Admin Authority: Owner account OR owner-approved entry in /admins/{uid}
     function isAdmin() {
       return isAuthenticated() && (
         isOwnerAccount() ||
@@ -33,23 +33,19 @@ service cloud.firestore {
       );
     }
 
-    // Verified Paid Access Gate: User must have active pro status AND unexpired subscription
-    // Safely handles both ISO 8601 string and Firestore Timestamp types
+    // Verified Paid Access Gate:
+    // User must have active pro status AND valid non-null Firestore Timestamp subscriptionExpiresAt > request.time.
+    // Never compares string(request.time) against ISO strings.
     function hasActiveSubscription() {
       return isAuthenticated() && (
         isOwnerAccount() ||
         isAdmin() ||
         (
-          exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+          exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
           get(/databases/$(database)/documents/users/$(request.auth.uid)).data.subscriptionStatus == 'pro' &&
-          (
-            !('subscriptionExpiresAt' in get(/databases/$(database)/documents/users/$(request.auth.uid)).data) ||
-            get(/databases/$(database)/documents/users/$(request.auth.uid)).data.subscriptionExpiresAt == null ||
-            (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.subscriptionExpiresAt is string && 
-             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.subscriptionExpiresAt > string(request.time)) ||
-            (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.subscriptionExpiresAt is timestamp && 
-             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.subscriptionExpiresAt > request.time)
-          )
+          'subscriptionExpiresAt' in get(/databases/$(database)/documents/users/$(request.auth.uid)).data &&
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.subscriptionExpiresAt is timestamp &&
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.subscriptionExpiresAt > request.time
         )
       );
     }
@@ -57,8 +53,7 @@ service cloud.firestore {
     // ---------------------------------------------------------
     // 1. ADMIN AUTHORIZATION RECORD (/admins/{adminId})
     // ---------------------------------------------------------
-    // CRITICAL: Only the verified owner account can create, update, or revoke admin privileges.
-    // Secondary admins or client-side requests CANNOT create other admins.
+    // Only the verified owner UID can create, update, or revoke admin privileges.
     match /admins/{adminId} {
       allow read: if isAuthenticated() && (request.auth.uid == adminId || isOwnerAccount());
       allow write: if isOwnerAccount();
@@ -67,26 +62,26 @@ service cloud.firestore {
     // ---------------------------------------------------------
     // 2. USER PROFILES (/users/{userId})
     // ---------------------------------------------------------
-    // Ordinary students CANNOT grant themselves admin role or pro subscription status.
+    // Students cannot modify role or subscription fields.
     match /users/{userId} {
-      allow read: if isOwner(userId) || isAdmin();
+      allow read: if isOwner(userId) || isOwnerAccount() || isAdmin();
       allow create: if isAuthenticated() && request.auth.uid == userId && (
         isOwnerAccount() || (
-          request.resource.data.role == 'student' && 
+          request.resource.data.role == 'student' &&
           request.resource.data.subscriptionStatus == 'free' &&
           (!('subscriptionExpiresAt' in request.resource.data) || request.resource.data.subscriptionExpiresAt == null)
         )
       );
       allow update: if isOwnerAccount() || (
-        isAdmin() && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role'])
-      ) || (
         isOwner(userId) &&
         !request.resource.data.diff(resource.data).affectedKeys().hasAny([
-          'role', 
-          'subscriptionStatus', 
-          'subscriptionExpiresAt', 
-          'activePackageId', 
-          'activePackageNameBn', 
+          'uid',
+          'createdAt',
+          'role',
+          'subscriptionStatus',
+          'subscriptionExpiresAt',
+          'activePackageId',
+          'activePackageNameBn',
           'activePackageNameEn'
         ])
       );
@@ -97,110 +92,111 @@ service cloud.firestore {
     // 3. PAYMENT REQUESTS (/paymentRequests/{paymentId})
     // ---------------------------------------------------------
     // Students can ONLY create requests with status 'pending' for their own UID.
-    // Document ID MUST match trx_{transactionId} to prevent duplicate transaction IDs across all accounts.
-    // Only the authorized Admin/Owner can approve, reject, or update requests.
+    // Document ID MUST match trx_{transactionId} (prevents duplicate & previously rejected TrxID reuse).
+    // Authoritative price validated against /packages/{packageId} when present in Firestore.
+    // Only the verified owner UID can read all, approve, reject, or delete requests.
     match /paymentRequests/{paymentId} {
-      allow read: if (isAuthenticated() && resource.data.userId == request.auth.uid) || isAdmin();
-      allow create: if isAuthenticated() && 
-        request.resource.data.userId == request.auth.uid && 
+      allow read: if (isAuthenticated() && resource.data.userId == request.auth.uid) || isOwnerAccount();
+      allow create: if isAuthenticated() &&
+        request.resource.data.userId == request.auth.uid &&
         request.resource.data.status == 'pending' &&
         request.resource.data.verifiedAt == null &&
         request.resource.data.verifiedBy == null &&
+        (!('rejectionReason' in request.resource.data) || request.resource.data.rejectionReason == null) &&
         request.resource.data.subscriptionId == null &&
+        request.resource.data.method in ['bKash', 'Nagad', 'Rocket'] &&
         request.resource.data.transactionId is string &&
         request.resource.data.transactionId.size() >= 4 &&
+        request.resource.data.transactionId.size() <= 64 &&
+        request.resource.data.transactionId.matches('^[A-Z0-9]+$') &&
         paymentId == ('trx_' + request.resource.data.transactionId) &&
+        request.resource.data.packageId is string &&
+        request.resource.data.packageId.size() > 0 &&
         request.resource.data.amount is number &&
-        request.resource.data.amount > 0;
-      allow update: if isOwnerAccount() || isAdmin();
+        request.resource.data.amount > 0 &&
+        (
+          !exists(/databases/$(database)/documents/packages/$(request.resource.data.packageId)) ||
+          request.resource.data.amount == get(/databases/$(database)/documents/packages/$(request.resource.data.packageId)).data.price
+        );
+      allow update: if isOwnerAccount();
       allow delete: if isOwnerAccount();
     }
 
     // ---------------------------------------------------------
     // 4. SUBSCRIPTIONS (/subscriptions/{subscriptionId})
     // ---------------------------------------------------------
-    // Strictly created and managed by the Admin/Owner upon manual payment approval.
-    // Students can ONLY read their own subscription document.
+    // Created and managed ONLY by the verified owner UID / trusted Admin SDK backend.
     match /subscriptions/{subscriptionId} {
-      allow read: if (isAuthenticated() && resource.data.userId == request.auth.uid) || isAdmin();
-      allow create, update: if isOwnerAccount() || isAdmin();
-      allow delete: if isOwnerAccount();
+      allow read: if (isAuthenticated() && resource.data.userId == request.auth.uid) || isOwnerAccount();
+      allow create, update, delete: if isOwnerAccount();
     }
 
     // ---------------------------------------------------------
     // 5. EXAMINATIONS (/exams/{examId})
     // ---------------------------------------------------------
-    // Free exams readable by all; Paid 60-min model tests require active Pro subscription or Admin.
+    // Safely handles missing-doc gets (resource == null) on allow get.
+    // Free exams readable by all; Paid exams require active Pro subscription or Owner Admin.
     match /exams/{examId} {
-      allow read: if (!('isPaid' in resource.data) || resource.data.isPaid == false || resource.data.get('isFree', false) == true) || hasActiveSubscription();
-      allow write: if isOwnerAccount() || isAdmin();
+      allow get: if resource == null ||
+                    !('isPaid' in resource.data) ||
+                    resource.data.isPaid == false ||
+                    resource.data.get('isFree', false) == true ||
+                    hasActiveSubscription();
+      allow list: if !('isPaid' in resource.data) ||
+                     resource.data.isPaid == false ||
+                     resource.data.get('isFree', false) == true ||
+                     hasActiveSubscription();
+      allow write: if isOwnerAccount();
     }
 
     // ---------------------------------------------------------
-    // 6. QUESTION BANK & SYLLABUS
+    // 6. QUESTION BANK, ANSWER KEYS & SYLLABUS
     // ---------------------------------------------------------
     match /subjects/{subjectId} {
       allow read: if true;
-      allow write: if isOwnerAccount() || isAdmin();
+      allow write: if isOwnerAccount();
     }
 
+    // Public Firestore reads disabled on raw question docs so legacy embedded keys cannot leak;
+    // sanitized questions are served via the trusted backend /api/questions endpoint.
+    // Verified Owner Admin can read/write directly in Firestore.
     match /questions/{questionId} {
-      allow read: if true;
-      allow write: if isOwnerAccount() || isAdmin();
+      allow read, write: if isOwnerAccount();
+    }
+
+    // Dedicated restricted answer key & explanation collections (backend + Owner Admin only)
+    match /questionKeys/{questionId} {
+      allow read, write: if isOwnerAccount();
     }
 
     match /previous_questions/{questionId} {
-      allow read: if true;
-      allow write: if isOwnerAccount() || isAdmin();
+      allow read, write: if isOwnerAccount();
+    }
+
+    match /previousQuestionKeys/{questionId} {
+      allow read, write: if isOwnerAccount();
     }
 
     // ---------------------------------------------------------
-    // 7. EXAM ATTEMPTS & RESULTS
+    // 7. EXAM ATTEMPTS & RESULTS (Trusted Backend / Owner Only Writes)
     // ---------------------------------------------------------
+    // Students cannot forge examResults, alter scores, or bypass server scoring.
     match /examAttempts/{attemptId} {
-      allow read: if isOwner(resource.data.userId) || isAdmin();
-      allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
-      allow update: if (isOwner(resource.data.userId) && request.resource.data.userId == request.auth.uid) || isAdmin();
-      allow delete: if isOwnerAccount() || isAdmin();
+      allow read: if isOwner(resource.data.userId) || isOwnerAccount();
+      allow create, update, delete: if isOwnerAccount();
     }
 
     match /examResults/{resultId} {
-      allow read: if isOwner(resource.data.userId) || isAdmin();
-      // Validates finalScore (standard model) and score (compat), and totalQuestions boundaries
-      allow create: if isAuthenticated() && 
-                    request.resource.data.userId == request.auth.uid && 
-                    request.resource.data.totalQuestions is number &&
-                    request.resource.data.totalQuestions <= 200 &&
-                    (('finalScore' in request.resource.data && request.resource.data.finalScore is number && 
-                      request.resource.data.finalScore <= request.resource.data.totalQuestions && 
-                      request.resource.data.finalScore >= -50) ||
-                     ('score' in request.resource.data && request.resource.data.score is number && 
-                      request.resource.data.score <= request.resource.data.totalQuestions && 
-                      request.resource.data.score >= -50));
-      allow update: if isOwnerAccount() || isAdmin();
-      allow delete: if isOwnerAccount() || isAdmin();
+      allow read: if isOwner(resource.data.userId) || isOwnerAccount();
+      allow create, update, delete: if isOwnerAccount();
     }
 
     // ---------------------------------------------------------
-    // 8. LEADERBOARD (Public merit list)
+    // 8. LEADERBOARD (Public merit list; Server-Authoritative Writes)
     // ---------------------------------------------------------
     match /leaderboard/{entryId} {
       allow read: if true;
-      // Validates both totalMarks (standard LeaderboardEntry) and totalQuestions (compat)
-      allow create: if isAuthenticated() && 
-                    request.resource.data.userId == request.auth.uid && 
-                    request.resource.data.score is number &&
-                    request.resource.data.score >= -50 &&
-                    request.resource.data.score <= 100 &&
-                    (('totalMarks' in request.resource.data && request.resource.data.totalMarks is number) ||
-                     ('totalQuestions' in request.resource.data && request.resource.data.totalQuestions is number));
-      allow update: if isOwnerAccount() || (
-        isOwner(resource.data.userId) && 
-        request.resource.data.userId == request.auth.uid &&
-        request.resource.data.score is number &&
-        request.resource.data.score <= 100
-      );
-      allow delete: if isOwnerAccount() || isAdmin();
+      allow create, update, delete: if isOwnerAccount();
     }
 
     // ---------------------------------------------------------
@@ -208,17 +204,17 @@ service cloud.firestore {
     // ---------------------------------------------------------
     match /packages/{packageId} {
       allow read: if true;
-      allow write: if isOwnerAccount() || isAdmin();
+      allow write: if isOwnerAccount();
     }
 
     match /config/{configId} {
       allow read: if true;
-      allow write: if isOwnerAccount() || isAdmin();
+      allow write: if isOwnerAccount();
     }
 
     match /auditLogs/{logId} {
-      allow read: if isAdmin();
-      allow create: if isAuthenticated();
+      allow read: if isOwnerAccount() || isAdmin();
+      allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
       allow update, delete: if isOwnerAccount();
     }
   }
