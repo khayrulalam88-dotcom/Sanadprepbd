@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useApp } from '../context/AppContext';
 import { 
   Users, 
@@ -44,9 +44,7 @@ import { Question, QuestionDifficulty, QuestionStatus, Exam, SubscriptionPackage
 import { BulkImportModal } from './BulkImportModal';
 import { EditUserModal, EditableUserData } from './EditUserModal';
 import { AdminCreateExamModal } from './AdminCreateExamModal';
-import { PreviousQuestionsAdminManager } from './PreviousQuestionsAdminManager';
 import { auth, OWNER_ADMIN_UID, OWNER_ADMIN_EMAIL, isVerifiedOwnerAccount } from '../lib/firebase';
-import { checkIsAdminInFirestore } from '../lib/firestoreService';
 
 export const AdminPanel: React.FC = () => {
   const { 
@@ -86,7 +84,7 @@ export const AdminPanel: React.FC = () => {
     examResults
   } = useApp();
 
-  const [activeTab, setActiveTab] = useState<'overview' | 'packages' | 'subscribers' | 'payments' | 'questions' | 'exams' | 'sessions' | 'audit' | 'previous_questions'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'packages' | 'subscribers' | 'payments' | 'questions' | 'exams' | 'sessions' | 'audit'>('overview');
 
   // 8 Authoritative Admin Overview Metrics (Section 5 Requirement)
   const totalStudents = React.useMemo(() => {
@@ -94,7 +92,7 @@ export const AdminPanel: React.FC = () => {
     subscriptions.forEach(s => s.userId && studentIds.add(s.userId));
     paymentRequests.forEach(p => p.userId && studentIds.add(p.userId));
     examResults.forEach(r => r.userId && studentIds.add(r.userId));
-    return Math.max(studentIds.size, 1);
+    return studentIds.size;
   }, [subscriptions, paymentRequests, examResults]);
 
   const activeSubscribers = React.useMemo(() => {
@@ -221,6 +219,28 @@ export const AdminPanel: React.FC = () => {
   const [paymentFilter, setPaymentFilter] = useState<'all' | 'pending' | 'approved' | 'rejected'>('all');
   const [paymentSearch, setPaymentSearch] = useState<string>('');
   const [paymentActionError, setPaymentActionError] = useState<string>('');
+  const [adminActionError, setAdminActionError] = useState<string>('');
+  const [adminActionSuccess, setAdminActionSuccess] = useState<string>('');
+  const [questionModalError, setQuestionModalError] = useState<string>('');
+  const [isSavingQuestion, setIsSavingQuestion] = useState<boolean>(false);
+  const [savingPackageId, setSavingPackageId] = useState<string | null>(null);
+  const [packageDrafts, setPackageDrafts] = useState<Record<string, { price: number; durationDays: number }>>(() => {
+    const initial: Record<string, { price: number; durationDays: number }> = {};
+    packages.forEach(p => {
+      initial[p.id] = { price: p.price, durationDays: p.durationDays || 90 };
+    });
+    return initial;
+  });
+
+  useEffect(() => {
+    setPackageDrafts(prev => {
+      const next: Record<string, { price: number; durationDays: number }> = { ...prev };
+      packages.forEach(p => {
+        next[p.id] = { price: p.price, durationDays: p.durationDays || 90 };
+      });
+      return next;
+    });
+  }, [packages]);
 
   // Subscribers filter
   const [subscriberFilter, setSubscriberFilter] = useState<'all' | 'active' | 'expired'>('all');
@@ -245,39 +265,68 @@ export const AdminPanel: React.FC = () => {
   const isQuestionManager = currentUser.role === 'question_manager' || isAdmin;
 
   // Save Exam Date Config
-  const handleSaveExamDateConfig = (e: React.FormEvent) => {
+  const handleSaveExamDateConfig = async (e: React.FormEvent) => {
     e.preventDefault();
-    const formattedIso = new Date(targetExamDateInput).toISOString();
-    updateExamDateConfig({
+    setAdminActionError('');
+    setAdminActionSuccess('');
+    setExamConfigSaved(false);
+    const parsedDate = new Date(targetExamDateInput);
+    if (Number.isNaN(parsedDate.getTime())) {
+      setAdminActionError(t('সঠিক পরীক্ষার তারিখ নির্বাচন করুন।', 'Please provide a valid target exam date.'));
+      return;
+    }
+    const formattedIso = parsedDate.toISOString();
+    const res = await updateExamDateConfig({
       targetExamDate: formattedIso,
       examDatePolicy: examPolicyInput,
       examPassPrice: Number(examPassPriceInput)
     });
+    if (!res.success) {
+      setAdminActionError(res.error || t('পরীক্ষার তারিখ কনফিগ সেভ ব্যর্থ হয়েছে।', 'Failed to save exam date configuration.'));
+      return;
+    }
     setExamConfigSaved(true);
+    setAdminActionSuccess(t('পরীক্ষার তারিখ ও নীতি সফলভাবে সংরক্ষিত হয়েছে।', 'Exam date configuration saved.'));
     setTimeout(() => setExamConfigSaved(false), 3000);
   };
 
   // Handle saving payment numbers
-  const handleSavePaymentSettings = (e: React.FormEvent) => {
+  const handleSavePaymentSettings = async (e: React.FormEvent) => {
     e.preventDefault();
-    updatePaymentSettings({
+    setAdminActionError('');
+    setAdminActionSuccess('');
+    setSettingsSavedSuccess(false);
+    const res = await updatePaymentSettings({
       bkashNumber: editBkash.trim() || '01712607777',
       nagadNumber: editNagad.trim() || '01712607777'
     });
+    if (!res.success) {
+      setAdminActionError(res.error || t('পেমেন্ট নম্বর সংরক্ষণ ব্যর্থ হয়েছে।', 'Failed to save payment settings.'));
+      return;
+    }
     setSettingsSavedSuccess(true);
+    setAdminActionSuccess(t('পেমেন্ট নম্বর সফলভাবে আপডেট হয়েছে।', 'Payment settings updated.'));
     setTimeout(() => {
       setSettingsSavedSuccess(false);
     }, 3000);
   };
 
   // Handle saving WhatsApp Support settings
-  const handleSaveSupportSettings = (e: React.FormEvent) => {
+  const handleSaveSupportSettings = async (e: React.FormEvent) => {
     e.preventDefault();
-    updateSupportSettings({
+    setAdminActionError('');
+    setAdminActionSuccess('');
+    setSupportSavedSuccess(false);
+    const res = await updateSupportSettings({
       whatsappNumber: editWhatsApp.trim() || '+8801671819027',
       whatsappMessage: editWhatsAppMsg.trim() || 'Hello Sanad Prep BD Support, I need help with my account or subscription.'
     });
+    if (!res.success) {
+      setAdminActionError(res.error || t('সাপোর্ট সেটিংস সংরক্ষণ ব্যর্থ হয়েছে।', 'Failed to save support settings.'));
+      return;
+    }
     setSupportSavedSuccess(true);
+    setAdminActionSuccess(t('হোয়াটসঅ্যাপ সাপোর্ট সেটিংস আপডেট হয়েছে।', 'Support settings updated.'));
     setTimeout(() => {
       setSupportSavedSuccess(false);
     }, 3000);
@@ -292,38 +341,73 @@ export const AdminPanel: React.FC = () => {
     }
   };
 
+  // Package save handler
+  const handleSavePackage = async (pkg: SubscriptionPackage) => {
+    const draft = packageDrafts[pkg.id] || { price: pkg.price, durationDays: pkg.durationDays || 90 };
+    setAdminActionError('');
+    setAdminActionSuccess('');
+    setSavingPackageId(pkg.id);
+    try {
+      const res = await updatePackage({
+        id: pkg.id,
+        price: Number(draft.price),
+        ...(pkg.validityType === 'days' ? { durationDays: Number(draft.durationDays) } : {})
+      });
+      if (!res.success) {
+        setAdminActionError(res.error || t('প্যাকেজ আপডেট ব্যর্থ হয়েছে।', 'Failed to update package.'));
+        return;
+      }
+      setAdminActionSuccess(t(`প্যাকেজ (${pkg.nameBn}) সফলভাবে আপডেট হয়েছে।`, `Package "${pkg.nameEn}" updated.`));
+    } finally {
+      setSavingPackageId(null);
+    }
+  };
+
   // Question form submit
-  const handleCreateQuestion = (e: React.FormEvent) => {
+  const handleCreateQuestion = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSavingQuestion) return;
+    setQuestionModalError('');
     if (!newQuestionBn.trim() || !newOptionsBn[0].trim()) {
-      alert(t('অনুগ্রহ করে প্রশ্নের বিবরণ ও অপশনসমূহ পূরণ করুন', 'Please provide question text and options'));
+      setQuestionModalError(t('অনুগ্রহ করে প্রশ্নের বিবরণ ও অপশনসমূহ পূরণ করুন', 'Please provide question text and options'));
       return;
     }
 
-    addQuestion({
-      subjectId: newSubjectId,
-      questionBn: newQuestionBn,
-      questionEn: newQuestionEn || newQuestionBn,
-      optionsBn: newOptionsBn,
-      optionsEn: newOptionsEn[0] ? newOptionsEn : newOptionsBn,
-      correctOptionIndex: newCorrectOptionIndex,
-      explanationBn: newExplanationBn,
-      explanationEn: newExplanationEn || newQuestionBn,
-      legalReference: newLegalReference,
-      difficulty: newDifficulty,
-      status: newStatus,
-      isDemoSample: true
-    });
+    setIsSavingQuestion(true);
+    try {
+      const res = await addQuestion({
+        subjectId: newSubjectId,
+        questionBn: newQuestionBn,
+        questionEn: newQuestionEn || newQuestionBn,
+        optionsBn: newOptionsBn,
+        optionsEn: newOptionsEn[0] ? newOptionsEn : newOptionsBn,
+        correctOptionIndex: newCorrectOptionIndex,
+        explanationBn: newExplanationBn,
+        explanationEn: newExplanationEn || newExplanationBn,
+        legalReference: newLegalReference,
+        difficulty: newDifficulty,
+        status: newStatus,
+        isDemoSample: true
+      });
 
-    // Reset form
-    setNewQuestionBn('');
-    setNewQuestionEn('');
-    setNewOptionsBn(['', '', '', '']);
-    setNewOptionsEn(['', '', '', '']);
-    setNewExplanationBn('');
-    setNewExplanationEn('');
-    setNewLegalReference('');
-    setShowAddQuestionModal(false);
+      if (!res.success) {
+        setQuestionModalError(res.error || t('প্রশ্ন সংরক্ষণ ব্যর্থ হয়েছে।', 'Failed to save question.'));
+        return;
+      }
+
+      // Reset form only on authoritative backend success
+      setNewQuestionBn('');
+      setNewQuestionEn('');
+      setNewOptionsBn(['', '', '', '']);
+      setNewOptionsEn(['', '', '', '']);
+      setNewExplanationBn('');
+      setNewExplanationEn('');
+      setNewLegalReference('');
+      setShowAddQuestionModal(false);
+      setAdminActionSuccess(t('নতুন প্রশ্ন সফলভাবে ডাটাবেজে সংরক্ষিত হয়েছে।', 'Question saved to backend.'));
+    } finally {
+      setIsSavingQuestion(false);
+    }
   };
 
   // Filter questions
@@ -416,9 +500,7 @@ export const AdminPanel: React.FC = () => {
       }
 
       const fbUser = auth?.currentUser;
-      const isVerifiedAdmin = fbUser && isVerifiedOwnerAccount(fbUser)
-        ? await checkIsAdminInFirestore(fbUser.uid)
-        : false;
+      const isVerifiedAdmin = Boolean(fbUser && isVerifiedOwnerAccount(fbUser));
       if (!isVerifiedAdmin) {
         setAdminLoginError(t('আপনার অ্যাকাউন্টে অ্যাডমিন অনুমতি নেই।', 'This account does not have verified administrator privileges.'));
         return;
@@ -443,9 +525,7 @@ export const AdminPanel: React.FC = () => {
         return;
       }
       const fbUser = auth?.currentUser;
-      const isVerifiedAdmin = fbUser && isVerifiedOwnerAccount(fbUser)
-        ? await checkIsAdminInFirestore(fbUser.uid)
-        : false;
+      const isVerifiedAdmin = Boolean(fbUser && isVerifiedOwnerAccount(fbUser));
       if (!isVerifiedAdmin) {
         setAdminLoginError(t('শুধুমাত্র অনুমোদিত সুপার অ্যাডমিন প্রবেশ করতে পারবেন।', 'Access restricted to verified Super Administrator only.'));
         return;
@@ -712,18 +792,6 @@ export const AdminPanel: React.FC = () => {
           </button>
         )}
 
-        {isQuestionManager && (
-          <button
-            onClick={() => setActiveTab('previous_questions')}
-            className={`px-4 py-2 rounded-xl text-xs sm:text-sm font-bold transition whitespace-nowrap flex items-center gap-1.5 cursor-pointer ${
-              activeTab === 'previous_questions' ? 'bg-[#102A43] text-white shadow-xs' : 'text-slate-600 hover:bg-slate-100'
-            }`}
-          >
-            <FileSpreadsheet className="w-4 h-4 text-emerald-400" />
-            <span>{t('বিগত সালের প্রশ্ন ও CSV', 'Previous Qs & CSV')}</span>
-          </button>
-        )}
-
         {isAdmin && (
           <button
             onClick={() => setActiveTab('audit')}
@@ -736,6 +804,38 @@ export const AdminPanel: React.FC = () => {
           </button>
         )}
       </div>
+
+      {adminActionError && (
+        <div className="p-3.5 rounded-2xl bg-rose-50 border border-rose-200 text-rose-800 text-xs sm:text-sm font-semibold flex items-center justify-between gap-3">
+          <span className="flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+            <span>{adminActionError}</span>
+          </span>
+          <button
+            type="button"
+            onClick={() => setAdminActionError('')}
+            className="text-rose-700 hover:text-rose-900 font-bold cursor-pointer"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
+      {adminActionSuccess && (
+        <div className="p-3.5 rounded-2xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-xs sm:text-sm font-semibold flex items-center justify-between gap-3">
+          <span className="flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+            <span>{adminActionSuccess}</span>
+          </span>
+          <button
+            type="button"
+            onClick={() => setAdminActionSuccess('')}
+            className="text-emerald-700 hover:text-emerald-900 font-bold cursor-pointer"
+          >
+            ✕
+          </button>
+        </div>
+      )}
 
       {/* TAB 1: Overview */}
       {activeTab === 'overview' && (
@@ -1168,8 +1268,17 @@ export const AdminPanel: React.FC = () => {
                         <input
                           type="number"
                           className="w-16 px-1.5 py-1 border rounded text-xs font-mono font-bold"
-                          value={pkg.durationDays || 90}
-                          onChange={(e) => updatePackage({ id: pkg.id, durationDays: Number(e.target.value) })}
+                          value={packageDrafts[pkg.id]?.durationDays ?? pkg.durationDays ?? 90}
+                          onChange={(e) => {
+                            const val = Number(e.target.value);
+                            setPackageDrafts(prev => ({
+                              ...prev,
+                              [pkg.id]: {
+                                price: prev[pkg.id]?.price ?? pkg.price,
+                                durationDays: val
+                              }
+                            }));
+                          }}
                         />
                       </div>
                     )}
@@ -1179,10 +1288,28 @@ export const AdminPanel: React.FC = () => {
                       <input
                         type="number"
                         className="w-20 px-1.5 py-1 border rounded text-xs font-mono font-bold"
-                        value={pkg.price}
-                        onChange={(e) => updatePackage({ id: pkg.id, price: Number(e.target.value) })}
+                        value={packageDrafts[pkg.id]?.price ?? pkg.price}
+                        onChange={(e) => {
+                          const val = Number(e.target.value);
+                          setPackageDrafts(prev => ({
+                            ...prev,
+                            [pkg.id]: {
+                              price: val,
+                              durationDays: prev[pkg.id]?.durationDays ?? pkg.durationDays ?? 90
+                            }
+                          }));
+                        }}
                       />
                     </div>
+
+                    <button
+                      type="button"
+                      disabled={savingPackageId === pkg.id}
+                      onClick={() => void handleSavePackage(pkg)}
+                      className="px-2.5 py-1 rounded-lg bg-[#102A43] hover:bg-[#243B53] disabled:opacity-60 text-[#D4AF37] text-xs font-bold cursor-pointer shrink-0"
+                    >
+                      {savingPackageId === pkg.id ? t('সেভ হচ্ছে...', 'Saving...') : t('সেভ', 'Save')}
+                    </button>
                   </div>
                 </div>
               ))}
@@ -1306,8 +1433,8 @@ export const AdminPanel: React.FC = () => {
                             userId: sub.userId,
                             subscriptionId: sub.id,
                             name: sub.studentName,
-                            email: sub.userId === currentUser.uid ? currentUser.email : `${sub.studentPhone.replace(/[^0-9]/g, '')}@student.sanadprep.com`,
-                            phone: sub.studentPhone,
+                            email: sub.userId === currentUser.uid ? currentUser.email : '',
+                            phone: sub.studentPhone || '',
                             role: sub.userId === OWNER_ADMIN_UID ? 'admin' : 'student',
                             subscriptionStatus: !isExpired ? 'pro' : 'expired',
                             packageId: sub.packageId,
@@ -1696,10 +1823,10 @@ export const AdminPanel: React.FC = () => {
                       userId: currentUser.uid,
                       name: currentUser.name,
                       email: currentUser.email,
-                      phone: currentUser.phone || '01711000000',
+                      phone: currentUser.phone || '',
                       role: currentUser.role,
                       subscriptionStatus: currentUser.subscriptionStatus,
-                      packageId: targetSub?.packageId || (currentUser.subscriptionStatus === 'pro' ? 'pro_mock_pass_90d' : 'free_tier'),
+                      packageId: targetSub?.packageId || (currentUser.subscriptionStatus === 'pro' ? 'pkg_pro_mock' : 'free_tier'),
                       expiresAt: targetSub?.expiresAt || new Date(Date.now() + 90 * 86400000).toISOString(),
                       isSessionRevoked: isSessionRevoked,
                     });
@@ -1902,7 +2029,17 @@ export const AdminPanel: React.FC = () => {
 
                   <div className="flex items-center gap-2 shrink-0">
                     <button
-                      onClick={() => deleteQuestion(q.id)}
+                      type="button"
+                      onClick={async () => {
+                        setAdminActionError('');
+                        setAdminActionSuccess('');
+                        const res = await deleteQuestion(q.id);
+                        if (!res.success) {
+                          setAdminActionError(res.error || t('প্রশ্ন মুছে ফেলতে ব্যর্থ হয়েছে।', 'Failed to delete question.'));
+                        } else {
+                          setAdminActionSuccess(t('প্রশ্ন মুছে ফেলা হয়েছে।', 'Question deleted.'));
+                        }
+                      }}
                       className="p-2 rounded-lg text-rose-600 hover:bg-rose-50 border border-rose-200 transition cursor-pointer"
                       title="Delete Question"
                     >
@@ -1992,8 +2129,14 @@ export const AdminPanel: React.FC = () => {
               <button
                 type="button"
                 onClick={async () => {
+                  setAdminActionError('');
+                  setAdminActionSuccess('');
                   const res = await generateAndSync30ModelTests();
-                  alert(res.message);
+                  if (!res.success) {
+                    setAdminActionError(res.message);
+                  } else {
+                    setAdminActionSuccess(res.message);
+                  }
                 }}
                 className="px-4 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-[#102A43] border border-slate-300 text-xs font-bold transition flex items-center gap-1.5 shrink-0 cursor-pointer"
               >
@@ -2189,8 +2332,13 @@ export const AdminPanel: React.FC = () => {
                             />
                             <button
                               type="button"
-                              onClick={() => {
-                                toggleExamStatus(ex.id, ex.isActive, scheduledDateInput || undefined);
+                              onClick={async () => {
+                                setAdminActionError('');
+                                const res = await toggleExamStatus(ex.id, ex.isActive, scheduledDateInput || undefined);
+                                if (!res.success) {
+                                  setAdminActionError(res.error || t('পরীক্ষার তারিখ আপডেট ব্যর্থ হয়েছে।', 'Failed to update exam schedule.'));
+                                  return;
+                                }
                                 setEditingExamDateId(null);
                               }}
                               className="px-3 py-1.5 bg-[#102A43] text-[#D4AF37] font-bold text-xs rounded-lg cursor-pointer"
@@ -2220,7 +2368,13 @@ export const AdminPanel: React.FC = () => {
                         {/* Toggle Active / Inactive */}
                         <button
                           type="button"
-                          onClick={() => toggleExamStatus(ex.id, !isLive)}
+                          onClick={async () => {
+                            setAdminActionError('');
+                            const res = await toggleExamStatus(ex.id, !isLive);
+                            if (!res.success) {
+                              setAdminActionError(res.error || t('পরীক্ষার স্ট্যাটাস পরিবর্তন ব্যর্থ হয়েছে।', 'Failed to update exam status.'));
+                            }
+                          }}
                           className={`px-3 py-1.5 rounded-xl font-bold text-xs transition cursor-pointer flex items-center gap-1.5 shadow-xs ${
                             isLive
                               ? 'bg-rose-100 hover:bg-rose-200 text-rose-800 border border-rose-300'
@@ -2249,9 +2403,13 @@ export const AdminPanel: React.FC = () => {
                         {/* Free / Paid Toggle */}
                         <button
                           type="button"
-                          onClick={() => {
+                          onClick={async () => {
+                            setAdminActionError('');
                             const updatedExam: Exam = { ...ex, isPaid: !ex.isPaid };
-                            updateExam(updatedExam);
+                            const res = await updateExam(updatedExam);
+                            if (!res.success) {
+                              setAdminActionError(res.error || t('পরীক্ষার এক্সেস আপডেট ব্যর্থ হয়েছে।', 'Failed to update exam tier.'));
+                            }
                           }}
                           className="px-2.5 py-1.5 rounded-xl text-xs font-bold bg-slate-100 hover:bg-[#102A43] hover:text-[#D4AF37] border border-slate-300 transition cursor-pointer"
                           title={ex.isPaid ? t('ফ্রি করে দিন', 'Make Free') : t('পেইড করে দিন', 'Make Paid')}
@@ -2285,11 +2443,6 @@ export const AdminPanel: React.FC = () => {
             ))}
           </div>
         </div>
-      )}
-
-      {/* TAB 9: Previous Questions & CSV Bulk Importer */}
-      {activeTab === 'previous_questions' && (
-        <PreviousQuestionsAdminManager />
       )}
 
       {/* Rejection Modal */}
@@ -2355,6 +2508,11 @@ export const AdminPanel: React.FC = () => {
             </div>
 
             <form onSubmit={handleCreateQuestion} className="space-y-4 text-xs sm:text-sm">
+              {questionModalError && (
+                <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 font-semibold text-xs">
+                  {questionModalError}
+                </div>
+              )}
               <div>
                 <label className="font-semibold text-slate-700 block mb-1">{t('বিষয় (Subject)', 'Subject')}</label>
                 <select
@@ -2450,9 +2608,10 @@ export const AdminPanel: React.FC = () => {
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2 rounded-xl bg-[#102A43] hover:bg-[#243B53] text-[#D4AF37] border border-[#D4AF37] font-bold"
+                  disabled={isSavingQuestion}
+                  className="px-5 py-2 rounded-xl bg-[#102A43] hover:bg-[#243B53] disabled:opacity-60 text-[#D4AF37] border border-[#D4AF37] font-bold"
                 >
-                  {t('সংরক্ষণ করুন', 'Save Question')}
+                  {isSavingQuestion ? t('সংরক্ষণ হচ্ছে...', 'Saving...') : t('সংরক্ষণ করুন', 'Save Question')}
                 </button>
               </div>
             </form>

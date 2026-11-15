@@ -62,11 +62,12 @@ export const OWNER_ADMIN_UID = 'PjBRV7LAQ8cIwOdM3z474A16dWg2';
 export const OWNER_ADMIN_EMAIL = 'khayrulalam88@gmail.com';
 
 export function isVerifiedOwnerAccount(
-  user?: { uid?: string | null; email?: string | null } | null
+  user?: { uid?: string | null; email?: string | null; emailVerified?: boolean | null } | null
 ): boolean {
-  if (!user || !user.uid) return false;
+  if (!user || !user.uid || !user.email) return false;
   if (user.uid !== OWNER_ADMIN_UID) return false;
-  if (user.email && user.email.toLowerCase().trim() !== OWNER_ADMIN_EMAIL) return false;
+  if (user.email.toLowerCase().trim() !== OWNER_ADMIN_EMAIL) return false;
+  if (user.emailVerified !== true) return false;
   return true;
 }
 

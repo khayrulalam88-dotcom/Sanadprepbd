@@ -1,9 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import type { Question, Exam, PreviousQuestion } from '../src/types/index.ts';
+import type { Question, Exam } from '../src/types/index.ts';
 import { generate30ModelTests } from '../src/utils/modelTestGenerator.ts';
-import { INITIAL_PREVIOUS_QUESTIONS } from '../src/data/initialPreviousQuestions.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -26,11 +25,7 @@ fs.mkdirSync(serverDataDir, { recursive: true });
 const serverQbPath = path.resolve(serverDataDir, 'questionBankFull.json');
 fs.writeFileSync(serverQbPath, JSON.stringify(allFullQuestions, null, 2), 'utf-8');
 
-// 2. Write full authoritative Previous Questions bank (ONLY on server)
-const serverPqPath = path.resolve(serverDataDir, 'previousQuestionsFull.json');
-fs.writeFileSync(serverPqPath, JSON.stringify(INITIAL_PREVIOUS_QUESTIONS, null, 2), 'utf-8');
-
-// 3. Write compact Exam Metadata (IDs + titles + questionIds, NO question text or answers!)
+// 2. Write compact Exam Metadata (IDs + titles + questionIds, NO question text or answers!)
 const modelTests30: Exam[] = generate30ModelTests(allFullQuestions);
 const subjectPracticeTests: Exam[] = [
   {
@@ -105,20 +100,5 @@ fs.writeFileSync(
   'utf-8'
 );
 
-// 4. Write sanitized Previous Questions list (NO correctAnswer, NO explanation)
-const sanitizedPrevious: PreviousQuestion[] = INITIAL_PREVIOUS_QUESTIONS.map(pq => ({
-  id: pq.id,
-  year: pq.year,
-  subject: pq.subject,
-  question: pq.question,
-  options: pq.options,
-  legalSection: pq.legalSection,
-  source: pq.source
-}));
-const sanitizedPqPath = path.resolve(rootDir, 'src/data/sanitizedPreviousQuestions.json');
-fs.writeFileSync(sanitizedPqPath, JSON.stringify(sanitizedPrevious, null, 2), 'utf-8');
-
 console.log(`Extracted ${allFullQuestions.length} full MCQs -> ${serverQbPath}`);
-console.log(`Extracted ${INITIAL_PREVIOUS_QUESTIONS.length} previous questions -> ${serverPqPath}`);
 console.log(`Wrote exam metadata (${modelTests30.length} model + ${subjectPracticeTests.length} subject) -> ${examsMetaPath}`);
-console.log(`Wrote sanitized previous questions -> ${sanitizedPqPath}`);

@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, ReactNode, useCallback } from 'react';
+import React, { createContext, useContext, useState, useEffect, useRef, ReactNode, useCallback } from 'react';
 import { 
   Language, 
   UserProfile, 
@@ -18,17 +18,22 @@ import {
   StudentSession,
   SubjectPracticeProgress,
   AnsweredQuestionRecord,
-  LeaderboardEntry,
-  PreviousQuestion,
-  PreviousExamResult
+  LeaderboardEntry
 } from '../types';
 import { INITIAL_SUBJECTS, INITIAL_QUESTIONS } from '../data/mockData';
-import { INITIAL_EXAMS, SUBJECT_PRACTICE_TESTS } from '../data/initialExams';
+import { INITIAL_EXAMS } from '../data/initialExams';
 import { INITIAL_PACKAGES, INITIAL_EXAM_DATE_CONFIG } from '../data/initialPackages';
-import { INITIAL_LEADERBOARD_ENTRIES } from '../data/initialLeaderboard';
-import { INITIAL_PREVIOUS_QUESTIONS } from '../data/initialPreviousQuestions';
 import { generate30ModelTests } from '../utils/modelTestGenerator';
-import { signInWithPopup, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged } from 'firebase/auth';
+import {
+  signInWithPopup,
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  sendEmailVerification,
+  sendPasswordResetEmail,
+  reload,
+  signOut,
+  onAuthStateChanged
+} from 'firebase/auth';
 import {
   isFirebaseConnected,
   getFirebaseProjectDetails,
@@ -39,34 +44,25 @@ import {
 } from '../lib/firebase';
 import {
   fetchQuestionsFromFirestore,
-  saveQuestionToFirestore,
-  deleteQuestionFromFirestore,
   fetchExamsFromFirestore,
-  saveExamToFirestore,
   fetchPaymentRequestsFromFirestore,
-  savePaymentRequestToFirestore,
-  updatePaymentRequestStatusInFirestore,
   fetchSubscriptionsFromFirestore,
-  saveSubscriptionToFirestore,
   fetchExamResultsFromFirestore,
   fetchLeaderboardFromFirestore,
-  fetchPreviousQuestionsFromFirestore,
-  savePreviousQuestionToFirestore,
-  deletePreviousQuestionFromFirestore,
-  batchImportPreviousQuestionsToFirestore,
   fetchUserProfileFromFirestore,
-  checkIsAdminInFirestore,
   saveUserProfileToFirestore,
   updateUserRoleOrSubscriptionInFirestore
 } from '../lib/firestoreService';
 import {
   setApiSessionId,
   apiFetchPublicCatalog,
+  apiFetchExams,
   apiFetchLeaderboard,
   apiCreateSession,
+  apiCheckSessionStatus,
+  apiLogoutSession,
   apiFetchSanitizedQuestions,
   apiFetchAdminQuestions,
-  apiFetchAdminPreviousQuestions,
   apiCheckPracticeAnswer,
   apiStartExam,
   apiSaveExamAnswer,
@@ -78,7 +74,6 @@ import {
   apiRejectPaymentRequest,
   apiAdminSaveQuestion,
   apiAdminDeleteQuestion,
-  apiAdminSavePreviousQuestion,
   apiAdminSaveExam,
   apiAdminFetchSubscriptions,
   apiAdminUpdateUser,
@@ -87,6 +82,11 @@ import {
   apiAdminUpdatePaymentSettings,
   apiAdminUpdateSupportSettings
 } from '../lib/api';
+import {
+  submitPaymentViaAuthoritativeBackend,
+  executeAuthoritativeAdminApi,
+  formatBackendApiError
+} from '../lib/securityHelpers';
 
 interface AppContextType {
   language: Language;
@@ -103,18 +103,18 @@ interface AppContextType {
   examResults: ExamResult[];
   paymentRequests: PaymentRequest[];
   paymentSettings: PaymentSettings;
-  updatePaymentSettings: (settings: Partial<PaymentSettings>) => void;
+  updatePaymentSettings: (settings: Partial<PaymentSettings>) => Promise<{ success: boolean; error?: string }>;
   supportSettings: SupportContactSettings;
-  updateSupportSettings: (settings: Partial<SupportContactSettings>) => void;
+  updateSupportSettings: (settings: Partial<SupportContactSettings>) => Promise<{ success: boolean; error?: string }>;
   isFirebaseActive: boolean;
   firebaseProjectDetails: ReturnType<typeof getFirebaseProjectDetails>;
   auditLogs: AuditLog[];
   
   // Subscription Packages & Exam Date Config
   packages: SubscriptionPackage[];
-  updatePackage: (pkg: Partial<SubscriptionPackage> & { id: string }) => void;
+  updatePackage: (pkg: Partial<SubscriptionPackage> & { id: string }) => Promise<{ success: boolean; error?: string }>;
   examDateConfig: ExamDateConfig;
-  updateExamDateConfig: (config: Partial<ExamDateConfig>) => void;
+  updateExamDateConfig: (config: Partial<ExamDateConfig>) => Promise<{ success: boolean; error?: string }>;
   subscriptions: UserSubscription[];
   activeSubscription: UserSubscription | null;
   calculateDaysRemaining: (expiresAt?: string) => number;
@@ -138,19 +138,11 @@ interface AppContextType {
   isSessionRevoked: boolean;
   sessionRevokedReason: string;
   simulateConcurrentLogin: () => void;
-  recoverSession: () => void;
-  
+  recoverSession: () => Promise<boolean>;
+
   // Screen Navigation
-  activeScreen: 'landing' | 'dashboard' | 'exam' | 'practice' | 'result' | 'admin' | 'tests' | 'subjects' | 'history' | 'question_bank' | 'previous_questions';
-  setActiveScreen: (screen: 'landing' | 'dashboard' | 'exam' | 'practice' | 'result' | 'admin' | 'tests' | 'subjects' | 'history' | 'question_bank' | 'previous_questions') => void;
-  
-  // Previous Year Questions
-  previousQuestions: PreviousQuestion[];
-  selectedPreviousYear: number | 'all';
-  setSelectedPreviousYear: (year: number | 'all') => void;
-  savePreviousQuestion: (question: PreviousQuestion) => Promise<void>;
-  deletePreviousQuestion: (id: string) => Promise<void>;
-  batchImportPreviousQuestions: (questions: PreviousQuestion[]) => Promise<{ successCount: number; failureCount: number; errors: string[] }>;
+  activeScreen: 'landing' | 'dashboard' | 'exam' | 'practice' | 'result' | 'admin' | 'tests' | 'subjects' | 'history' | 'question_bank';
+  setActiveScreen: (screen: 'landing' | 'dashboard' | 'exam' | 'practice' | 'result' | 'admin' | 'tests' | 'subjects' | 'history' | 'question_bank') => void;
 
   // Exams & Custom Model Test
   activeAttempt: ExamAttempt | null;
@@ -196,12 +188,12 @@ interface AppContextType {
   getSubjectProgress: (subjectId: string) => SubjectPracticeProgress;
   
   // Questions & Exams CRUD
-  addQuestion: (q: Omit<Question, 'id' | 'createdAt' | 'updatedAt'>) => void;
-  updateQuestion: (q: Question) => void;
-  deleteQuestion: (id: string) => void;
-  addExam: (exam: Omit<Exam, 'id' | 'createdAt'>) => void;
-  updateExam: (exam: Exam) => void;
-  toggleExamStatus: (examId: string, isActive?: boolean, scheduledDate?: string) => void;
+  addQuestion: (q: Omit<Question, 'id' | 'createdAt' | 'updatedAt'>) => Promise<{ success: boolean; error?: string }>;
+  updateQuestion: (q: Question) => Promise<{ success: boolean; error?: string }>;
+  deleteQuestion: (id: string) => Promise<{ success: boolean; error?: string }>;
+  addExam: (exam: Omit<Exam, 'id' | 'createdAt'>) => Promise<{ success: boolean; exam?: Exam; error?: string }>;
+  updateExam: (exam: Exam) => Promise<{ success: boolean; error?: string }>;
+  toggleExamStatus: (examId: string, isActive?: boolean, scheduledDate?: string) => Promise<{ success: boolean; error?: string }>;
   generateAndSync30ModelTests: () => Promise<{ success: boolean; count: number; message: string }>;
   
   // Payment Flow
@@ -222,9 +214,18 @@ interface AppContextType {
   
   // UI Modals & Auth
   isLoggedIn: boolean;
+  isEmailVerified: boolean;
   isVerifiedAdmin: boolean;
   loginWithGoogle: () => Promise<{ success: boolean; error?: string }>;
-  loginWithEmail: (email: string, password: string, isSignUp?: boolean, candidateName?: string) => Promise<{ success: boolean; error?: string }>;
+  loginWithEmail: (
+    email: string,
+    password: string,
+    isSignUp?: boolean,
+    candidateName?: string
+  ) => Promise<{ success: boolean; needsEmailVerification?: boolean; error?: string }>;
+  resendVerificationEmail: () => Promise<{ success: boolean; error?: string }>;
+  refreshVerificationStatus: () => Promise<{ verified: boolean; error?: string }>;
+  sendPasswordReset: (email: string) => Promise<{ success: boolean; error?: string }>;
   getIdToken: () => Promise<string | null>;
   logoutUser: () => void;
   showLoginModal: boolean;
@@ -254,6 +255,37 @@ const LOCAL_STORAGE_KEY_EXAM_CONFIG = 'barprep_bd_exam_date_config';
 const LOCAL_STORAGE_KEY_EXAMS = 'sanadprep_bd_exams';
 const LOCAL_STORAGE_KEY_ANSWERED_QUESTIONS = 'sanadprep_answered_questions';
 const LOCAL_STORAGE_KEY_LEADERBOARD = 'sanadprep_bd_leaderboard';
+const LOCAL_STORAGE_KEY_ACTIVE_SESSION = 'sanadprep_active_session';
+
+function readStoredActiveSession(uid: string): string | null {
+  try {
+    const raw = localStorage.getItem(LOCAL_STORAGE_KEY_ACTIVE_SESSION);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { uid?: string; sessionId?: string };
+    if (parsed && parsed.uid === uid && typeof parsed.sessionId === 'string' && parsed.sessionId.trim()) {
+      return parsed.sessionId.trim();
+    }
+  } catch {
+    // ignore malformed localStorage state
+  }
+  return null;
+}
+
+function writeStoredActiveSession(uid: string, sessionId: string): void {
+  try {
+    localStorage.setItem(LOCAL_STORAGE_KEY_ACTIVE_SESSION, JSON.stringify({ uid, sessionId }));
+  } catch {
+    // ignore storage quota failures
+  }
+}
+
+function clearStoredActiveSession(): void {
+  try {
+    localStorage.removeItem(LOCAL_STORAGE_KEY_ACTIVE_SESSION);
+  } catch {
+    // ignore storage removal errors
+  }
+}
 
 const createGuestUserProfile = (): UserProfile => ({
   uid: '',
@@ -302,16 +334,23 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     return [];
   });
 
-  // Top Performers Leaderboard
+  // Top Performers Leaderboard (real exam submissions only — never pre-seeded mock entries)
   const [leaderboardEntries, setLeaderboardEntries] = useState<LeaderboardEntry[]>(() => {
     try {
       const saved = localStorage.getItem(LOCAL_STORAGE_KEY_LEADERBOARD);
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+        if (Array.isArray(parsed)) {
+          return parsed.filter(
+            (item: LeaderboardEntry) =>
+              item &&
+              typeof item.id === 'string' &&
+              !/^lead_(farhana|mahmud|nusrat|rakib|tanvir|sadia|imran|shamima)_/.test(item.id)
+          );
+        }
       }
     } catch (e) {}
-    return INITIAL_LEADERBOARD_ENTRIES;
+    return [];
   });
 
   // Packages (Monthly Pass, Pro Mock Pass, Exam Pass, Long Course Pass)
@@ -389,9 +428,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   ]);
 
-  const [activeScreen, setActiveScreen] = useState<'landing' | 'dashboard' | 'exam' | 'practice' | 'result' | 'admin' | 'tests' | 'subjects' | 'history' | 'question_bank' | 'previous_questions'>('landing');
-  const [selectedPreviousYear, setSelectedPreviousYear] = useState<number | 'all'>('all');
-  const [previousQuestions, setPreviousQuestions] = useState<PreviousQuestion[]>(INITIAL_PREVIOUS_QUESTIONS);
+  const [activeScreen, setActiveScreen] = useState<'landing' | 'dashboard' | 'exam' | 'practice' | 'result' | 'admin' | 'tests' | 'subjects' | 'history' | 'question_bank'>('landing');
   const [showCustomTestModal, setShowCustomTestModal] = useState<boolean>(false);
   const [activeAttempt, setActiveAttempt] = useState<ExamAttempt | null>(() => {
     try {
@@ -415,10 +452,16 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [isSubmittingExam, setIsSubmittingExam] = useState<boolean>(false);
 
   const [isLoggedIn, setIsLoggedIn] = useState<boolean>(false);
+  const [isEmailVerified, setIsEmailVerified] = useState<boolean>(false);
   const [isVerifiedAdmin, setIsVerifiedAdmin] = useState<boolean>(false);
   const [showLoginModal, setShowLoginModal] = useState<boolean>(false);
   const [showSearchModal, setShowSearchModal] = useState<boolean>(false);
   const [showInfoModal, setShowInfoModal] = useState<'about' | 'syllabus' | 'rules' | 'books' | null>(null);
+  const paymentSubmitLockRef = useRef<boolean>(false);
+  const explicitAuthInProgressRef = useRef<boolean>(false);
+  const activeSyncRef = useRef<{ uid: string; promise: Promise<void> } | null>(null);
+  const questionsLoadedModeRef = useRef<'none' | 'sanitized' | 'admin'>('none');
+  const questionsFetchInFlightRef = useRef<{ mode: 'sanitized' | 'admin'; promise: Promise<void> } | null>(null);
 
   // Student's Answered Questions Ledger for Subject Practice Completion Progress
   const [answeredQuestions, setAnsweredQuestions] = useState<Record<string, AnsweredQuestionRecord>>(() => {
@@ -443,114 +486,221 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   };
 
-  const syncAuthenticatedUserData = useCallback(
-    async (fbUser: { uid: string; email?: string | null; displayName?: string | null }, isAdmin: boolean) => {
-      const uid = fbUser.uid;
-      const isOwner = isVerifiedOwnerAccount(fbUser);
+  const ensureQuestionsLoaded = useCallback(async () => {
+    const fbUser = auth?.currentUser;
+    if (!fbUser || !fbUser.emailVerified) return;
 
+    const isOwner = isVerifiedOwnerAccount(fbUser);
+    const desiredMode: 'sanitized' | 'admin' = isOwner ? 'admin' : 'sanitized';
+
+    if (
+      questionsLoadedModeRef.current === desiredMode ||
+      (desiredMode === 'sanitized' && questionsLoadedModeRef.current === 'admin')
+    ) {
+      return;
+    }
+
+    if (questionsFetchInFlightRef.current?.mode === desiredMode) {
+      return questionsFetchInFlightRef.current.promise;
+    }
+
+    const isProdEnv = typeof import.meta !== 'undefined' && Boolean(import.meta.env?.PROD);
+
+    const runFetch = async () => {
       try {
-        // 1. Establish server session & active subscription check
-        const sessionRes = await apiCreateSession(
-          fbUser.displayName || undefined,
-          typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 80) : 'Web Browser'
-        );
-        if (sessionRes.ok && sessionRes.data) {
-          setCurrentSession(sessionRes.data.session);
-          setApiSessionId(sessionRes.data.sessionId);
-          setIsSessionRevoked(false);
-          setSessionRevokedReason('');
-        }
-
-        // 2. Fetch questions (Owner Admin gets full questions + keys; students get sanitized stems & options only)
         if (isOwner) {
-          const [adminQRes, adminPqRes] = await Promise.all([
-            apiFetchAdminQuestions(),
-            apiFetchAdminPreviousQuestions()
-          ]);
+          const adminQRes = await apiFetchAdminQuestions();
           if (adminQRes.ok && adminQRes.data?.questions?.length) {
             setQuestions(adminQRes.data.questions);
-          } else {
+            questionsLoadedModeRef.current = 'admin';
+          } else if (!isProdEnv) {
             const fsQ = await fetchQuestionsFromFirestore();
-            if (fsQ.length > 0) setQuestions(fsQ);
-          }
-          if (adminPqRes.ok && adminPqRes.data?.previousQuestions?.length) {
-            setPreviousQuestions(adminPqRes.data.previousQuestions);
-          } else {
-            const fsPq = await fetchPreviousQuestionsFromFirestore();
-            if (fsPq.length > 0) setPreviousQuestions(fsPq);
+            if (fsQ.length > 0) {
+              setQuestions(fsQ);
+              questionsLoadedModeRef.current = 'admin';
+            }
           }
         } else {
           const qRes = await apiFetchSanitizedQuestions();
           if (qRes.ok && qRes.data?.questions?.length) {
             setQuestions(qRes.data.questions);
+            questionsLoadedModeRef.current = 'sanitized';
           }
         }
-
-        // 3. Fetch payments, subscriptions, and exam results from BOTH Firestore & backend API
-        const [
-          fsPayments,
-          apiPaymentsRes,
-          fsSubs,
-          apiSubsRes,
-          fsResults,
-          apiResultsRes
-        ] = await Promise.all([
-          fetchPaymentRequestsFromFirestore(uid, isAdmin),
-          apiFetchPaymentRequests(),
-          fetchSubscriptionsFromFirestore(uid, isAdmin),
-          isOwner ? apiAdminFetchSubscriptions() : Promise.resolve(null),
-          fetchExamResultsFromFirestore(uid, isAdmin),
-          apiFetchExamResults(uid)
-        ]);
-
-        const payMap = new Map<string, PaymentRequest>();
-        (apiPaymentsRes.ok ? apiPaymentsRes.data?.paymentRequests || [] : []).forEach(p => payMap.set(p.id, p));
-        (fsPayments || []).forEach(p => payMap.set(p.id, p));
-        const mergedPayments = Array.from(payMap.values()).sort(
-          (a, b) => new Date(b.requestedAt).getTime() - new Date(a.requestedAt).getTime()
-        );
-        setPaymentRequests(mergedPayments);
-
-        const subMap = new Map<string, UserSubscription>();
-        (apiSubsRes?.ok ? apiSubsRes.data?.subscriptions || [] : []).forEach(s => subMap.set(s.id, s));
-        (fsSubs || []).forEach(s => subMap.set(s.id, s));
-        const mergedSubs = Array.from(subMap.values());
-        setSubscriptions(mergedSubs);
-
-        const resMap = new Map<string, ExamResult>();
-        (fsResults || []).forEach(r => resMap.set(r.id, r));
-        (apiResultsRes.ok ? apiResultsRes.data?.results || [] : []).forEach(r => resMap.set(r.id, r));
-        const mergedResults = Array.from(resMap.values()).sort(
-          (a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime()
-        );
-        setExamResults(mergedResults);
-
-        const hasActiveSub = mergedSubs.some(
-          s => s.userId === uid && s.status === 'active' && new Date(s.expiresAt).getTime() > Date.now()
-        );
-        if (hasActiveSub) {
-          setCurrentUser(prev => ({ ...prev, subscriptionStatus: 'pro' }));
-        }
-
-        const [apiCatalogExams, fsExams] = await Promise.all([
-          apiFetchPublicCatalog().then(([exRes]) => (exRes.ok ? exRes.data?.exams || [] : [])),
-          fetchExamsFromFirestore(hasActiveSub || isAdmin)
-        ]);
-        const examSource = apiCatalogExams.length > 0 ? apiCatalogExams : fsExams;
-        if (examSource && examSource.length > 0) {
-          setExams(prev => {
-            const map = new Map<string, Exam>();
-            examSource.forEach(e => map.set(e.id, e));
-            // Keep any freshly synced local exams not yet on server
-            prev.forEach(e => {
-              if (!map.has(e.id)) map.set(e.id, e);
-            });
-            return Array.from(map.values());
-          });
-        }
       } catch (err) {
-        console.warn('Post-login sync notice:', err);
+        console.warn('Lazy question bank load notice:', err);
       }
+    };
+
+    const promise = runFetch().finally(() => {
+      if (questionsFetchInFlightRef.current?.promise === promise) {
+        questionsFetchInFlightRef.current = null;
+      }
+    });
+    questionsFetchInFlightRef.current = { mode: desiredMode, promise };
+    return promise;
+  }, []);
+
+  const syncAuthenticatedUserData = useCallback(
+    async (
+      fbUser: { uid: string; email?: string | null; displayName?: string | null },
+      isAdmin: boolean,
+      opts?: { forceNewSession?: boolean }
+    ) => {
+      const uid = fbUser.uid;
+      if (!opts?.forceNewSession && activeSyncRef.current?.uid === uid) {
+        return activeSyncRef.current.promise;
+      }
+
+      const runSync = async () => {
+        const isOwner = isVerifiedOwnerAccount(fbUser);
+        const isProdEnv = typeof import.meta !== 'undefined' && Boolean(import.meta.env?.PROD);
+
+        try {
+          // 1. Validate existing session on page reload OR establish a fresh single-device session on explicit login
+          let activeSessData: {
+            session: StudentSession;
+            sessionId: string;
+            activeSubscription: UserSubscription | null;
+          } | null = null;
+          const storedSessionId = !opts?.forceNewSession ? readStoredActiveSession(uid) : null;
+
+          if (storedSessionId) {
+            setApiSessionId(storedSessionId);
+            const statusRes = await apiCheckSessionStatus();
+            if (statusRes.ok && statusRes.data?.active && statusRes.data.session) {
+              activeSessData = {
+                sessionId: storedSessionId,
+                session: statusRes.data.session,
+                activeSubscription: statusRes.data.activeSubscription ?? null
+              };
+            } else if (statusRes.code === 'SESSION_REVOKED') {
+              setApiSessionId(null);
+              clearStoredActiveSession();
+              setCurrentSession(null);
+              setIsSessionRevoked(true);
+              setSessionRevokedReason(
+                statusRes.message ||
+                  'একই অ্যাকাউন্ট অন্য ডিভাইস থেকে লগইন করা হয়েছে। নিরাপত্তা বিধির কারণে এই সেশনটি বন্ধ করা হয়েছে।'
+              );
+              return;
+            } else if (statusRes.code === 'SESSION_REQUIRED') {
+              setApiSessionId(null);
+              clearStoredActiveSession();
+              const recreated = await apiCreateSession(
+                fbUser.displayName || undefined,
+                typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 80) : 'Web Browser'
+              );
+              if (recreated.ok && recreated.data) {
+                activeSessData = {
+                  sessionId: recreated.data.sessionId,
+                  session: recreated.data.session,
+                  activeSubscription: recreated.data.activeSubscription ?? null
+                };
+              }
+            } else {
+              // Fail closed on backend/network unavailability without clobbering another active device
+              setApiSessionId(null);
+              setCurrentSession(null);
+              return;
+            }
+          } else {
+            const sessionRes = await apiCreateSession(
+              fbUser.displayName || undefined,
+              typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 80) : 'Web Browser'
+            );
+            if (sessionRes.ok && sessionRes.data) {
+              activeSessData = {
+                sessionId: sessionRes.data.sessionId,
+                session: sessionRes.data.session,
+                activeSubscription: sessionRes.data.activeSubscription ?? null
+              };
+            } else {
+              setApiSessionId(null);
+              clearStoredActiveSession();
+              setCurrentSession(null);
+              return;
+            }
+          }
+
+          if (!activeSessData) {
+            setApiSessionId(null);
+            setCurrentSession(null);
+            return;
+          }
+
+          setCurrentSession(activeSessData.session);
+          setApiSessionId(activeSessData.sessionId);
+          writeStoredActiveSession(uid, activeSessData.sessionId);
+          setIsSessionRevoked(false);
+          setSessionRevokedReason('');
+
+          // 2. Fetch payments, subscriptions (owner ledger or student active subscription from session),
+          //    exam results, and exams via authoritative backend APIs (avoiding redundant Firestore dual-reads).
+          //    The 3,000-question bank is lazy-loaded only when the user opens a question-bank/practice view.
+          const [apiPaymentsRes, apiSubsRes, apiResultsRes, apiExamsRes] = await Promise.all([
+            apiFetchPaymentRequests(),
+            isOwner ? apiAdminFetchSubscriptions() : Promise.resolve(null),
+            apiFetchExamResults(uid),
+            apiFetchExams()
+          ]);
+
+          const mergedPayments = apiPaymentsRes.ok
+            ? apiPaymentsRes.data?.paymentRequests || []
+            : (!isProdEnv ? await fetchPaymentRequestsFromFirestore(uid, isAdmin) : []);
+          mergedPayments.sort(
+            (a, b) => new Date(b.requestedAt).getTime() - new Date(a.requestedAt).getTime()
+          );
+          setPaymentRequests(mergedPayments);
+
+          const mergedSubs: UserSubscription[] = isOwner
+            ? (apiSubsRes?.ok
+                ? apiSubsRes.data?.subscriptions || []
+                : (!isProdEnv ? await fetchSubscriptionsFromFirestore(uid, isAdmin) : []))
+            : (activeSessData.activeSubscription ? [activeSessData.activeSubscription] : []);
+          setSubscriptions(mergedSubs);
+
+          const mergedResults = apiResultsRes.ok
+            ? apiResultsRes.data?.results || []
+            : (!isProdEnv ? await fetchExamResultsFromFirestore(uid, isAdmin) : []);
+          mergedResults.sort(
+            (a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime()
+          );
+          setExamResults(mergedResults);
+
+          const hasActiveSub = mergedSubs.some(
+            s => s.userId === uid && s.status === 'active' && new Date(s.expiresAt).getTime() > Date.now()
+          );
+          if (hasActiveSub) {
+            setCurrentUser(prev => ({ ...prev, subscriptionStatus: 'pro' }));
+          }
+
+          const examSource =
+            apiExamsRes.ok && apiExamsRes.data?.exams?.length
+              ? apiExamsRes.data.exams
+              : (!isProdEnv ? await fetchExamsFromFirestore(hasActiveSub || isAdmin) : []);
+          if (examSource && examSource.length > 0) {
+            setExams(prev => {
+              const map = new Map<string, Exam>();
+              examSource.forEach(e => map.set(e.id, e));
+              prev.forEach(e => {
+                if (!map.has(e.id)) map.set(e.id, e);
+              });
+              return Array.from(map.values());
+            });
+          }
+        } catch (err) {
+          console.warn('Post-login sync notice:', err);
+        }
+      };
+
+      const promise = runSync().finally(() => {
+        if (activeSyncRef.current?.promise === promise) {
+          activeSyncRef.current = null;
+        }
+      });
+      activeSyncRef.current = { uid, promise };
+      return promise;
     },
     []
   );
@@ -560,7 +710,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     password: string,
     isSignUp = false,
     candidateName?: string
-  ): Promise<{ success: boolean; error?: string }> => {
+  ): Promise<{ success: boolean; needsEmailVerification?: boolean; error?: string }> => {
+    explicitAuthInProgressRef.current = true;
     try {
       if (!auth) {
         return { success: false, error: 'Firebase Authentication is not available.' };
@@ -570,48 +721,65 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         ? await createUserWithEmailAndPassword(auth, trimmedEmail, password)
         : await signInWithEmailAndPassword(auth, trimmedEmail, password);
       const fbUser = userCredential.user;
+      if (isSignUp && !fbUser.emailVerified) {
+        await sendEmailVerification(fbUser).catch(err => console.warn('Send email verification notice:', err));
+      }
+
       const uid = fbUser.uid;
       const resolvedEmail = fbUser.email || trimmedEmail;
       const isOwner = isVerifiedOwnerAccount(fbUser);
-      const isAdmin = isOwner || (await checkIsAdminInFirestore(uid));
+      const isAdmin = isOwner;
       const resolvedName = fbUser.displayName || candidateName || (isOwner ? 'মো: খাইরুল আলম' : 'শিক্ষার্থী');
       const effectiveRole: UserRole = isAdmin ? 'admin' : 'student';
 
-      let existingProfile = await fetchUserProfileFromFirestore(uid);
-      if (!existingProfile) {
-        const newProfile: UserProfile = {
+      let existingProfile: UserProfile | null = null;
+      if (fbUser.emailVerified) {
+        existingProfile = await fetchUserProfileFromFirestore(uid);
+        if (!existingProfile) {
+          const newProfile: UserProfile = {
+            uid,
+            name: resolvedName,
+            email: resolvedEmail,
+            phone: fbUser.phoneNumber || '',
+            role: effectiveRole,
+            subscriptionStatus: 'free',
+            createdAt: new Date().toISOString()
+          };
+          await saveUserProfileToFirestore(newProfile);
+          existingProfile = newProfile;
+        } else {
+          existingProfile = { ...existingProfile, role: effectiveRole };
+          if (isOwner && existingProfile.role !== 'admin') {
+            await updateUserRoleOrSubscriptionInFirestore(uid, { role: 'admin' }).catch(err =>
+              console.warn('Owner role sync notice:', err)
+            );
+          }
+        }
+      } else {
+        existingProfile = {
           uid,
           name: resolvedName,
           email: resolvedEmail,
           phone: fbUser.phoneNumber || '',
-          role: effectiveRole,
+          role: 'student',
           subscriptionStatus: 'free',
           createdAt: new Date().toISOString()
         };
-        await saveUserProfileToFirestore(newProfile);
-        existingProfile = newProfile;
-      } else {
-        existingProfile = { ...existingProfile, role: effectiveRole };
-        if (isOwner && existingProfile.role !== 'admin') {
-          await updateUserRoleOrSubscriptionInFirestore(uid, { role: 'admin' }).catch(() => {});
-        }
       }
 
+      setIsEmailVerified(Boolean(fbUser.emailVerified));
       setIsVerifiedAdmin(isAdmin);
       setCurrentUser(existingProfile);
       setIsLoggedIn(true);
-      setCurrentSession({
-        sessionId: `sess_${Date.now()}_${uid.slice(0, 6)}`,
-        userId: uid,
-        userEmail: resolvedEmail,
-        userName: existingProfile.name,
-        deviceInfo: typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 60) : 'Web Browser',
-        createdAt: new Date().toISOString(),
-        lastActiveAt: new Date().toISOString(),
-        status: 'active'
-      });
 
-      await syncAuthenticatedUserData(fbUser, isAdmin);
+      if (!fbUser.emailVerified) {
+        setApiSessionId(null);
+        clearStoredActiveSession();
+        setCurrentSession(null);
+        return { success: true, needsEmailVerification: true };
+      }
+
+      await syncAuthenticatedUserData(fbUser, isAdmin, { forceNewSession: true });
 
       if (isAdmin) {
         setActiveScreen('admin');
@@ -632,10 +800,59 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         errMsg = language === 'bn' ? 'পাসওয়ার্ড কমপক্ষে ৬ অক্ষরের হতে হবে।' : 'Password should be at least 6 characters.';
       }
       return { success: false, error: errMsg };
+    } finally {
+      explicitAuthInProgressRef.current = false;
+    }
+  };
+
+  const resendVerificationEmail = async (): Promise<{ success: boolean; error?: string }> => {
+    try {
+      if (!auth?.currentUser) {
+        return { success: false, error: 'অ্যাকাউন্টে লগইন করা নেই।' };
+      }
+      await sendEmailVerification(auth.currentUser);
+      return { success: true };
+    } catch (err: unknown) {
+      return { success: false, error: err instanceof Error ? err.message : 'Verification email failed' };
+    }
+  };
+
+  const refreshVerificationStatus = async (): Promise<{ verified: boolean; error?: string }> => {
+    try {
+      if (!auth?.currentUser) {
+        return { verified: false, error: 'অ্যাকাউন্টে লগইন করা নেই।' };
+      }
+      await reload(auth.currentUser);
+      const verified = Boolean(auth.currentUser.emailVerified);
+      setIsEmailVerified(verified);
+      if (verified) {
+        const fbUser = auth.currentUser;
+        const isOwner = isVerifiedOwnerAccount(fbUser);
+        setIsVerifiedAdmin(isOwner);
+        await fbUser.getIdToken(true);
+        await syncAuthenticatedUserData(fbUser, isOwner, { forceNewSession: true });
+        setActiveScreen(isOwner ? 'admin' : 'dashboard');
+      }
+      return { verified };
+    } catch (err: unknown) {
+      return { verified: false, error: err instanceof Error ? err.message : 'Status check failed' };
+    }
+  };
+
+  const sendPasswordReset = async (email: string): Promise<{ success: boolean; error?: string }> => {
+    try {
+      if (!auth) {
+        return { success: false, error: 'Firebase Authentication is not available.' };
+      }
+      await sendPasswordResetEmail(auth, email.trim().toLowerCase());
+      return { success: true };
+    } catch (err: unknown) {
+      return { success: false, error: err instanceof Error ? err.message : 'Password reset failed' };
     }
   };
 
   const loginWithGoogle = async (): Promise<{ success: boolean; error?: string }> => {
+    explicitAuthInProgressRef.current = true;
     try {
       if (!auth || !googleProvider) {
         return { success: false, error: 'Firebase Authentication is not available.' };
@@ -648,7 +865,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       const phone = fbUser.phoneNumber || '';
 
       const isOwner = isVerifiedOwnerAccount(fbUser);
-      const isAdmin = isOwner || (await checkIsAdminInFirestore(uid));
+      const isAdmin = isOwner;
       const effectiveRole: UserRole = isAdmin ? 'admin' : 'student';
 
       let existingProfile = await fetchUserProfileFromFirestore(uid);
@@ -667,25 +884,18 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       } else {
         existingProfile = { ...existingProfile, role: effectiveRole };
         if (isOwner && existingProfile.role !== 'admin') {
-          await updateUserRoleOrSubscriptionInFirestore(uid, { role: 'admin' }).catch(() => {});
+          await updateUserRoleOrSubscriptionInFirestore(uid, { role: 'admin' }).catch(err =>
+            console.warn('Owner role sync notice:', err)
+          );
         }
       }
 
+      setIsEmailVerified(Boolean(fbUser.emailVerified));
       setIsVerifiedAdmin(isAdmin);
       setCurrentUser(existingProfile);
       setIsLoggedIn(true);
-      setCurrentSession({
-        sessionId: `sess_${Date.now()}_${uid.slice(0, 6)}`,
-        userId: uid,
-        userEmail: email,
-        userName: existingProfile.name,
-        deviceInfo: typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 60) : 'Web Browser',
-        createdAt: new Date().toISOString(),
-        lastActiveAt: new Date().toISOString(),
-        status: 'active'
-      });
 
-      await syncAuthenticatedUserData(fbUser, isAdmin);
+      await syncAuthenticatedUserData(fbUser, isAdmin, { forceNewSession: true });
 
       if (isAdmin) {
         setActiveScreen('admin');
@@ -696,19 +906,33 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     } catch (err: any) {
       console.error('Google Sign-In failed:', err);
       return { success: false, error: err?.message || 'Google Sign-In failed' };
+    } finally {
+      explicitAuthInProgressRef.current = false;
     }
   };
 
-  const logoutUser = () => {
-    if (auth) {
-      signOut(auth).catch(e => console.warn('Firebase sign out notice:', e));
+  const logoutUser = async () => {
+    const activeSessionId = currentSession?.sessionId || (currentUser.uid ? readStoredActiveSession(currentUser.uid) : null);
+    let capturedToken: string | null = null;
+    if (auth?.currentUser && activeSessionId) {
+      try {
+        capturedToken = await auth.currentUser.getIdToken();
+      } catch {
+        capturedToken = null;
+      }
     }
+
     setApiSessionId(null);
+    clearStoredActiveSession();
+    setIsSessionRevoked(false);
+    setSessionRevokedReason('');
     setIsLoggedIn(false);
+    setIsEmailVerified(false);
     setIsVerifiedAdmin(false);
     setCurrentUser(createGuestUserProfile());
+    questionsLoadedModeRef.current = 'none';
+    questionsFetchInFlightRef.current = null;
     setQuestions(INITIAL_QUESTIONS);
-    setPreviousQuestions(INITIAL_PREVIOUS_QUESTIONS);
     setSubscriptions([]);
     setPaymentRequests([]);
     setExamResults([]);
@@ -725,6 +949,15 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       localStorage.removeItem('barprep_bd_current_session');
       localStorage.removeItem('sanadprep_previous_questions');
     } catch (e) {}
+
+    if (capturedToken && activeSessionId) {
+      apiLogoutSession({ token: capturedToken, sessionId: activeSessionId }).catch(err =>
+        console.warn('Server logout notice:', err)
+      );
+    }
+    if (auth) {
+      signOut(auth).catch(e => console.warn('Firebase sign out notice:', e));
+    }
   };
 
   // Firebase Auth State Listener (Auto-restores session on page reload / navigation)
@@ -732,22 +965,47 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     if (!auth) return;
     const unsubscribe = onAuthStateChanged(auth, async (fbUser) => {
       if (fbUser) {
+        if (explicitAuthInProgressRef.current) {
+          return;
+        }
         const uid = fbUser.uid;
         const email = fbUser.email || '';
         const name = fbUser.displayName || 'ব্যবহারকারী';
         const phone = fbUser.phoneNumber || '';
 
+        const verified = Boolean(fbUser.emailVerified);
         const isOwner = isVerifiedOwnerAccount(fbUser);
-        const isAdmin = isOwner || (await checkIsAdminInFirestore(uid));
+        const isAdmin = isOwner;
         const effectiveRole: UserRole = isAdmin ? 'admin' : 'student';
-        const profile = await fetchUserProfileFromFirestore(uid);
 
+        setIsEmailVerified(verified);
         setIsVerifiedAdmin(isAdmin);
+
+        if (!verified) {
+          setCurrentUser({
+            uid,
+            name,
+            email,
+            phone,
+            role: 'student',
+            subscriptionStatus: 'free',
+            createdAt: new Date().toISOString()
+          });
+          setIsLoggedIn(true);
+          setApiSessionId(null);
+          clearStoredActiveSession();
+          setCurrentSession(null);
+          return;
+        }
+
+        const profile = await fetchUserProfileFromFirestore(uid);
 
         if (profile) {
           const verifiedProfile = { ...profile, role: effectiveRole };
           if (isOwner && profile.role !== 'admin') {
-            updateUserRoleOrSubscriptionInFirestore(uid, { role: 'admin' }).catch(() => {});
+            updateUserRoleOrSubscriptionInFirestore(uid, { role: 'admin' }).catch(err =>
+              console.warn('Owner role sync notice:', err)
+            );
           }
           setCurrentUser(verifiedProfile);
         } else {
@@ -760,17 +1018,25 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
             subscriptionStatus: 'free',
             createdAt: new Date().toISOString()
           };
-          saveUserProfileToFirestore(newProfile).catch(() => {});
+          saveUserProfileToFirestore(newProfile).catch(err =>
+            console.warn('User profile bootstrap notice:', err)
+          );
           setCurrentUser(newProfile);
         }
 
         setIsLoggedIn(true);
-        await syncAuthenticatedUserData(fbUser, isAdmin);
+        await syncAuthenticatedUserData(fbUser, isAdmin, { forceNewSession: false });
       } else {
         setApiSessionId(null);
+        clearStoredActiveSession();
+        setIsSessionRevoked(false);
+        setSessionRevokedReason('');
         setIsLoggedIn(false);
+        setIsEmailVerified(false);
         setIsVerifiedAdmin(false);
         setCurrentUser(createGuestUserProfile());
+        questionsLoadedModeRef.current = 'none';
+        questionsFetchInFlightRef.current = null;
         setQuestions(INITIAL_QUESTIONS);
         setSubscriptions([]);
         setPaymentRequests([]);
@@ -790,6 +1056,28 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     return () => unsubscribe();
   }, [syncAuthenticatedUserData]);
 
+  // Lazy-load the question bank only when an authenticated, verified session enters a question-consuming screen or search modal
+  useEffect(() => {
+    if (!isLoggedIn || !isEmailVerified || isSessionRevoked || !currentSession) return;
+    if (
+      activeScreen === 'practice' ||
+      activeScreen === 'question_bank' ||
+      activeScreen === 'subjects' ||
+      activeScreen === 'admin' ||
+      showSearchModal
+    ) {
+      void ensureQuestionsLoaded();
+    }
+  }, [
+    isLoggedIn,
+    isEmailVerified,
+    isSessionRevoked,
+    currentSession,
+    activeScreen,
+    showSearchModal,
+    ensureQuestionsLoaded
+  ]);
+
   // Synchronize public catalog with Backend API & Firestore on Mount
   useEffect(() => {
     let isMounted = true;
@@ -801,8 +1089,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           configRes,
           paySettingsRes,
           _subjectsRes,
-          leaderboardRes,
-          prevQuestionsRes
+          leaderboardRes
         ] = await apiFetchPublicCatalog();
 
         if (isMounted && examsRes.ok && examsRes.data?.exams?.length) {
@@ -825,18 +1112,14 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           if (paySettingsRes.data.supportSettings) setSupportSettings(paySettingsRes.data.supportSettings);
         }
 
-        if (isMounted && prevQuestionsRes.ok && prevQuestionsRes.data?.previousQuestions?.length) {
-          setPreviousQuestions(prevQuestionsRes.data.previousQuestions);
-        }
-
-        const dbLeaderboard = await fetchLeaderboardFromFirestore();
-        const apiLeaderboard = leaderboardRes.ok ? leaderboardRes.data?.leaderboard || [] : [];
-        const combinedLead = [...apiLeaderboard, ...dbLeaderboard];
-        if (isMounted && combinedLead.length > 0) {
+        const apiLeaderboard = leaderboardRes.ok
+          ? leaderboardRes.data?.leaderboard || []
+          : await fetchLeaderboardFromFirestore();
+        if (isMounted && apiLeaderboard.length > 0) {
           setLeaderboardEntries(prev => {
             const map = new Map<string, LeaderboardEntry>();
             prev.forEach(item => map.set(item.id, item));
-            combinedLead.forEach(item => map.set(item.id, item));
+            apiLeaderboard.forEach(item => map.set(item.id, item));
             const merged = Array.from(map.values());
             merged.sort((a, b) => b.score - a.score || a.timeSpentSeconds - b.timeSpentSeconds);
             return merged.map((e, idx) => ({ ...e, rank: idx + 1 }));
@@ -967,14 +1250,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     (!!activeSubscription && !!activeSubscription.expiresAt && new Date(activeSubscription.expiresAt).getTime() > Date.now())
   ));
 
-  // Refresh leaderboard from Backend API & Firestore
+  // Refresh leaderboard from Backend API (Firestore fallback only if backend unavailable)
   const refreshLeaderboard = async () => {
     try {
-      const [apiRes, dbLeaderboard] = await Promise.all([
-        apiFetchLeaderboard(),
-        fetchLeaderboardFromFirestore()
-      ]);
-      const combined = [...(apiRes.ok ? apiRes.data?.leaderboard || [] : []), ...(dbLeaderboard || [])];
+      const apiRes = await apiFetchLeaderboard();
+      const combined = apiRes.ok ? apiRes.data?.leaderboard || [] : await fetchLeaderboardFromFirestore();
       if (combined.length > 0) {
         setLeaderboardEntries(prev => {
           const map = new Map<string, LeaderboardEntry>();
@@ -1023,21 +1303,36 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setShowPaymentModal(true);
   };
 
-  // Update Package (Verified Owner Admin only)
-  const updatePackage = (updated: Partial<SubscriptionPackage> & { id: string }) => {
-    if (!isVerifiedOwnerAccount(auth?.currentUser)) return;
-    setPackages(prev => prev.map(p => {
-      if (p.id === updated.id) {
-        return { ...p, ...updated, updatedAt: new Date().toISOString() };
-      }
-      return p;
-    }));
+  const handleAdminUnauthorized = () => setShowLoginModal(true);
+  const handleAdminSessionRevoked = (reason: string) => {
+    setApiSessionId(null);
+    clearStoredActiveSession();
+    setCurrentSession(null);
+    setIsSessionRevoked(true);
+    setSessionRevokedReason(reason);
+  };
 
-    if (updated.id === 'pkg_exam_pass' && updated.price !== undefined) {
-      setExamDateConfig(prev => ({ ...prev, examPassPrice: Number(updated.price) }));
+  // Update Package (Verified Owner Admin only — Authoritative Backend API)
+  const updatePackage = async (
+    updated: Partial<SubscriptionPackage> & { id: string }
+  ): Promise<{ success: boolean; error?: string }> => {
+    const res = await executeAuthoritativeAdminApi({
+      isVerifiedOwner: isVerifiedOwnerAccount(auth?.currentUser),
+      operation: () => apiAdminUpdatePackage(updated),
+      onUnauthorized: handleAdminUnauthorized,
+      onSessionRevoked: handleAdminSessionRevoked
+    });
+
+    if (!res.success || !res.data?.package) {
+      return { success: false, error: res.error || 'প্যাকেজ আপডেট করা যায়নি।' };
     }
 
-    apiAdminUpdatePackage(updated).catch(e => console.warn('Backend package update notice:', e));
+    const savedPkg = res.data.package;
+    setPackages(prev => prev.map(p => (p.id === savedPkg.id ? savedPkg : p)));
+
+    if (savedPkg.id === 'pkg_exam_pass') {
+      setExamDateConfig(prev => ({ ...prev, examPassPrice: Number(savedPkg.price) }));
+    }
 
     setAuditLogs(prev => [
       {
@@ -1045,43 +1340,54 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         userId: currentUser.uid,
         userName: currentUser.name,
         action: 'UPDATE_PACKAGE',
-        details: `Updated package ID ${updated.id}: Price=৳${updated.price || 'same'}, Validity=${updated.durationDays || 'same'}d`,
+        details: `Updated package ID ${savedPkg.id}: Price=৳${savedPkg.price}, Validity=${savedPkg.durationDays || 'exam_date'}d`,
         timestamp: new Date().toISOString()
       },
       ...prev
     ]);
+
+    return { success: true };
   };
 
-  // Update Exam Date Configuration & Apply Policy (Verified Owner Admin only)
-  const updateExamDateConfig = (config: Partial<ExamDateConfig>) => {
-    if (!isVerifiedOwnerAccount(auth?.currentUser)) return;
-    const nextConfig = {
-      ...examDateConfig,
-      ...config,
-      lastUpdated: new Date().toISOString()
-    };
-    setExamDateConfig(nextConfig);
+  // Update Exam Date Configuration & Apply Policy (Verified Owner Admin only — Authoritative Backend API)
+  const updateExamDateConfig = async (
+    config: Partial<ExamDateConfig>
+  ): Promise<{ success: boolean; error?: string }> => {
+    const res = await executeAuthoritativeAdminApi({
+      isVerifiedOwner: isVerifiedOwnerAccount(auth?.currentUser),
+      operation: () => apiAdminUpdateExamConfig(config),
+      onUnauthorized: handleAdminUnauthorized,
+      onSessionRevoked: handleAdminSessionRevoked
+    });
 
-    if (config.examPassPrice !== undefined) {
-      setPackages(prev => prev.map(p => p.id === 'pkg_exam_pass' ? { ...p, price: Number(config.examPassPrice) } : p));
+    if (!res.success || !res.data?.examDateConfig) {
+      return { success: false, error: res.error || 'পরীক্ষার তারিখ কনফিগারেশন সংরক্ষণ করা যায়নি।' };
     }
 
-    let affectedCount = 0;
-    if (nextConfig.examDatePolicy === 'extend_all' && config.targetExamDate) {
-      setSubscriptions(prev => prev.map(sub => {
-        if (sub.packageId === 'pkg_exam_pass' && sub.status === 'active') {
-          affectedCount++;
-          return {
-            ...sub,
-            expiresAt: new Date(config.targetExamDate!).toISOString(),
-            targetExamDateSnapshot: config.targetExamDate
-          };
-        }
-        return sub;
-      }));
+    const savedConfig = res.data.examDateConfig;
+    const affectedCount = res.data.affectedSubscribers ?? 0;
+    setExamDateConfig(savedConfig);
+
+    if (savedConfig.examPassPrice !== undefined) {
+      setPackages(prev =>
+        prev.map(p => (p.id === 'pkg_exam_pass' ? { ...p, price: Number(savedConfig.examPassPrice) } : p))
+      );
     }
 
-    apiAdminUpdateExamConfig(config).catch(e => console.warn('Backend exam config update notice:', e));
+    if (savedConfig.examDatePolicy === 'extend_all' && savedConfig.targetExamDate) {
+      setSubscriptions(prev =>
+        prev.map(sub => {
+          if (sub.packageId === 'pkg_exam_pass' && sub.status === 'active') {
+            return {
+              ...sub,
+              expiresAt: new Date(savedConfig.targetExamDate).toISOString(),
+              targetExamDateSnapshot: savedConfig.targetExamDate
+            };
+          }
+          return sub;
+        })
+      );
+    }
 
     setAuditLogs(prev => [
       {
@@ -1089,53 +1395,85 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         userId: currentUser.uid,
         userName: currentUser.name,
         action: 'UPDATE_EXAM_DATE_CONFIG',
-        details: `Exam Date set to ${nextConfig.targetExamDate} (${nextConfig.timezone}). Policy: ${nextConfig.examDatePolicy}. Affected active subscribers: ${affectedCount}`,
+        details: `Exam Date set to ${savedConfig.targetExamDate} (${savedConfig.timezone}). Policy: ${savedConfig.examDatePolicy}. Affected active subscribers: ${affectedCount}`,
         timestamp: new Date().toISOString()
       },
       ...prev
     ]);
+
+    return { success: true };
   };
 
-  const updatePaymentSettings = (settings: Partial<PaymentSettings>) => {
-    if (!isVerifiedOwnerAccount(auth?.currentUser)) return;
-    setPaymentSettings(prev => ({ ...prev, ...settings }));
-    if (settings.whatsappNumber || settings.whatsappMessage) {
-      setSupportSettings(prev => ({
-        ...prev,
-        ...(settings.whatsappNumber ? { whatsappNumber: settings.whatsappNumber } : {}),
-        ...(settings.whatsappMessage ? { whatsappMessage: settings.whatsappMessage } : {})
-      }));
+  const updatePaymentSettings = async (
+    settings: Partial<PaymentSettings>
+  ): Promise<{ success: boolean; error?: string }> => {
+    const res = await executeAuthoritativeAdminApi({
+      isVerifiedOwner: isVerifiedOwnerAccount(auth?.currentUser),
+      operation: () => apiAdminUpdatePaymentSettings(settings),
+      onUnauthorized: handleAdminUnauthorized,
+      onSessionRevoked: handleAdminSessionRevoked
+    });
+
+    if (!res.success || !res.data?.paymentSettings) {
+      return { success: false, error: res.error || 'পেমেন্ট সেটিংস সংরক্ষণ করা যায়নি।' };
     }
-    apiAdminUpdatePaymentSettings(settings).catch(e => console.warn('Backend payment settings sync notice:', e));
+
+    const savedPayment = res.data.paymentSettings;
+    setPaymentSettings(savedPayment);
+    if (res.data.supportSettings) {
+      setSupportSettings(res.data.supportSettings);
+    }
+
     setAuditLogs(prev => [
       {
         id: `log_${Date.now()}`,
         userId: currentUser.uid,
         userName: currentUser.name,
         action: 'UPDATE_PAYMENT_SETTINGS',
-        details: `Updated Payment Numbers: bKash: ${settings.bkashNumber ?? paymentSettings.bkashNumber}, Nagad: ${settings.nagadNumber ?? paymentSettings.nagadNumber}`,
+        details: `Updated Payment Numbers: bKash: ${savedPayment.bkashNumber}, Nagad: ${savedPayment.nagadNumber}`,
         timestamp: new Date().toISOString()
       },
       ...prev
     ]);
+
+    return { success: true };
   };
 
-  const updateSupportSettings = (settings: Partial<SupportContactSettings>) => {
-    if (!isVerifiedOwnerAccount(auth?.currentUser)) return;
-    setSupportSettings(prev => ({ ...prev, ...settings }));
-    setPaymentSettings(prev => ({ ...prev, ...settings }));
-    apiAdminUpdateSupportSettings(settings).catch(e => console.warn('Backend support settings sync notice:', e));
+  const updateSupportSettings = async (
+    settings: Partial<SupportContactSettings>
+  ): Promise<{ success: boolean; error?: string }> => {
+    const res = await executeAuthoritativeAdminApi({
+      isVerifiedOwner: isVerifiedOwnerAccount(auth?.currentUser),
+      operation: () => apiAdminUpdateSupportSettings(settings),
+      onUnauthorized: handleAdminUnauthorized,
+      onSessionRevoked: handleAdminSessionRevoked
+    });
+
+    if (!res.success || !res.data?.supportSettings) {
+      return { success: false, error: res.error || 'সাপোর্ট সেটিংস সংরক্ষণ করা যায়নি।' };
+    }
+
+    const savedSupport = res.data.supportSettings;
+    setSupportSettings(savedSupport);
+    setPaymentSettings(prev => ({
+      ...prev,
+      whatsappNumber: savedSupport.whatsappNumber,
+      whatsappMessage: savedSupport.whatsappMessage
+    }));
+
     setAuditLogs(prev => [
       {
         id: `log_${Date.now()}`,
         userId: currentUser.uid,
         userName: currentUser.name,
         action: 'UPDATE_SUPPORT_SETTINGS',
-        details: `Updated WhatsApp Support: ${settings.whatsappNumber ?? supportSettings.whatsappNumber}`,
+        details: `Updated WhatsApp Support: ${savedSupport.whatsappNumber}`,
         timestamp: new Date().toISOString()
       },
       ...prev
     ]);
+
+    return { success: true };
   };
 
   // Single Active Session Simulation (Account sharing protection test)
@@ -1158,18 +1496,18 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     ]);
   };
 
-  const recoverSession = () => {
-    const freshSession: StudentSession = {
-      sessionId: `sess_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-      userId: currentUser.uid,
-      userEmail: currentUser.email,
-      userName: currentUser.name,
-      deviceInfo: 'Verified Device (Dhaka, BD)',
-      createdAt: new Date().toISOString(),
-      lastActiveAt: new Date().toISOString(),
-      status: 'active'
-    };
-    setCurrentSession(freshSession);
+  const recoverSession = async (): Promise<boolean> => {
+    if (!auth?.currentUser) return false;
+    const res = await apiCreateSession(
+      currentUser.name || auth.currentUser.displayName || undefined,
+      typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 80) : 'Web Browser'
+    );
+    if (!res.ok || !res.data?.success) {
+      return false;
+    }
+    setApiSessionId(res.data.sessionId);
+    writeStoredActiveSession(auth.currentUser.uid, res.data.sessionId);
+    setCurrentSession(res.data.session);
     setIsSessionRevoked(false);
     setSessionRevokedReason('');
     setAuditLogs(prev => [
@@ -1178,11 +1516,12 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         userId: currentUser.uid,
         userName: currentUser.name,
         action: 'SESSION_RECOVERED',
-        details: `Single active session re-established: ${freshSession.sessionId}.`,
+        details: `Single active session re-established: ${res.data!.sessionId}.`,
         timestamp: new Date().toISOString()
       },
       ...prev
     ]);
+    return true;
   };
 
   const currentExamForAttempt = activeAttempt 
@@ -1337,15 +1676,28 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       createdAt: new Date().toISOString()
     };
 
-    const saveRes = await apiAdminSaveExam(newCustomExam);
-    saveExamToFirestore(newCustomExam).catch(e => console.warn('Firestore custom exam save notice:', e));
-    setExams(prev => [saveRes.ok && saveRes.data?.exam ? saveRes.data.exam : newCustomExam, ...prev]);
+    const saveRes = await executeAuthoritativeAdminApi({
+      isVerifiedOwner: isVerifiedOwnerAccount(auth?.currentUser),
+      operation: () => apiAdminSaveExam(newCustomExam),
+      onUnauthorized: handleAdminUnauthorized,
+      onSessionRevoked: handleAdminSessionRevoked
+    });
 
-    const startRes = await startExam(testId);
+    if (!saveRes.success || !saveRes.data?.exam) {
+      return {
+        success: false,
+        reason: saveRes.error || 'কাস্টম মডেল টেস্ট ব্যাকএন্ডে সংরক্ষণ করা যায়নি।'
+      };
+    }
+
+    const persistedExam = saveRes.data.exam;
+    setExams(prev => [persistedExam, ...prev]);
+
+    const startRes = await startExam(persistedExam.id);
     if (!startRes.success) {
       return { success: false, reason: startRes.reason };
     }
-    return { success: true, examId: testId };
+    return { success: true, examId: persistedExam.id };
   };
 
   const saveActiveAnswer = (questionId: string, optionIndex: number) => {
@@ -1358,7 +1710,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         answers: nextAnswers,
         flaggedQuestionIds: prev.flaggedQuestionIds,
         currentQuestionIndex: prev.currentQuestionIndex
-      }).catch(() => {});
+      }).catch(err => console.warn('Exam answer auto-save notice:', err));
       return {
         ...prev,
         answers: nextAnswers,
@@ -1378,7 +1730,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         answers: updatedAnswers,
         flaggedQuestionIds: prev.flaggedQuestionIds,
         currentQuestionIndex: prev.currentQuestionIndex
-      }).catch(() => {});
+      }).catch(err => console.warn('Exam answer clear auto-save notice:', err));
       return {
         ...prev,
         answers: updatedAnswers,
@@ -1399,7 +1751,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         answers: prev.answers,
         flaggedQuestionIds: flagged,
         currentQuestionIndex: prev.currentQuestionIndex
-      }).catch(() => {});
+      }).catch(err => console.warn('Exam flag auto-save notice:', err));
       return {
         ...prev,
         flaggedQuestionIds: flagged,
@@ -1423,6 +1775,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     try {
       const res = await apiSubmitExam(activeAttempt.id, activeAttempt.answers, isAutoTimeout);
       if (!res.ok || !res.data?.success || !res.data.result) {
+        if (res.code === 'SESSION_REVOKED') {
+          handleAdminSessionRevoked(
+            res.message || 'একই অ্যাকাউন্ট অন্য ডিভাইস থেকে লগইন করা হয়েছে। উত্তর জমা নেওয়া সম্ভব নয়।'
+          );
+        }
         const errMsg = res.message || 'পরীক্ষা জমা দিতে সমস্যা হয়েছে। অনুগ্রহ করে পুনরায় চেষ্টা করুন।';
         setExamLaunchError(errMsg);
         return null;
@@ -1508,6 +1865,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     if (sub) {
       setSelectedSubjectForPractice(sub);
       setActiveScreen('practice');
+      void ensureQuestionsLoaded();
       return { success: true };
     }
     return { success: false, reason: 'Subject not found' };
@@ -1535,6 +1893,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     if (!res.ok || !res.data?.success) {
       if (res.code === 'SUBSCRIPTION_REQUIRED') {
         openSubscriptionModal(packages[0]?.id);
+      } else if (res.code === 'SESSION_REVOKED') {
+        handleAdminSessionRevoked(res.message || 'সেশনটি অন্য ডিভাইস থেকে ব্যবহারের কারণে বন্ধ করা হয়েছে।');
       }
       return { success: false, error: res.message || 'উত্তর যাচাই করা যায়নি।' };
     }
@@ -1583,124 +1943,153 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     };
   }, [questions, answeredQuestions]);
 
-  const addQuestion = (newQ: Omit<Question, 'id' | 'createdAt' | 'updatedAt'>) => {
-    if (!isVerifiedOwnerAccount(auth?.currentUser)) return;
-    const created: Question = {
+  const addQuestion = async (
+    newQ: Omit<Question, 'id' | 'createdAt' | 'updatedAt'>
+  ): Promise<{ success: boolean; error?: string }> => {
+    const candidate: Question = {
       ...newQ,
       id: `q_custom_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       createdBy: currentUser.name
     };
-    setQuestions(prev => [created, ...prev]);
-    apiAdminSaveQuestion(created).catch(() => {});
-    saveQuestionToFirestore(created).catch(e => console.warn('Firestore question save error:', e));
-  };
 
-  const updateQuestion = (updated: Question) => {
-    if (!isVerifiedOwnerAccount(auth?.currentUser)) return;
-    const withTime = { ...updated, updatedAt: new Date().toISOString() };
-    setQuestions(prev => prev.map(q => (q.id === updated.id ? withTime : q)));
-    apiAdminSaveQuestion(withTime).catch(() => {});
-    saveQuestionToFirestore(withTime).catch(e => console.warn('Firestore question update error:', e));
-  };
-
-  const deleteQuestion = (id: string) => {
-    if (!isVerifiedOwnerAccount(auth?.currentUser)) return;
-    setQuestions(prev => prev.filter(q => q.id !== id));
-    apiAdminDeleteQuestion(id).catch(() => {});
-    deleteQuestionFromFirestore(id).catch(e => console.warn('Firestore question delete error:', e));
-  };
-
-  const savePreviousQuestion = async (question: PreviousQuestion): Promise<void> => {
-    if (!isVerifiedOwnerAccount(auth?.currentUser)) return;
-    const exists = previousQuestions.some(q => q.id === question.id);
-    if (exists) {
-      setPreviousQuestions(prev => prev.map(q => q.id === question.id ? question : q));
-    } else {
-      setPreviousQuestions(prev => [question, ...prev]);
-    }
-    await apiAdminSavePreviousQuestion(question).catch(() => {});
-    await savePreviousQuestionToFirestore(question);
-  };
-
-  const deletePreviousQuestion = async (id: string): Promise<void> => {
-    if (!isVerifiedOwnerAccount(auth?.currentUser)) return;
-    setPreviousQuestions(prev => prev.filter(q => q.id !== id));
-    await deletePreviousQuestionFromFirestore(id);
-  };
-
-  const batchImportPreviousQuestions = async (
-    newQuestions: PreviousQuestion[]
-  ): Promise<{ successCount: number; failureCount: number; errors: string[] }> => {
-    if (!isVerifiedOwnerAccount(auth?.currentUser)) {
-      return { successCount: 0, failureCount: newQuestions.length, errors: ['Unauthorized: Admin verification required.'] };
-    }
-    setPreviousQuestions(prev => {
-      const map = new Map<string, PreviousQuestion>();
-      newQuestions.forEach(q => map.set(q.id, q));
-      prev.forEach(q => {
-        if (!map.has(q.id)) {
-          map.set(q.id, q);
-        }
-      });
-      return Array.from(map.values()).sort((a, b) => b.year - a.year);
+    const res = await executeAuthoritativeAdminApi({
+      isVerifiedOwner: isVerifiedOwnerAccount(auth?.currentUser),
+      operation: () => apiAdminSaveQuestion(candidate),
+      onUnauthorized: handleAdminUnauthorized,
+      onSessionRevoked: handleAdminSessionRevoked
     });
 
-    const res = await batchImportPreviousQuestionsToFirestore(newQuestions);
-    return res;
+    if (!res.success || !res.data?.question) {
+      return { success: false, error: res.error || 'প্রশ্ন সংরক্ষণ করা যায়নি।' };
+    }
+
+    setQuestions(prev => [res.data!.question, ...prev]);
+    return { success: true };
   };
 
-  const addExam = (newExam: Omit<Exam, 'id' | 'createdAt'>) => {
-    if (!isVerifiedOwnerAccount(auth?.currentUser)) return;
+  const updateQuestion = async (updated: Question): Promise<{ success: boolean; error?: string }> => {
+    const withTime = { ...updated, updatedAt: new Date().toISOString() };
+    const res = await executeAuthoritativeAdminApi({
+      isVerifiedOwner: isVerifiedOwnerAccount(auth?.currentUser),
+      operation: () => apiAdminSaveQuestion(withTime),
+      onUnauthorized: handleAdminUnauthorized,
+      onSessionRevoked: handleAdminSessionRevoked
+    });
+
+    if (!res.success || !res.data?.question) {
+      return { success: false, error: res.error || 'প্রশ্ন আপডেট করা যায়নি।' };
+    }
+
+    const saved = res.data.question;
+    setQuestions(prev => prev.map(q => (q.id === saved.id ? saved : q)));
+    return { success: true };
+  };
+
+  const deleteQuestion = async (id: string): Promise<{ success: boolean; error?: string }> => {
+    const res = await executeAuthoritativeAdminApi({
+      isVerifiedOwner: isVerifiedOwnerAccount(auth?.currentUser),
+      operation: () => apiAdminDeleteQuestion(id),
+      onUnauthorized: handleAdminUnauthorized,
+      onSessionRevoked: handleAdminSessionRevoked
+    });
+
+    if (!res.success) {
+      return { success: false, error: res.error || 'প্রশ্ন মুছে ফেলা যায়নি।' };
+    }
+
+    setQuestions(prev => prev.filter(q => q.id !== id));
+    return { success: true };
+  };
+
+  const addExam = async (
+    newExam: Omit<Exam, 'id' | 'createdAt'>
+  ): Promise<{ success: boolean; exam?: Exam; error?: string }> => {
     const created: Exam = {
       ...newExam,
       id: `exam_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
       createdAt: new Date().toISOString()
     };
-    setExams(prev => [...prev, created]);
-    apiAdminSaveExam(created).catch(() => {});
-    saveExamToFirestore(created).catch(e => console.warn('Firestore exam save error:', e));
+
+    const res = await executeAuthoritativeAdminApi({
+      isVerifiedOwner: isVerifiedOwnerAccount(auth?.currentUser),
+      operation: () => apiAdminSaveExam(created),
+      onUnauthorized: handleAdminUnauthorized,
+      onSessionRevoked: handleAdminSessionRevoked
+    });
+
+    if (!res.success || !res.data?.exam) {
+      return { success: false, error: res.error || 'মডেল টেস্ট সংরক্ষণ করা যায়নি।' };
+    }
+
+    const saved = res.data.exam;
+    setExams(prev => [...prev, saved]);
+    return { success: true, exam: saved };
   };
 
-  const updateExam = (updated: Exam) => {
-    if (!isVerifiedOwnerAccount(auth?.currentUser)) return;
-    setExams(prev => prev.map(e => e.id === updated.id ? updated : e));
-    apiAdminSaveExam(updated).catch(() => {});
-    saveExamToFirestore(updated).catch(e => console.warn('Firestore exam update error:', e));
+  const updateExam = async (updated: Exam): Promise<{ success: boolean; error?: string }> => {
+    const res = await executeAuthoritativeAdminApi({
+      isVerifiedOwner: isVerifiedOwnerAccount(auth?.currentUser),
+      operation: () => apiAdminSaveExam(updated),
+      onUnauthorized: handleAdminUnauthorized,
+      onSessionRevoked: handleAdminSessionRevoked
+    });
+
+    if (!res.success || !res.data?.exam) {
+      return { success: false, error: res.error || 'পরীক্ষা আপডেট করা যায়নি।' };
+    }
+
+    const saved = res.data.exam;
+    setExams(prev => prev.map(e => (e.id === saved.id ? saved : e)));
+    return { success: true };
   };
 
-  const toggleExamStatus = (examId: string, isActive?: boolean, scheduledDate?: string) => {
-    if (!isVerifiedOwnerAccount(auth?.currentUser)) return;
-    setExams(prev => prev.map(e => {
-      if (e.id === examId) {
-        const nextActive = isActive !== undefined ? isActive : !e.isActive;
-        const updated: Exam = {
-          ...e,
-          isActive: nextActive,
-          published: nextActive ? true : e.published,
-          scheduledDate: scheduledDate !== undefined ? scheduledDate : e.scheduledDate
-        };
-        apiAdminSaveExam(updated).catch(() => {});
-        saveExamToFirestore(updated).catch(err => console.warn('Firestore exam status update error:', err));
-        return updated;
-      }
-      return e;
-    }));
-
+  const toggleExamStatus = async (
+    examId: string,
+    isActive?: boolean,
+    scheduledDate?: string
+  ): Promise<{ success: boolean; error?: string }> => {
     const target = exams.find(e => e.id === examId);
-    const nextActive = isActive !== undefined ? isActive : (target ? !target.isActive : true);
+    if (!target) {
+      return { success: false, error: 'পরীক্ষাটি খুঁজে পাওয়া যায়নি।' };
+    }
+
+    const nextActive = isActive !== undefined ? isActive : !target.isActive;
+    const candidate: Exam = {
+      ...target,
+      isActive: nextActive,
+      published: nextActive ? true : target.published,
+      scheduledDate: scheduledDate !== undefined ? scheduledDate : target.scheduledDate
+    };
+
+    const res = await executeAuthoritativeAdminApi({
+      isVerifiedOwner: isVerifiedOwnerAccount(auth?.currentUser),
+      operation: () => apiAdminSaveExam(candidate),
+      onUnauthorized: handleAdminUnauthorized,
+      onSessionRevoked: handleAdminSessionRevoked
+    });
+
+    if (!res.success || !res.data?.exam) {
+      return { success: false, error: res.error || 'পরীক্ষার স্ট্যাটাস পরিবর্তন করা যায়নি।' };
+    }
+
+    const saved = res.data.exam;
+    setExams(prev => prev.map(e => (e.id === saved.id ? saved : e)));
+
     setAuditLogs(prev => [
       {
         id: `log_${Date.now()}`,
         userId: currentUser.uid,
         userName: currentUser.name,
         action: nextActive ? 'LAUNCH_EXAM' : 'DEACTIVATE_EXAM',
-        details: `${nextActive ? 'Launched' : 'Deactivated'} exam ${examId} (${target?.titleEn || 'Model Test'}) - Scheduled: ${scheduledDate || target?.scheduledDate || 'Immediate'}`,
+        details: `${nextActive ? 'Launched' : 'Deactivated'} exam ${examId} (${target.titleEn || 'Model Test'}) - Scheduled: ${scheduledDate || target.scheduledDate || 'Immediate'}`,
         timestamp: new Date().toISOString()
       },
       ...prev
     ]);
+
+    return { success: true };
   };
 
   const generateAndSync30ModelTests = async (): Promise<{ success: boolean; count: number; message: string }> => {
@@ -1710,35 +2099,68 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     let questionPool = questions;
     if (questionPool.length < 3000) {
       const adminQRes = await apiFetchAdminQuestions();
-      if (adminQRes.ok && adminQRes.data?.questions?.length) {
+      if (!adminQRes.ok) {
+        return {
+          success: false,
+          count: 0,
+          message: formatBackendApiError({
+            status: adminQRes.status,
+            code: adminQRes.code,
+            serverMessage: adminQRes.message,
+            isJson: adminQRes.code !== 'NON_JSON_RESPONSE'
+          })
+        };
+      }
+      if (adminQRes.data?.questions?.length) {
         questionPool = adminQRes.data.questions;
         setQuestions(questionPool);
       }
     }
+
     const generated = generate30ModelTests(questionPool);
-    const nonModelExams = exams.filter(e => e.type !== 'full_mock');
-    const updatedExams = [...generated, ...nonModelExams];
-    setExams(updatedExams);
-    try {
-      localStorage.setItem(LOCAL_STORAGE_KEY_EXAMS, JSON.stringify(updatedExams));
-    } catch (e) {}
-    // Persist each generated exam metadata without overwriting non-model tests
-    await Promise.all(
-      generated.slice(0, 30).map(ex =>
-        Promise.all([
-          apiAdminSaveExam(ex).catch(() => {}),
-          saveExamToFirestore(ex).catch(() => {})
-        ])
-      )
-    );
+    const savedExams: Exam[] = [];
+    const errors: string[] = [];
+
+    for (const ex of generated.slice(0, 30)) {
+      const saveRes = await apiAdminSaveExam(ex);
+      if (saveRes.ok && saveRes.data?.exam) {
+        savedExams.push(saveRes.data.exam);
+      } else {
+        errors.push(
+          saveRes.message ||
+            formatBackendApiError({
+              status: saveRes.status,
+              code: saveRes.code,
+              isJson: saveRes.code !== 'NON_JSON_RESPONSE'
+            })
+        );
+      }
+    }
+
+    if (savedExams.length > 0) {
+      setExams(prev => {
+        const savedMap = new Map(savedExams.map(e => [e.id, e]));
+        const retained = prev.filter(e => !savedMap.has(e.id));
+        return [...savedExams, ...retained];
+      });
+    }
+
+    if (errors.length > 0) {
+      return {
+        success: false,
+        count: savedExams.length,
+        message: `${savedExams.length}/${generated.length}টি টেস্ট সেভ হয়েছে, কিন্তু ${errors.length}টি ব্যর্থ: ${errors[0]}`
+      };
+    }
+
     return {
       success: true,
-      count: generated.length,
-      message: `${generated.length}টি পূর্ণাঙ্গ মডেল টেস্ট সফলভাবে প্রস্তুত ও সমন্বিত হয়েছে।`
+      count: savedExams.length,
+      message: `${savedExams.length}টি পূর্ণাঙ্গ মডেল টেস্ট সফলভাবে প্রস্তুত ও সমন্বিত হয়েছে।`
     };
   };
 
-  // Create Payment Request (Server-authoritative amount & duplicate/rejected TrxID enforcement)
+  // Create Payment Request (Strictly Authenticated Backend API — Zero Firestore fallback, Zero client pricing)
   const createPaymentRequest = async (req: {
     method: 'bKash' | 'Nagad' | 'Rocket';
     studentPhone?: string;
@@ -1748,47 +2170,46 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     packageId: string;
     packageTitle?: string;
   }): Promise<{ success: boolean; error?: string }> => {
-    const authenticatedUid = auth?.currentUser?.uid;
-    if (!isLoggedIn || !authenticatedUid) {
-      return { success: false, error: 'পেমেন্ট রিকোয়েস্ট পাঠাতে অনুগ্রহ করে প্রথমে আপনার অ্যাকাউন্টে লগইন করুন।' };
-    }
-
-    const cleanTrxId = req.transactionId.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
-    if (cleanTrxId.length < 4 || cleanTrxId.length > 64) {
-      return { success: false, error: 'সঠিক ট্রানজাকশন আইডি (TrxID) প্রদান করুন (৪–৬৪ অক্ষর)।' };
-    }
-
-    // Check locally known requests across ALL statuses (including rejected)
-    const duplicate = paymentRequests.find(
-      p => p.id === `trx_${cleanTrxId}` || p.transactionId === cleanTrxId
-    );
-    if (duplicate) {
+    if (paymentSubmitLockRef.current) {
       return {
         success: false,
-        error:
-          duplicate.status === 'rejected'
-            ? 'এই ট্রানজাকশন আইডিটি (TrxID) পূর্বে বাতিল করা হয়েছে এবং পুনরায় জমা দেওয়া যাবে না।'
-            : 'এই ট্রানজাকশন আইডিটি (TrxID) ইতিপূর্বে জমা দেওয়া হয়েছে। একই TrxID পুনরাবৃত্তি গ্রহণযোগ্য নয়।'
+        error: 'পেমেন্ট রিকোয়েস্ট ইতিমধ্যে পাঠানো হচ্ছে। অনুগ্রহ করে কয়েক সেকেন্ড অপেক্ষা করুন।'
       };
     }
 
-    // 1. Call trusted backend /api/payments/create (calculates amount from server package pricing)
-    const apiRes = await apiCreatePaymentRequest({
-      method: req.method,
-      studentPhone: req.studentPhone || currentUser.phone,
-      senderNumber: req.senderNumber,
-      transactionId: cleanTrxId,
-      packageId: req.packageId,
-      studentName: currentUser.name
-    });
+    const authenticatedUid = isLoggedIn ? auth?.currentUser?.uid : null;
+    paymentSubmitLockRef.current = true;
 
-    if (apiRes.ok && apiRes.data?.success && apiRes.data.paymentRequest) {
-      const persistedReq = apiRes.data.paymentRequest;
+    try {
+      const result = await submitPaymentViaAuthoritativeBackend({
+        authenticatedUid,
+        method: req.method,
+        studentPhone: req.studentPhone || currentUser.phone,
+        senderNumber: req.senderNumber,
+        transactionId: req.transactionId,
+        packageId: req.packageId,
+        studentName: currentUser.name,
+        existingRequests: paymentRequests,
+        apiBaseUrl: typeof import.meta !== 'undefined' ? import.meta.env?.VITE_API_BASE_URL : '',
+        isProduction: typeof import.meta !== 'undefined' ? Boolean(import.meta.env?.PROD) : false,
+        callCreatePaymentApi: apiCreatePaymentRequest,
+        onUnauthorized: () => setShowLoginModal(true),
+        onSessionRevoked: handleAdminSessionRevoked
+      });
+
+      if (!result.success || !result.paymentRequest) {
+        return {
+          success: false,
+          error: result.error || 'পেমেন্ট রিকোয়েস্ট জমা দেওয়া যায়নি। অনুগ্রহ করে পুনরায় চেষ্টা করুন।'
+        };
+      }
+
+      const persistedReq = result.paymentRequest;
       setPaymentRequests(prev => [persistedReq, ...prev.filter(p => p.id !== persistedReq.id)]);
       setAuditLogs(prev => [
         {
           id: `log_${Date.now()}`,
-          userId: authenticatedUid,
+          userId: authenticatedUid!,
           userName: currentUser.name,
           action: 'PAYMENT_REQUEST_SUBMITTED',
           details: `${persistedReq.method} TrxID: ${persistedReq.transactionId} (৳${persistedReq.amount}) submitted for package "${persistedReq.packageNameEn}".`,
@@ -1797,140 +2218,69 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         ...prev
       ]);
       return { success: true };
+    } finally {
+      paymentSubmitLockRef.current = false;
     }
-
-    // Explicit failure from backend — NEVER show false success
-    if (apiRes.code !== 'NON_JSON_RESPONSE' && apiRes.code !== 'NETWORK_ERROR') {
-      return {
-        success: false,
-        error: apiRes.message || 'পেমেন্ট রিকোয়েস্ট জমা দেওয়া যায়নি। অনুগ্রহ করে পুনরায় চেষ্টা করুন।'
-      };
-    }
-
-    // Fallback for standalone static hosting without backend API: write strictly to Firestore & await confirmation
-    const pkg = packages.find(p => p.id === req.packageId && p.isActive) || packages[0];
-    const authoritativeAmount =
-      pkg.id === 'pkg_exam_pass' ? examDateConfig.examPassPrice : pkg.price;
-    const durationDays =
-      pkg.durationDays || (pkg.validityType === 'exam_date' ? calculateDaysRemaining(examDateConfig.targetExamDate) : 90);
-
-    const newReq: PaymentRequest = {
-      id: `trx_${cleanTrxId}`,
-      userId: authenticatedUid,
-      studentName: currentUser.name,
-      studentPhone: req.studentPhone || currentUser.phone,
-      method: req.method,
-      senderNumber: req.senderNumber,
-      transactionId: cleanTrxId,
-      amount: authoritativeAmount,
-      packageId: pkg.id,
-      packageNameBn: pkg.nameBn,
-      packageNameEn: pkg.nameEn,
-      packageTitle: `${pkg.nameBn} - ৳${authoritativeAmount}`,
-      durationDays,
-      validityType: pkg.validityType,
-      status: 'pending',
-      requestedAt: new Date().toISOString()
-    };
-
-    try {
-      await savePaymentRequestToFirestore(newReq);
-    } catch (err: any) {
-      const errMsg = String(err?.message || '');
-      if (errMsg === 'DUPLICATE_TRX_ID' || errMsg === 'TRX_ALREADY_EXISTS_OR_PERMISSION_DENIED') {
-        return {
-          success: false,
-          error: 'এই ট্রানজাকশন আইডিটি (TrxID) ইতিপূর্বে ব্যবহৃত হয়েছে অথবা বাতিল হয়েছে। পুনরায় জমা দেওয়া সম্ভব নয়।'
-        };
-      }
-      return {
-        success: false,
-        error: 'ডাটাবেজে পেমেন্ট রিকোয়েস্ট সংরক্ষণ ব্যর্থ হয়েছে। অনুগ্রহ করে পরে চেষ্টা করুন।'
-      };
-    }
-
-    setPaymentRequests(prev => [newReq, ...prev]);
-    return { success: true };
   };
 
-  // Approve Payment Request & Atomically Activate Subscription (Owner Admin Only)
+  // Approve Payment Request & Atomically Activate Subscription (Owner Admin Only — Authoritative Backend API)
   const approvePaymentRequest = async (id: string): Promise<{ success: boolean; error?: string }> => {
-    if (!isVerifiedOwnerAccount(auth?.currentUser)) {
-      return { success: false, error: 'অননুমোদিত চেষ্টা: শুধুমাত্র যাচাইকৃত সুপার অ্যাডমিন পেমেন্ট অনুমোদন করতে পারবেন।' };
-    }
-
     const req = paymentRequests.find(r => r.id === id);
     if (!req) return { success: false, error: 'Payment request not found' };
     if (req.status === 'approved') {
       return { success: false, error: 'Payment request is already approved' };
     }
 
-    const apiRes = await apiApprovePaymentRequest(id, currentUser.name);
-    if (apiRes.ok && apiRes.data?.success) {
-      const { paymentRequest: updatedPay, subscription: newSub } = apiRes.data;
-      setPaymentRequests(prev => prev.map(r => (r.id === id ? updatedPay : r)));
-      setSubscriptions(prev => [newSub, ...prev.filter(s => s.id !== newSub.id)]);
+    const res = await executeAuthoritativeAdminApi({
+      isVerifiedOwner: isVerifiedOwnerAccount(auth?.currentUser),
+      operation: () => apiApprovePaymentRequest(id, currentUser.name),
+      onUnauthorized: handleAdminUnauthorized,
+      onSessionRevoked: handleAdminSessionRevoked
+    });
 
-      // Also ensure Firestore client mirror is updated if Admin SDK IAM isn't active on dev backend
-      saveSubscriptionToFirestore(newSub).catch(() => {});
-      updatePaymentRequestStatusInFirestore(id, {
-        status: 'approved',
-        verifiedAt: updatedPay.verifiedAt,
-        verifiedBy: updatedPay.verifiedBy,
-        subscriptionId: newSub.id
-      }).catch(() => {});
-      if (updatedPay.userId) {
-        updateUserRoleOrSubscriptionInFirestore(updatedPay.userId, {
-          subscriptionStatus: 'pro',
-          subscriptionExpiresAt: newSub.expiresAt,
-          activePackageId: updatedPay.packageId,
-          activePackageNameBn: updatedPay.packageNameBn,
-          activePackageNameEn: updatedPay.packageNameEn
-        }).catch(() => {});
-      }
-
-      if (updatedPay.userId === currentUser.uid) {
-        setCurrentUser(prev => ({
-          ...prev,
-          subscriptionStatus: 'pro',
-          subscriptionExpiresAt: newSub.expiresAt,
-          activePackageId: updatedPay.packageId,
-          activePackageNameBn: updatedPay.packageNameBn,
-          activePackageNameEn: updatedPay.packageNameEn
-        }));
-      }
-
-      return { success: true };
+    if (!res.success || !res.data?.success) {
+      return {
+        success: false,
+        error: res.error || 'পেমেন্ট অনুমোদন করা যায়নি।'
+      };
     }
 
-    return {
-      success: false,
-      error: apiRes.message || 'পেমেন্ট অনুমোদন করা যায়নি।'
-    };
+    const { paymentRequest: updatedPay, subscription: newSub } = res.data;
+    setPaymentRequests(prev => prev.map(r => (r.id === id ? updatedPay : r)));
+    setSubscriptions(prev => [newSub, ...prev.filter(s => s.id !== newSub.id)]);
+
+    if (updatedPay.userId === currentUser.uid) {
+      setCurrentUser(prev => ({
+        ...prev,
+        subscriptionStatus: 'pro',
+        subscriptionExpiresAt: newSub.expiresAt,
+        activePackageId: updatedPay.packageId,
+        activePackageNameBn: updatedPay.packageNameBn,
+        activePackageNameEn: updatedPay.packageNameEn
+      }));
+    }
+
+    return { success: true };
   };
 
   const rejectPaymentRequest = async (id: string, reason: string): Promise<{ success: boolean; error?: string }> => {
-    if (!isVerifiedOwnerAccount(auth?.currentUser)) {
-      return { success: false, error: 'অননুমোদিত চেষ্টা: শুধুমাত্র যাচাইকৃত সুপার অ্যাডমিন পেমেন্ট বাতিল করতে পারবেন।' };
+    const res = await executeAuthoritativeAdminApi({
+      isVerifiedOwner: isVerifiedOwnerAccount(auth?.currentUser),
+      operation: () => apiRejectPaymentRequest(id, reason, currentUser.name),
+      onUnauthorized: handleAdminUnauthorized,
+      onSessionRevoked: handleAdminSessionRevoked
+    });
+
+    if (!res.success || !res.data?.success) {
+      return {
+        success: false,
+        error: res.error || 'পেমেন্ট বাতিল করা যায়নি।'
+      };
     }
 
-    const apiRes = await apiRejectPaymentRequest(id, reason, currentUser.name);
-    if (apiRes.ok && apiRes.data?.success) {
-      const updatedPay = apiRes.data.paymentRequest;
-      updatePaymentRequestStatusInFirestore(id, {
-        status: 'rejected',
-        rejectionReason: updatedPay.rejectionReason,
-        verifiedAt: updatedPay.verifiedAt,
-        verifiedBy: updatedPay.verifiedBy
-      }).catch(() => {});
-      setPaymentRequests(prev => prev.map(r => (r.id === id ? updatedPay : r)));
-      return { success: true };
-    }
-
-    return {
-      success: false,
-      error: apiRes.message || 'পেমেন্ট বাতিল করা যায়নি।'
-    };
+    const updatedPay = res.data.paymentRequest;
+    setPaymentRequests(prev => prev.map(r => (r.id === id ? updatedPay : r)));
+    return { success: true };
   };
 
   const adminUpdateUser = async (params: {
@@ -1947,47 +2297,36 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     expiresAt?: string;
     isSessionRevoked?: boolean;
   }): Promise<{ success: boolean; message: string }> => {
-    if (!isVerifiedOwnerAccount(auth?.currentUser)) {
-      return {
-        success: false,
-        message: 'অননুমোদিত চেষ্টা: শুধুমাত্র যাচাইকৃত সুপার অ্যাডমিন ব্যবহারকারীর তথ্য বা সাবস্ক্রিপশন পরিবর্তন করতে পারবেন।'
-      };
-    }
-
     const safeRole: UserRole = params.role === 'admin' && params.userId !== OWNER_ADMIN_UID
       ? 'student'
       : params.role;
 
-    const apiRes = await apiAdminUpdateUser({ ...params, role: safeRole });
-    if (!apiRes.ok && apiRes.code !== 'NON_JSON_RESPONSE' && apiRes.code !== 'NETWORK_ERROR') {
-      return { success: false, message: apiRes.message || 'আপডেট ব্যর্থ হয়েছে।' };
+    const res = await executeAuthoritativeAdminApi({
+      isVerifiedOwner: isVerifiedOwnerAccount(auth?.currentUser),
+      operation: () => apiAdminUpdateUser({ ...params, role: safeRole }),
+      onUnauthorized: handleAdminUnauthorized,
+      onSessionRevoked: handleAdminSessionRevoked
+    });
+
+    if (!res.success || !res.data?.success) {
+      return { success: false, message: res.error || 'আপডেট ব্যর্থ হয়েছে।' };
     }
 
-    if (params.userId) {
-      await updateUserRoleOrSubscriptionInFirestore(params.userId, {
-        name: params.name,
-        phone: params.phone,
-        role: safeRole,
-        subscriptionStatus: params.subscriptionStatus,
-        subscriptionExpiresAt: params.expiresAt,
-        activePackageId: params.packageId,
-        activePackageNameBn: params.packageNameBn,
-        activePackageNameEn: params.packageNameEn
-      }).catch(e => console.warn('Firestore user profile update notice:', e));
-    }
+    const updatedUser = res.data.user;
+    const persistedSub = res.data.subscription;
 
     if (params.userId === currentUser.uid) {
       setCurrentUser(prev => ({
         ...prev,
-        name: params.name,
-        email: params.email,
-        phone: params.phone,
-        role: safeRole,
-        subscriptionStatus: params.subscriptionStatus,
-        subscriptionExpiresAt: params.expiresAt,
-        activePackageId: params.packageId,
-        activePackageNameBn: params.packageNameBn,
-        activePackageNameEn: params.packageNameEn
+        name: updatedUser?.name ?? params.name,
+        email: updatedUser?.email ?? params.email,
+        phone: updatedUser?.phone ?? params.phone,
+        role: updatedUser?.role ?? safeRole,
+        subscriptionStatus: updatedUser?.subscriptionStatus ?? params.subscriptionStatus,
+        subscriptionExpiresAt: updatedUser?.subscriptionExpiresAt ?? params.expiresAt,
+        activePackageId: updatedUser?.activePackageId ?? params.packageId,
+        activePackageNameBn: updatedUser?.activePackageNameBn ?? params.packageNameBn,
+        activePackageNameEn: updatedUser?.activePackageNameEn ?? params.packageNameEn
       }));
 
       if (params.isSessionRevoked !== undefined) {
@@ -2000,53 +2339,32 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       }
     }
 
-    setSubscriptions(prev => {
-      let found = false;
-      const updatedList = prev.map(sub => {
-        if (sub.userId === params.userId || (params.subscriptionId && sub.id === params.subscriptionId)) {
-          found = true;
-          const updatedSub: UserSubscription = {
-            ...sub,
-            studentName: params.name,
-            studentPhone: params.phone,
-            packageId: params.packageId || sub.packageId,
-            packageNameBn: params.packageNameBn || sub.packageNameBn,
-            packageNameEn: params.packageNameEn || sub.packageNameEn,
-            status: params.subscriptionStatus === 'pro' ? 'active' : (params.subscriptionStatus === 'expired' ? 'expired' : 'cancelled'),
-            expiresAt: params.expiresAt || sub.expiresAt
-          };
-          saveSubscriptionToFirestore(updatedSub).catch(e => console.warn('Firestore subscription update notice:', e));
-          return updatedSub;
+    if (persistedSub) {
+      setSubscriptions(prev => {
+        const exists = prev.some(s => s.id === persistedSub.id || s.userId === params.userId);
+        if (exists) {
+          return prev.map(s =>
+            s.id === persistedSub.id || s.userId === params.userId ? persistedSub : s
+          );
         }
-        return sub;
+        return [persistedSub, ...prev];
       });
-
-      if (!found && params.subscriptionStatus === 'pro') {
-        const pkg = packages.find(p => p.id === params.packageId) || packages[0];
-        const newSub: UserSubscription = {
-          id: `sub_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-          userId: params.userId,
-          studentName: params.name,
-          studentPhone: params.phone,
-          packageId: pkg.id,
-          packageNameBn: pkg.nameBn,
-          packageNameEn: pkg.nameEn,
-          pricePaid: pkg.price,
-          paymentRequestId: `admin_grant_${Date.now()}`,
-          paymentMethod: 'bKash',
-          transactionId: `ADMIN_GRANT_${Date.now().toString().slice(-6)}`,
-          activatedAt: new Date().toISOString(),
-          expiresAt: params.expiresAt || new Date(Date.now() + 90 * 24 * 3600 * 1000).toISOString(),
-          validityType: pkg.validityType as 'days' | 'exam_date',
-          status: 'active',
-          createdAt: new Date().toISOString()
-        };
-        saveSubscriptionToFirestore(newSub).catch(e => console.warn('Firestore subscription save notice:', e));
-        return [newSub, ...updatedList];
-      }
-
-      return updatedList;
-    });
+    } else if (params.subscriptionStatus !== 'pro') {
+      setSubscriptions(prev =>
+        prev.map(sub => {
+          if (sub.userId === params.userId || (params.subscriptionId && sub.id === params.subscriptionId)) {
+            return {
+              ...sub,
+              studentName: params.name,
+              studentPhone: params.phone,
+              status: params.subscriptionStatus === 'expired' ? 'expired' : 'cancelled',
+              expiresAt: params.expiresAt || sub.expiresAt
+            };
+          }
+          return sub;
+        })
+      );
+    }
 
     if (currentSession && currentSession.userId === params.userId) {
       setCurrentSession(prev => prev ? {
@@ -2108,12 +2426,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         recoverSession,
         activeScreen,
         setActiveScreen,
-        previousQuestions,
-        selectedPreviousYear,
-        setSelectedPreviousYear,
-        savePreviousQuestion,
-        deletePreviousQuestion,
-        batchImportPreviousQuestions,
         activeAttempt,
         currentExamForAttempt,
         startExam,
@@ -2151,9 +2463,13 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         approvePaymentRequest,
         rejectPaymentRequest,
         isLoggedIn,
+        isEmailVerified,
         isVerifiedAdmin,
         loginWithGoogle,
         loginWithEmail,
+        resendVerificationEmail,
+        refreshVerificationStatus,
+        sendPasswordReset,
         getIdToken,
         logoutUser,
         showLoginModal,

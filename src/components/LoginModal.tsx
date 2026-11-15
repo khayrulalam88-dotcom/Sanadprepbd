@@ -2,37 +2,41 @@ import React, { useState } from 'react';
 import { useApp } from '../context/AppContext';
 import { OWNER_ADMIN_UID, auth, isVerifiedOwnerAccount } from '../lib/firebase';
 import { Logo } from './Logo';
-import { 
-  X, 
-  Phone, 
-  Mail, 
-  Lock, 
-  Eye, 
-  EyeOff, 
-  CheckCircle2, 
-  Sparkles, 
-  ShieldCheck, 
-  ArrowRight, 
-  User, 
-  LogOut
+import {
+  X,
+  Phone,
+  Mail,
+  Lock,
+  Eye,
+  EyeOff,
+  CheckCircle2,
+  ShieldCheck,
+  User,
+  LogOut,
+  RefreshCw,
+  KeyRound
 } from 'lucide-react';
 
 export const LoginModal: React.FC = () => {
-  const { 
-    showLoginModal, 
-    setShowLoginModal, 
-    isLoggedIn, 
-    currentUser, 
+  const {
+    showLoginModal,
+    setShowLoginModal,
+    isLoggedIn,
+    isEmailVerified,
+    currentUser,
     loginWithGoogle,
     loginWithEmail,
-    logoutUser, 
+    resendVerificationEmail,
+    refreshVerificationStatus,
+    sendPasswordReset,
+    logoutUser,
     setActiveScreen,
-    t, 
-    language 
+    t,
+    language
   } = useApp();
 
   const [authTab, setAuthTab] = useState<'email' | 'phone'>('email');
-  const [emailMode, setEmailMode] = useState<'signin' | 'signup'>('signin');
+  const [emailMode, setEmailMode] = useState<'signin' | 'signup' | 'forgot'>('signin');
   const [isGoogleLoading, setIsGoogleLoading] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -41,9 +45,6 @@ export const LoginModal: React.FC = () => {
   const [password, setPassword] = useState('');
   const [candidateName, setCandidateName] = useState('');
   const [showPassword, setShowPassword] = useState(false);
-
-  // Mobile guidance state
-  const [phoneNumber, setPhoneNumber] = useState('');
 
   // Feedback state
   const [successMessage, setSuccessMessage] = useState('');
@@ -54,6 +55,7 @@ export const LoginModal: React.FC = () => {
   const handleGoogleLogin = async () => {
     setIsGoogleLoading(true);
     setErrorMessage('');
+    setSuccessMessage('');
     try {
       const res = await loginWithGoogle();
       if (!res.success) {
@@ -65,14 +67,14 @@ export const LoginModal: React.FC = () => {
           setSuccessMessage('');
         }, 500);
       }
-    } catch (e: any) {
-      setErrorMessage(e?.message || 'Google Sign-In error');
+    } catch (e: unknown) {
+      setErrorMessage(e instanceof Error ? e.message : 'Google Sign-In error');
     } finally {
       setIsGoogleLoading(false);
     }
   };
 
-  // Real Email & Password Login / Registration via Firebase Auth
+  // Real Email & Password Login / Registration / Password Reset via Firebase Auth
   const handleEmailSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMessage('');
@@ -81,6 +83,26 @@ export const LoginModal: React.FC = () => {
     const cleanEmail = email.trim();
     if (!cleanEmail) {
       setErrorMessage(language === 'bn' ? 'ইমেইল অ্যাড্রেস প্রদান করুন।' : 'Please provide your email address.');
+      return;
+    }
+
+    if (emailMode === 'forgot') {
+      setIsSubmitting(true);
+      try {
+        const res = await sendPasswordReset(cleanEmail);
+        if (!res.success) {
+          setErrorMessage(res.error || (language === 'bn' ? 'পাসওয়ার্ড রিসেট ইমেইল পাঠানো যায়নি।' : 'Could not send password reset email.'));
+        } else {
+          setSuccessMessage(
+            language === 'bn'
+              ? 'পাসওয়ার্ড রিসেট লিংক আপনার ইমেইলে পাঠানো হয়েছে। অনুগ্রহ করে ইনবক্স ও স্প্যাম ফোল্ডার দেখুন।'
+              : 'Password reset link sent to your email. Please check your inbox and spam folder.'
+          );
+          setEmailMode('signin');
+        }
+      } finally {
+        setIsSubmitting(false);
+      }
       return;
     }
 
@@ -94,6 +116,12 @@ export const LoginModal: React.FC = () => {
       const res = await loginWithEmail(cleanEmail, password, emailMode === 'signup', candidateName.trim());
       if (!res.success) {
         setErrorMessage(res.error || (language === 'bn' ? 'প্রমাণীকরণ সম্পন্ন করা যায়নি।' : 'Authentication failed.'));
+      } else if (res.needsEmailVerification) {
+        setSuccessMessage(
+          language === 'bn'
+            ? 'নিবন্ধন সম্পন্ন হয়েছে! আপনার ইমেইলে একটি ভেরিফিকেশন লিংক পাঠানো হয়েছে। পরীক্ষা শুরু করার আগে অনুগ্রহ করে ইমেইল যাচাই করুন।'
+            : 'Account created! A verification email has been sent to your inbox. Please verify your email before continuing.'
+        );
       } else {
         setSuccessMessage(
           emailMode === 'signup'
@@ -105,8 +133,55 @@ export const LoginModal: React.FC = () => {
           setSuccessMessage('');
         }, 600);
       }
-    } catch (err: any) {
-      setErrorMessage(err?.message || 'Authentication error');
+    } catch (err: unknown) {
+      setErrorMessage(err instanceof Error ? err.message : 'Authentication error');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleResendVerification = async () => {
+    setErrorMessage('');
+    setSuccessMessage('');
+    setIsSubmitting(true);
+    try {
+      const res = await resendVerificationEmail();
+      if (!res.success) {
+        setErrorMessage(res.error || t('ভেরিফিকেশন ইমেইল পাঠানো যায়নি।', 'Failed to send verification email.'));
+      } else {
+        setSuccessMessage(
+          t(
+            'ভেরিফিকেশন লিংক পুনরায় পাঠানো হয়েছে। অনুগ্রহ করে ইমেইল যাচাই করে নিচের বাটনে ক্লিক করুন।',
+            'Verification link re-sent. Check your inbox and click verify below.'
+          )
+        );
+      }
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleCheckVerified = async () => {
+    setErrorMessage('');
+    setSuccessMessage('');
+    setIsSubmitting(true);
+    try {
+      const res = await refreshVerificationStatus();
+      if (res.verified) {
+        setSuccessMessage(t('ইমেইল সফলভাবে যাচাই সম্পন্ন হয়েছে!', 'Email verified successfully!'));
+        setTimeout(() => {
+          setShowLoginModal(false);
+          setSuccessMessage('');
+        }, 500);
+      } else {
+        setErrorMessage(
+          res.error ||
+            t(
+              'ইমেইল এখনো যাচাইকৃত হিসেবে পাওয়া যায়নি। অনুগ্রহ করে ইমেইলের লিংকে ক্লিক করে আবার চেষ্টা করুন।',
+              'Email is not verified yet. Please click the verification link in your email and try again.'
+            )
+        );
+      }
     } finally {
       setIsSubmitting(false);
     }
@@ -114,11 +189,10 @@ export const LoginModal: React.FC = () => {
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/70 backdrop-blur-xs animate-in fade-in duration-200">
-      <div 
+      <div
         className="bg-white rounded-3xl max-w-md w-full shadow-2xl border border-slate-100 overflow-hidden relative"
         onClick={(e) => e.stopPropagation()}
       >
-        
         {/* Close Button */}
         <button
           onClick={() => setShowLoginModal(false)}
@@ -127,7 +201,7 @@ export const LoginModal: React.FC = () => {
           <X className="w-4 h-4" />
         </button>
 
-        {/* Modal Header without any 7-day trial notice */}
+        {/* Modal Header */}
         <div className="bg-gradient-to-br from-[#102A43] to-[#243B53] text-white p-6 pb-5">
           <div className="flex items-center justify-between mb-3">
             <Logo size="sm" theme="light" variant="navbar" language={language} />
@@ -140,15 +214,14 @@ export const LoginModal: React.FC = () => {
             {language === 'bn' ? 'লগইন করুন' : 'Sign In to Your Account'}
           </h2>
           <p className="text-xs text-slate-300 mt-1">
-            {language === 'bn' 
-              ? 'বার কাউন্সিল পরীক্ষার পূর্ণাঙ্গ প্রস্তুতি ও ৬০ মিনিটের লাইভ মক টেস্ট।' 
+            {language === 'bn'
+              ? 'বার কাউন্সিল পরীক্ষার পূর্ণাঙ্গ প্রস্তুতি ও ৬০ মিনিটের লাইভ মক টেস্ট।'
               : 'Access timed mock tests, questions & legal statutory references.'}
           </p>
         </div>
 
         {/* Content Body */}
         <div className="p-6 space-y-4">
-
           {/* Already logged in status */}
           {isLoggedIn && (
             <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200 text-xs space-y-3">
@@ -156,8 +229,14 @@ export const LoginModal: React.FC = () => {
                 <span className="font-bold text-slate-500 uppercase tracking-wider text-[11px]">
                   {t('বর্তমান একাউন্ট', 'Current Account')}
                 </span>
-                <span className="px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 font-bold text-[10px]">
-                  ACTIVE
+                <span
+                  className={`px-2 py-0.5 rounded-full font-bold text-[10px] ${
+                    isEmailVerified
+                      ? 'bg-emerald-100 text-emerald-800'
+                      : 'bg-amber-100 text-amber-800'
+                  }`}
+                >
+                  {isEmailVerified ? 'VERIFIED' : 'EMAIL UNVERIFIED'}
                 </span>
               </div>
               <div className="flex items-center gap-3">
@@ -172,6 +251,36 @@ export const LoginModal: React.FC = () => {
                   </p>
                 </div>
               </div>
+
+              {!isEmailVerified && (
+                <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 space-y-2">
+                  <p className="text-[11px] text-amber-900 font-semibold leading-relaxed">
+                    {t(
+                      'পরীক্ষা, অনুশীলন এবং পেমেন্ট সুবিধা চালু করতে আপনার ইমেইল ভেরিফিকেশন সম্পন্ন করুন।',
+                      'Verify your email address to unlock exams, practice, and payment requests.'
+                    )}
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      disabled={isSubmitting}
+                      onClick={handleResendVerification}
+                      className="px-3 py-1.5 rounded-lg bg-white border border-amber-300 text-amber-900 font-bold text-[11px] hover:bg-amber-100 transition cursor-pointer disabled:opacity-50"
+                    >
+                      {t('ভেরিফিকেশন ইমেইল পুনরায় পাঠান', 'Resend Email')}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isSubmitting}
+                      onClick={handleCheckVerified}
+                      className="px-3 py-1.5 rounded-lg bg-[#102A43] text-[#D4AF37] font-bold text-[11px] hover:bg-[#243B53] transition cursor-pointer flex items-center gap-1 disabled:opacity-50"
+                    >
+                      <RefreshCw className="w-3 h-3" />
+                      <span>{t('যাচাই সম্পন্ন — চালিয়ে যান', 'I Verified — Continue')}</span>
+                    </button>
+                  </div>
+                </div>
+              )}
 
               <div className="flex items-center gap-2 pt-2 border-t border-slate-200">
                 {isVerifiedOwnerAccount(auth?.currentUser) && currentUser.uid === OWNER_ADMIN_UID && (
@@ -213,8 +322,8 @@ export const LoginModal: React.FC = () => {
               <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z" />
             </svg>
             <span>
-              {isGoogleLoading 
-                ? t('যাচাই করা হচ্ছে...', 'Authenticating...') 
+              {isGoogleLoading
+                ? t('যাচাই করা হচ্ছে...', 'Authenticating...')
                 : t('গুগল দিয়ে নিরাপদ সাইন ইন (Firebase)', 'Sign in with Google (Firebase Auth)')}
             </span>
           </button>
@@ -258,7 +367,7 @@ export const LoginModal: React.FC = () => {
           )}
           {successMessage && (
             <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-semibold flex items-center gap-2">
-              <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
               <span>{successMessage}</span>
             </div>
           )}
@@ -266,8 +375,8 @@ export const LoginModal: React.FC = () => {
           {/* Tab 1: Email & Password (Real Firebase Auth) */}
           {authTab === 'email' && (
             <form onSubmit={handleEmailSubmit} className="space-y-3">
-              {/* Sign In vs Sign Up Toggle */}
-              <div className="flex items-center justify-center gap-2 p-1 bg-slate-50 border border-slate-200 rounded-lg text-[11px] font-bold">
+              {/* Sign In vs Sign Up vs Forgot Toggle */}
+              <div className="flex items-center justify-center gap-1 p-1 bg-slate-50 border border-slate-200 rounded-lg text-[11px] font-bold">
                 <button
                   type="button"
                   onClick={() => { setEmailMode('signin'); setErrorMessage(''); }}
@@ -275,7 +384,7 @@ export const LoginModal: React.FC = () => {
                     emailMode === 'signin' ? 'bg-[#102A43] text-[#D4AF37]' : 'text-slate-600 hover:text-slate-900'
                   }`}
                 >
-                  {t('সাইন ইন (Sign In)', 'Sign In')}
+                  {t('সাইন ইন', 'Sign In')}
                 </button>
                 <button
                   type="button"
@@ -284,7 +393,16 @@ export const LoginModal: React.FC = () => {
                     emailMode === 'signup' ? 'bg-[#102A43] text-[#D4AF37]' : 'text-slate-600 hover:text-slate-900'
                   }`}
                 >
-                  {t('নতুন একাউন্ট (Sign Up)', 'Create Account')}
+                  {t('নতুন একাউন্ট', 'Sign Up')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setEmailMode('forgot'); setErrorMessage(''); }}
+                  className={`flex-1 py-1 rounded transition cursor-pointer ${
+                    emailMode === 'forgot' ? 'bg-[#102A43] text-[#D4AF37]' : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  {t('পাসওয়ার্ড রিসেট', 'Reset')}
                 </button>
               </div>
 
@@ -324,39 +442,59 @@ export const LoginModal: React.FC = () => {
                 </div>
               </div>
 
-              <div>
-                <label className="block text-xs font-bold text-slate-700 mb-1">
-                  {t('পাসওয়ার্ড', 'Password')}
-                </label>
-                <div className="flex items-center rounded-xl border border-slate-300 p-2.5 bg-white focus-within:border-[#102A43]">
-                  <Lock className="w-4 h-4 text-slate-400 mr-2" />
-                  <input
-                    type={showPassword ? 'text' : 'password'}
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    placeholder="••••••••"
-                    className="flex-1 text-xs text-slate-900 outline-none"
-                    required
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowPassword(!showPassword)}
-                    className="text-slate-400 hover:text-slate-600 cursor-pointer"
-                  >
-                    {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                  </button>
+              {emailMode !== 'forgot' && (
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="block text-xs font-bold text-slate-700">
+                      {t('পাসওয়ার্ড', 'Password')}
+                    </label>
+                    {emailMode === 'signin' && (
+                      <button
+                        type="button"
+                        onClick={() => { setEmailMode('forgot'); setErrorMessage(''); setSuccessMessage(''); }}
+                        className="text-[11px] font-semibold text-[#102A43] hover:underline cursor-pointer"
+                      >
+                        {t('পাসওয়ার্ড ভুলে গেছেন?', 'Forgot password?')}
+                      </button>
+                    )}
+                  </div>
+                  <div className="flex items-center rounded-xl border border-slate-300 p-2.5 bg-white focus-within:border-[#102A43]">
+                    <Lock className="w-4 h-4 text-slate-400 mr-2" />
+                    <input
+                      type={showPassword ? 'text' : 'password'}
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      placeholder="••••••••"
+                      className="flex-1 text-xs text-slate-900 outline-none"
+                      required
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowPassword(!showPassword)}
+                      className="text-slate-400 hover:text-slate-600 cursor-pointer"
+                    >
+                      {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                    </button>
+                  </div>
                 </div>
-              </div>
+              )}
 
               <button
                 type="submit"
                 disabled={isSubmitting}
                 className="w-full py-3 rounded-xl bg-[#102A43] hover:bg-[#243B53] text-[#D4AF37] font-bold text-xs transition shadow-sm cursor-pointer disabled:opacity-60 flex items-center justify-center gap-2"
               >
+                {emailMode === 'forgot' && <KeyRound className="w-3.5 h-3.5" />}
                 {isSubmitting ? (
                   <span>{t('যাচাই করা হচ্ছে...', 'Processing...')}</span>
                 ) : (
-                  <span>{emailMode === 'signup' ? t('নিবন্ধন সম্পন্ন করুন', 'Register Account') : t('নিরাপদ সাইন ইন', 'Sign In')}</span>
+                  <span>
+                    {emailMode === 'forgot'
+                      ? t('পাসওয়ার্ড রিসেট লিংক পাঠান', 'Send Reset Link')
+                      : emailMode === 'signup'
+                        ? t('নিবন্ধন সম্পন্ন করুন', 'Register Account')
+                        : t('নিরাপদ সাইন ইন', 'Sign In')}
+                  </span>
                 )}
               </button>
             </form>
@@ -398,7 +536,6 @@ export const LoginModal: React.FC = () => {
           <p className="text-[11px] text-center text-slate-400 pt-2 border-t border-slate-100">
             {t('নিরাপদ ও এনক্রিপ্টেড ডাটাবেস। একাউন্ট শেয়ারিং সুরক্ষা সক্রিয়।', 'Secure & encrypted authentication. Account sharing protection active.')}
           </p>
-
         </div>
       </div>
     </div>

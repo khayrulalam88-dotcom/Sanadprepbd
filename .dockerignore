@@ -1,0 +1,22 @@
+# Dependencies and build outputs
+node_modules/
+dist/
+
+# Version control & IDE metadata
+.git/
+.gitignore
+.DS_Store
+.aistudio/
+
+# Environment & credentials (never bake secrets into Docker images)
+.env
+.env.*
+*service-account*.json
+*firebase-adminsdk*.json
+
+# Audit backups & temporary logs
+.backup_*/
+android/
+*.log
+*.tmp
+*.bak

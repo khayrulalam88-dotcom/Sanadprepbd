@@ -1,22 +1,26 @@
+import 'dotenv/config';
 import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
-import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
+import type { Firestore } from 'firebase-admin/firestore';
 import type {
   SubscriptionPackage,
   ExamDateConfig,
   UserSubscription,
   PaymentRequest,
+  PaymentSettings,
+  SupportContactSettings,
   StudentSession,
   ExamResult,
   ExamAttempt,
   Exam,
   LeaderboardEntry,
+  Question,
   ServerQuestion,
-  ServerPreviousQuestion,
+  AuditLog,
   UserRole
 } from './src/types/index.ts';
 import { calculateExamScore } from './src/utils/scoring.ts';
@@ -29,26 +33,35 @@ import {
   persistenceState,
   probeFirestoreAdminConnectivity,
   createMemoryMirror,
+  consumeRateLimit,
+  resolveWorkspacePath,
   checkUserHasActiveSubscription,
   getAllQuestionsAuthoritative,
+  getSanitizedQuestionsAuthoritative,
+  invalidateQuestionBankCache,
+  createQuestionBankVersionPayload,
+  getConfiguredDatabaseInfo,
+  assertExpectedNamedDatabase,
   getAuthoritativeExam,
   getAuthoritativeQuestionMap,
   sanitizeQuestionForClient,
-  sanitizePreviousQuestionForClient,
   isoToTimestamp,
+  timestampToIso,
   isAlreadyExistsError,
   isPermissionOrCredentialError,
+  getSafeDiagnosticError,
   migrateAllSubscriptionTimestampsAdmin,
   importMissingDataToFirestoreAdmin,
   type MemoryMirror
 } from './server/services/firestoreBackend.ts';
+import { isGeminiConfigured } from './server/services/geminiService.ts';
 
 const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 export interface DecodedAuthUser {
   uid: string;
   email?: string;
+  emailVerified?: boolean;
   name?: string;
 }
 
@@ -59,10 +72,23 @@ export interface AuthenticatedRequest extends Request {
 
 export type TokenVerifier = (idToken: string) => Promise<DecodedAuthUser>;
 
-function isOwnerUser(user?: { uid?: string; email?: string }): boolean {
+class HttpError extends Error {
+  status: number;
+  code: string;
+  constructor(status: number, code: string, message: string) {
+    super(message);
+    this.status = status;
+    this.code = code;
+  }
+}
+
+function isOwnerUser(user?: { uid?: string; email?: string; emailVerified?: boolean }): boolean {
   if (!user || !user.uid) return false;
   if (user.uid !== OWNER_ADMIN_UID) return false;
-  if (user.email && user.email.toLowerCase().trim() !== OWNER_ADMIN_EMAIL) return false;
+  if (typeof user.email !== 'string' || user.email.trim().toLowerCase() !== OWNER_ADMIN_EMAIL) {
+    return false;
+  }
+  if (user.emailVerified !== true) return false;
   return true;
 }
 
@@ -84,32 +110,115 @@ export function calculateSubscriptionExpiry(
   return new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString();
 }
 
-function isOriginAllowed(origin?: string): boolean {
-  if (!origin) return true;
-  const extraOrigins = (process.env.ALLOWED_ORIGIN || '')
+export function parseAllowedOrigins(raw?: string): Set<string> {
+  const allowed = new Set<string>();
+  const entries = (raw || '')
     .split(',')
     .map(s => s.trim())
     .filter(Boolean);
-  if (extraOrigins.includes(origin)) return true;
+  for (const entry of entries) {
+    try {
+      const parsed = new URL(entry);
+      if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+        allowed.add(parsed.origin.toLowerCase());
+      }
+    } catch {
+      // Ignore malformed origin entries
+    }
+  }
+  return allowed;
+}
 
+export function isOriginAllowed(
+  origin?: string,
+  options?: { isProduction?: boolean; allowedOriginEnv?: string }
+): boolean {
+  if (!origin) return true;
+
+  let parsedOrigin: URL;
   try {
-    const url = new URL(origin);
-    const host = url.hostname.toLowerCase();
-    if (host === 'localhost' || host === '127.0.0.1') return true;
-    if (host.endsWith('.pages.dev') || host.endsWith('.workers.dev') || host.endsWith('.run.app')) return true;
+    parsedOrigin = new URL(origin);
   } catch {
     return false;
   }
+
+  if (parsedOrigin.protocol !== 'http:' && parsedOrigin.protocol !== 'https:') {
+    return false;
+  }
+
+  const normalizedOrigin = parsedOrigin.origin.toLowerCase();
+  const isProd = options?.isProduction ?? (process.env.NODE_ENV === 'production');
+  const allowedSet = parseAllowedOrigins(
+    options?.allowedOriginEnv !== undefined ? options.allowedOriginEnv : process.env.ALLOWED_ORIGIN
+  );
+
+  if (allowedSet.has(normalizedOrigin)) {
+    return true;
+  }
+
+  const host = parsedOrigin.hostname.toLowerCase();
+  if (!isProd && (host === 'localhost' || host === '127.0.0.1')) {
+    return true;
+  }
+
   return false;
+}
+
+function sendRouteError(
+  res: Response,
+  context: string,
+  err: unknown,
+  defaultCode = 'DATABASE_ERROR',
+  defaultMessage = 'Database operation failed.'
+) {
+  if (err instanceof HttpError) {
+    return res.status(err.status).json({ error: err.code, message: err.message });
+  }
+  if (isAlreadyExistsError(err)) {
+    return res.status(409).json({ error: 'ALREADY_EXISTS', message: 'Record already exists.' });
+  }
+  const safe = getSafeDiagnosticError(err);
+  console.error(`[SanadPrep][${context}]`, safe.code ?? '', safe.message);
+  return res.status(500).json({ error: defaultCode, message: defaultMessage });
 }
 
 export function createSanadPrepApp(options?: {
   tokenVerifier?: TokenVerifier;
   mirror?: MemoryMirror;
   disableFirestoreWrites?: boolean;
+  firestoreDb?: Firestore;
+  isProduction?: boolean;
+  allowedOriginEnv?: string;
+  questionBankCacheTtlMs?: number;
+  rateLimitOverrides?: {
+    windowMs?: number;
+    globalMax?: number;
+    routeMax?: Record<string, number>;
+  };
 }) {
   const mirror: MemoryMirror = options?.mirror || createMemoryMirror();
-  const useFirestore = () => !options?.disableFirestoreWrites && persistenceState.mode === 'firestore';
+  const isProductionMode = options?.isProduction ?? (process.env.NODE_ENV === 'production');
+  const db: Firestore = options?.firestoreDb || adminDb;
+  const allowMemoryFallback = !isProductionMode;
+  const dbInfo = getConfiguredDatabaseInfo(db);
+  const dbValidation = assertExpectedNamedDatabase(db);
+
+  const isFirestoreReady = () => {
+    if (options?.disableFirestoreWrites) return false;
+    if (options?.firestoreDb) return true;
+    return persistenceState.mode === 'firestore';
+  };
+
+  const useFirestore = () => isFirestoreReady();
+
+  async function recordAuditLog(entry: AuditLog): Promise<void> {
+    if (useFirestore()) {
+      await db.collection('auditLogs').doc(entry.id).set(entry);
+    }
+    if (!isProductionMode) {
+      mirror.auditLogs.unshift(entry);
+    }
+  }
 
   const verifyIdToken: TokenVerifier =
     options?.tokenVerifier ||
@@ -118,9 +227,67 @@ export function createSanadPrepApp(options?: {
       return {
         uid: decoded.uid,
         email: decoded.email,
+        emailVerified: decoded.email_verified === true,
         name: decoded.name || decoded.email?.split('@')[0] || 'Student'
       };
     });
+
+  function requireProductionDatabase(req: Request, res: Response, next: NextFunction) {
+    if (isProductionMode && !useFirestore() && req.path !== '/health' && req.path !== '/api/health') {
+      return res.status(503).json({
+        error: 'FIRESTORE_UNAVAILABLE',
+        message: 'Authoritative database unavailable in production.'
+      });
+    }
+    return next();
+  }
+
+  function createRateLimiter(bucketName: string, defaultMax: number, keyBy: 'ip' | 'uid' = 'uid') {
+    const windowMs = options?.rateLimitOverrides?.windowMs ?? 60_000;
+    const maxRequests =
+      bucketName === 'global'
+        ? (options?.rateLimitOverrides?.globalMax ?? defaultMax)
+        : (options?.rateLimitOverrides?.routeMax?.[bucketName] ?? defaultMax);
+
+    return async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+      if (bucketName === 'global' && (req.path === '/health' || req.path === '/api/health')) {
+        return next();
+      }
+      try {
+        const subject =
+          keyBy === 'uid' && req.authUser?.uid
+            ? `uid_${req.authUser.uid}`
+            : `ip_${req.ip || req.socket.remoteAddress || 'unknown'}`;
+        const result = await consumeRateLimit({
+          key: `${bucketName}:${subject}`,
+          windowMs,
+          maxRequests,
+          db,
+          useFirestoreDb: useFirestore()
+        });
+        res.setHeader('X-RateLimit-Limit', String(result.limit));
+        res.setHeader('X-RateLimit-Remaining', String(result.remaining));
+        if (!result.allowed) {
+          res.setHeader('Retry-After', String(result.retryAfterSeconds));
+          return res.status(429).json({
+            error: 'RATE_LIMITED',
+            retryAfterSeconds: result.retryAfterSeconds,
+            message: `অতিরিক্ত অনুরোধ পাঠানো হয়েছে। অনুগ্রহ করে ${result.retryAfterSeconds} সেকেন্ড পর আবার চেষ্টা করুন।`
+          });
+        }
+        return next();
+      } catch (err) {
+        return sendRouteError(res, `rateLimit:${bucketName}`, err);
+      }
+    };
+  }
+
+  const globalRateLimiter = createRateLimiter('global', 120, 'ip');
+  const practiceCheckRateLimiter = createRateLimiter('practice_check', 30, 'uid');
+  const authSessionRateLimiter = createRateLimiter('auth_session', 15, 'uid');
+  const paymentsCreateRateLimiter = createRateLimiter('payments_create', 10, 'uid');
+  const examsStartRateLimiter = createRateLimiter('exams_start', 15, 'uid');
+  const examsSubmitRateLimiter = createRateLimiter('exams_submit', 15, 'uid');
 
   async function requireFirebaseAuth(req: AuthenticatedRequest, res: Response, next: NextFunction) {
     const authHeader = req.headers.authorization;
@@ -137,7 +304,14 @@ export function createSanadPrepApp(options?: {
     }
 
     try {
-      req.authUser = await verifyIdToken(idToken);
+      const decoded = await verifyIdToken(idToken);
+      if (decoded.emailVerified !== true) {
+        return res.status(403).json({
+          error: 'EMAIL_NOT_VERIFIED',
+          message: 'অ্যাকাউন্ট সক্রিয় করতে অনুগ্রহ করে আপনার ইমেইল ভেরিফাই করুন।'
+        });
+      }
+      req.authUser = decoded;
       return next();
     } catch {
       return res.status(401).json({
@@ -157,16 +331,81 @@ export function createSanadPrepApp(options?: {
     return next();
   }
 
-  function authenticateSession(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  async function authenticateSession(req: AuthenticatedRequest, res: Response, next: NextFunction) {
     const sessionTokenHeader = req.headers['x-session-id'];
     const token = typeof sessionTokenHeader === 'string' ? sessionTokenHeader.trim() : '';
     if (!token) {
-      return next();
+      return res.status(401).json({
+        error: 'SESSION_REQUIRED',
+        message: 'সক্রিয় ডিভাইস সেশন পাওয়া যায়নি। অনুগ্রহ করে পুনরায় সাইন ইন করুন।'
+      });
     }
+
+    if (useFirestore()) {
+      try {
+        const uid = req.authUser?.uid;
+        const [sessSnap, userSessSnap] = await Promise.all([
+          db.collection('sessions').doc(token).get(),
+          uid ? db.collection('userSessions').doc(uid).get() : Promise.resolve(null)
+        ]);
+
+        if (!sessSnap.exists) {
+          return res.status(401).json({
+            error: 'SESSION_REQUIRED',
+            message: 'সেশনটি খুঁজে পাওয়া যায়নি বা মেয়াদ শেষ হয়েছে। অনুগ্রহ করে পুনরায় সাইন ইন করুন।'
+          });
+        }
+
+        const session = sessSnap.data() as StudentSession;
+        if (req.authUser && session.userId !== req.authUser.uid) {
+          return res.status(403).json({
+            error: 'SESSION_MISMATCH',
+            message: 'Session does not match authenticated user.'
+          });
+        }
+
+        const currentActiveId = userSessSnap?.exists
+          ? (userSessSnap.data()?.activeSessionId as string | undefined)
+          : undefined;
+
+        if (session.status === 'revoked' || (currentActiveId && currentActiveId !== token)) {
+          if (session.status !== 'revoked') {
+            await db
+              .collection('sessions')
+              .doc(token)
+              .update({ status: 'revoked', revokedReason: 'Logged in from another device/browser' });
+          }
+          return res.status(401).json({
+            error: 'SESSION_REVOKED',
+            message: 'একই অ্যাকাউন্ট অন্য ডিভাইস থেকে লগইন করা হয়েছে। আপনার পূর্ববর্তী সেশনটি বন্ধ করা হয়েছে।'
+          });
+        }
+
+        const nowIso = new Date().toISOString();
+        await db.collection('sessions').doc(token).update({ lastActiveAt: nowIso });
+        req.session = { ...session, lastActiveAt: nowIso };
+        return next();
+      } catch (err) {
+        return sendRouteError(
+          res,
+          'authenticateSession',
+          err,
+          'SESSION_CHECK_FAILED',
+          'Failed to verify session state.'
+        );
+      }
+    }
+
+    if (!allowMemoryFallback) {
+      return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE', message: 'Database unavailable.' });
+    }
+
     const session = mirror.sessions[token];
     if (!session) {
-      // Allow stateless Cloud Run horizontal scale when Firebase ID token is valid unless explicitly revoked in mirror
-      return next();
+      return res.status(401).json({
+        error: 'SESSION_REQUIRED',
+        message: 'সেশনটি খুঁজে পাওয়া যায়নি বা মেয়াদ শেষ হয়েছে। অনুগ্রহ করে পুনরায় সাইন ইন করুন।'
+      });
     }
     if (req.authUser && session.userId !== req.authUser.uid) {
       return res.status(403).json({ error: 'SESSION_MISMATCH', message: 'Session does not match authenticated user.' });
@@ -192,68 +431,175 @@ export function createSanadPrepApp(options?: {
   }
 
   const app = express();
+  app.disable('x-powered-by');
+  app.set('trust proxy', 1);
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
+    if (isProductionMode) {
+      res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
+    next();
+  });
   app.use(
     cors({
       origin: (origin, callback) => {
-        if (isOriginAllowed(origin)) {
+        if (
+          isOriginAllowed(origin, {
+            isProduction: isProductionMode,
+            allowedOriginEnv: options?.allowedOriginEnv
+          })
+        ) {
           callback(null, true);
         } else {
-          callback(new Error('Not allowed by CORS'));
+          callback(new HttpError(403, 'CORS_ORIGIN_NOT_ALLOWED', 'Origin not allowed by CORS policy.'));
         }
       },
       allowedHeaders: ['Content-Type', 'Authorization', 'X-Session-Id'],
       credentials: true
     })
   );
+  app.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+    if (err instanceof HttpError && err.code === 'CORS_ORIGIN_NOT_ALLOWED') {
+      return res.status(403).json({ error: err.code, message: err.message });
+    }
+    return next(err);
+  });
   app.use(express.json({ limit: '5mb' }));
+  app.use(['/api/previous-questions', '/api/admin/previous-questions'], (_req, res) => {
+    return res.status(404).json({
+      error: 'NOT_FOUND',
+      message: 'This endpoint has been permanently retired.'
+    });
+  });
+  app.use('/api', requireProductionDatabase);
+  app.use('/api', globalRateLimiter);
 
   // ---------------------------------------------------------
   // HEALTH & PUBLIC CONFIGURATION ENDPOINTS
   // ---------------------------------------------------------
-  app.get('/api/health', (_req, res) => {
-    res.json({
-      status: 'ok',
+  app.get(['/health', '/api/health'], (_req, res) => {
+    const mode = useFirestore() ? 'firestore' : isProductionMode ? 'unavailable' : 'memory-fallback';
+    const healthy = !isProductionMode || (mode === 'firestore' && dbValidation.valid);
+    return res.status(healthy ? 200 : 503).json({
+      status: healthy ? 'ok' : 'degraded',
       service: 'Sanad Prep BD Subscription & Examination Engine',
-      persistenceMode: useFirestore() ? 'firestore' : 'memory-fallback',
+      persistenceMode: mode,
+      environment: isProductionMode ? 'production' : 'development',
+      projectId: dbInfo.projectId,
+      databaseId: dbInfo.configuredDatabaseId,
+      expectedDatabaseMatched: dbValidation.valid,
       questionBankCount: mirror.questions.length,
       examCount: mirror.exams.length,
+      geminiConfigured: isGeminiConfigured(),
       serverTime: new Date().toISOString(),
       timezone: mirror.examDateConfig.timezone
     });
   });
 
   app.get('/api/packages', async (_req, res) => {
-    let packagesList = mirror.packages;
-    if (useFirestore()) {
-      try {
-        const snap = await adminDb.collection('packages').get();
-        if (!snap.empty) {
-          packagesList = snap.docs.map(d => ({ id: d.id, ...(d.data() as Omit<SubscriptionPackage, 'id'>) }));
-        }
-      } catch {
-        // use mirror
+    try {
+      if (useFirestore()) {
+        const [pkgSnap, configSnap] = await Promise.all([
+          db.collection('packages').get(),
+          db.collection('config').doc('examDate').get()
+        ]);
+        const examPassPrice = configSnap.exists ? (configSnap.data()?.examPassPrice as number | undefined) : undefined;
+        const packagesList = pkgSnap.docs.map(d => ({
+          id: d.id,
+          ...(d.data() as Omit<SubscriptionPackage, 'id'>)
+        }));
+        const active = packagesList.filter(p => p.isActive && !p.isArchived);
+        const mapped = active.map(p =>
+          p.id === 'pkg_exam_pass' && typeof examPassPrice === 'number' ? { ...p, price: examPassPrice } : p
+        );
+        return res.json({ packages: mapped });
       }
+
+      if (!allowMemoryFallback) {
+        return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+      }
+      const active = mirror.packages.filter(p => p.isActive && !p.isArchived);
+      const mapped = active.map(p =>
+        p.id === 'pkg_exam_pass' ? { ...p, price: mirror.examDateConfig.examPassPrice } : p
+      );
+      return res.json({ packages: mapped });
+    } catch (err) {
+      return sendRouteError(res, 'GET /api/packages', err);
     }
-    const active = packagesList.filter(p => p.isActive && !p.isArchived);
-    const mapped = active.map(p =>
-      p.id === 'pkg_exam_pass' ? { ...p, price: mirror.examDateConfig.examPassPrice } : p
-    );
-    res.json({ packages: mapped });
   });
 
-  app.get('/api/exam-config', (_req, res) => {
-    res.json({ examDateConfig: mirror.examDateConfig });
+  app.get('/api/exam-config', async (_req, res) => {
+    try {
+      if (useFirestore()) {
+        const snap = await db.collection('config').doc('examDate').get();
+        const examDateConfig = snap.exists
+          ? { ...mirror.examDateConfig, ...(snap.data() as Partial<ExamDateConfig>) }
+          : mirror.examDateConfig;
+        return res.json({ examDateConfig });
+      }
+      if (!allowMemoryFallback) {
+        return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+      }
+      return res.json({ examDateConfig: mirror.examDateConfig });
+    } catch (err) {
+      return sendRouteError(res, 'GET /api/exam-config', err);
+    }
   });
 
-  app.get('/api/payment-settings', (_req, res) => {
-    res.json({
-      paymentSettings: mirror.paymentSettings,
-      supportSettings: mirror.supportSettings
-    });
+  app.get('/api/payment-settings', async (_req, res) => {
+    try {
+      if (useFirestore()) {
+        const [paySnap, supSnap] = await Promise.all([
+          db.collection('config').doc('paymentSettings').get(),
+          db.collection('config').doc('supportSettings').get()
+        ]);
+        const paymentSettings: PaymentSettings = {
+          ...mirror.paymentSettings,
+          ...(paySnap.exists ? (paySnap.data() as Partial<PaymentSettings>) : {})
+        };
+        const supportSettings: SupportContactSettings = {
+          ...mirror.supportSettings,
+          ...(supSnap.exists ? (supSnap.data() as Partial<SupportContactSettings>) : {})
+        };
+        if (supSnap.exists) {
+          paymentSettings.whatsappNumber = supportSettings.whatsappNumber;
+          paymentSettings.whatsappMessage = supportSettings.whatsappMessage;
+        }
+        return res.json({ paymentSettings, supportSettings });
+      }
+      if (!allowMemoryFallback) {
+        return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+      }
+      return res.json({
+        paymentSettings: mirror.paymentSettings,
+        supportSettings: mirror.supportSettings
+      });
+    } catch (err) {
+      return sendRouteError(res, 'GET /api/payment-settings', err);
+    }
   });
 
-  app.get('/api/support-settings', (_req, res) => {
-    res.json({ supportSettings: mirror.supportSettings });
+  app.get('/api/support-settings', async (_req, res) => {
+    try {
+      if (useFirestore()) {
+        const supSnap = await db.collection('config').doc('supportSettings').get();
+        const supportSettings: SupportContactSettings = {
+          ...mirror.supportSettings,
+          ...(supSnap.exists ? (supSnap.data() as Partial<SupportContactSettings>) : {})
+        };
+        return res.json({ supportSettings });
+      }
+      if (!allowMemoryFallback) {
+        return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+      }
+      return res.json({ supportSettings: mirror.supportSettings });
+    } catch (err) {
+      return sendRouteError(res, 'GET /api/support-settings', err);
+    }
   });
 
   app.get('/api/subjects', (_req, res) => {
@@ -261,1476 +607,2478 @@ export function createSanadPrepApp(options?: {
   });
 
   app.get('/api/exams', async (_req, res) => {
-    let examList = mirror.exams;
-    if (useFirestore()) {
-      try {
-        const snap = await adminDb.collection('exams').get();
-        if (!snap.empty) {
-          examList = snap.docs.map(d => {
-            const data = d.data() as Omit<Exam, 'id'>;
-            return {
-              id: d.id,
-              ...data,
-              isActive: data.isActive !== undefined ? data.isActive : (!data.isPaid || d.id === 'exam_model_test_01'),
-              scheduledDate: data.scheduledDate || undefined
-            };
-          });
-        }
-      } catch {
-        // use mirror
+    try {
+      if (useFirestore()) {
+        const snap = await db.collection('exams').get();
+        const examList = snap.docs.map(d => {
+          const data = d.data() as Omit<Exam, 'id'>;
+          return {
+            id: d.id,
+            ...data,
+            isActive: data.isActive !== undefined ? data.isActive : (!data.isPaid || d.id === 'exam_model_test_01'),
+            scheduledDate: data.scheduledDate || undefined
+          };
+        });
+        return res.json({ exams: examList });
       }
+      if (!allowMemoryFallback) {
+        return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+      }
+      return res.json({ exams: mirror.exams });
+    } catch (err) {
+      return sendRouteError(res, 'GET /api/exams', err);
     }
-    // Preserve full exam catalog metadata (without exposing answer keys)
-    res.json({ exams: examList });
   });
 
   app.get('/api/leaderboard', async (req, res) => {
-    const examId = typeof req.query.examId === 'string' ? req.query.examId : undefined;
-    let entries = [...mirror.leaderboard];
-    if (useFirestore()) {
-      try {
+    try {
+      const examId = typeof req.query.examId === 'string' ? req.query.examId : undefined;
+      let entries: LeaderboardEntry[];
+      if (useFirestore()) {
         const qRef =
           examId && examId !== 'all'
-            ? adminDb.collection('leaderboard').where('examId', '==', examId).limit(50)
-            : adminDb.collection('leaderboard').limit(50);
+            ? db.collection('leaderboard').where('examId', '==', examId)
+            : db.collection('leaderboard');
         const snap = await qRef.get();
-        if (!snap.empty) {
-          entries = snap.docs.map(d => d.data() as LeaderboardEntry);
+        entries = snap.docs.map(d => d.data() as LeaderboardEntry);
+      } else {
+        if (!allowMemoryFallback) {
+          return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
         }
-      } catch {
-        // fallback to mirror
+        entries = [...mirror.leaderboard];
+        if (examId && examId !== 'all') {
+          entries = entries.filter(e => e.examId === examId);
+        }
       }
+
+      entries.sort((a, b) => b.score - a.score || a.timeSpentSeconds - b.timeSpentSeconds);
+      const top50 = entries.slice(0, 50).map((e, i) => ({ ...e, rank: i + 1 }));
+      return res.json({ leaderboard: top50 });
+    } catch (err) {
+      return sendRouteError(res, 'GET /api/leaderboard', err);
     }
-    if (examId && examId !== 'all') {
-      entries = entries.filter(e => e.examId === examId);
-    }
-    entries.sort((a, b) => b.score - a.score || a.timeSpentSeconds - b.timeSpentSeconds);
-    res.json({ leaderboard: entries.map((e, i) => ({ ...e, rank: i + 1 })) });
   });
 
   // ---------------------------------------------------------
   // SANITIZED QUESTIONS & PRACTICE VERIFICATION
   // (NEVER exposes correctOptionIndex or explanations pre-submission!)
   // ---------------------------------------------------------
-  app.get('/api/questions', requireFirebaseAuth, async (req: AuthenticatedRequest, res) => {
-    const subjectId = typeof req.query.subjectId === 'string' ? req.query.subjectId : undefined;
-    const examId = typeof req.query.examId === 'string' ? req.query.examId : undefined;
-    const uid = req.authUser!.uid;
-    const isOwner = isOwnerUser(req.authUser);
+  app.get('/api/questions', requireFirebaseAuth, authenticateSession, async (req: AuthenticatedRequest, res) => {
+    try {
+      const subjectId = typeof req.query.subjectId === 'string' ? req.query.subjectId : undefined;
+      const examId = typeof req.query.examId === 'string' ? req.query.examId : undefined;
+      const search = typeof req.query.search === 'string' ? req.query.search.trim().toLowerCase() : '';
+      const rawLimit = typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined;
+      const rawOffset = typeof req.query.offset === 'string' ? Number(req.query.offset) : 0;
+      const uid = req.authUser!.uid;
+      const isOwner = isOwnerUser(req.authUser);
 
-    const allQuestions = await getAllQuestionsAuthoritative(mirror);
-    let list = allQuestions;
+      // Uses version-checked TTL cache and reads ONLY /questions (never /questionKeys)
+      let list: Question[] = await getSanitizedQuestionsAuthoritative(
+        mirror,
+        db,
+        allowMemoryFallback,
+        useFirestore(),
+        { ttlMs: options?.questionBankCacheTtlMs }
+      );
 
-    if (subjectId) {
-      list = list.filter(q => q.subjectId === subjectId);
-    }
-    if (examId) {
-      const targetExam = await getAuthoritativeExam(examId, mirror);
-      if (targetExam) {
-        if (targetExam.isPaid && !isOwner) {
-          const subCheck = await checkUserHasActiveSubscription(uid, mirror);
-          if (!subCheck.active) {
-            return res.status(403).json({
-              error: 'SUBSCRIPTION_REQUIRED',
-              message: 'Pro subscription required to access paid exam questions.'
-            });
-          }
-        }
-        list = getQuestionsForExam(targetExam, list) as ServerQuestion[];
+      if (subjectId) {
+        list = list.filter(q => q.subjectId === subjectId);
       }
-    }
+      if (search) {
+        list = list.filter(
+          q =>
+            q.questionBn.toLowerCase().includes(search) ||
+            (q.questionEn || '').toLowerCase().includes(search) ||
+            (q.legalReference || '').toLowerCase().includes(search)
+        );
+      }
+      if (examId) {
+        const targetExam = await getAuthoritativeExam(
+          examId,
+          mirror,
+          db,
+          allowMemoryFallback,
+          useFirestore()
+        );
+        if (targetExam) {
+          if (targetExam.isPaid && !isOwner) {
+            const subCheck = await checkUserHasActiveSubscription(
+              uid,
+              mirror,
+              db,
+              allowMemoryFallback,
+              useFirestore()
+            );
+            if (!subCheck.active) {
+              return res.status(403).json({
+                error: 'SUBSCRIPTION_REQUIRED',
+                message: 'Pro subscription required to access paid exam questions.'
+              });
+            }
+          }
+          list = getQuestionsForExam(targetExam, list);
+        }
+      }
 
-    // ALWAYS sanitize stems/options for student consumption (answer keys locked on server)
-    return res.json({ questions: list.map(sanitizeQuestionForClient) });
-  });
+      const sanitized = list.map(sanitizeQuestionForClient);
+      const total = sanitized.length;
 
-  app.post('/api/practice/check', requireFirebaseAuth, authenticateSession, async (req: AuthenticatedRequest, res) => {
-    const uid = req.authUser!.uid;
-    const isOwner = isOwnerUser(req.authUser);
-    const { questionId, selectedOption } = req.body || {};
-
-    if (!questionId || typeof selectedOption !== 'number') {
-      return res.status(400).json({ error: 'INVALID_REQUEST', message: 'questionId and selectedOption required.' });
-    }
-
-    const qMap = await getAuthoritativeQuestionMap([String(questionId)], mirror);
-    const q = qMap.get(String(questionId));
-    if (!q) {
-      return res.status(404).json({ error: 'QUESTION_NOT_FOUND', message: 'Question not found.' });
-    }
-
-    if (!q.isDemoSample && !isOwner) {
-      const subCheck = await checkUserHasActiveSubscription(uid, mirror);
-      if (!subCheck.active) {
-        return res.status(403).json({
-          error: 'SUBSCRIPTION_REQUIRED',
-          message: 'বিষয়ভিত্তিক অনুশীলন ও উত্তর যাচাইয়ের জন্য সক্রিয় প্রো সাবস্ক্রিপশন প্রয়োজন।'
+      if (rawLimit !== undefined && Number.isFinite(rawLimit) && rawLimit > 0) {
+        const safeLimit = Math.min(500, Math.floor(rawLimit));
+        const safeOffset = Number.isFinite(rawOffset) && rawOffset >= 0 ? Math.floor(rawOffset) : 0;
+        const sliced = sanitized.slice(safeOffset, safeOffset + safeLimit);
+        return res.json({
+          questions: sliced,
+          total,
+          limit: safeLimit,
+          offset: safeOffset,
+          hasMore: safeOffset + sliced.length < total
         });
       }
-    }
 
-    const isCorrect = selectedOption === q.correctOptionIndex;
-    return res.json({
-      success: true,
-      questionId: q.id,
-      isCorrect,
-      correctOptionIndex: q.correctOptionIndex,
-      explanationBn: q.explanationBn || '',
-      explanationEn: q.explanationEn || '',
-      legalReference: q.legalReference || ''
-    });
+      return res.json({ questions: sanitized, total });
+    } catch (err) {
+      return sendRouteError(res, 'GET /api/questions', err);
+    }
   });
 
-  // ---------------------------------------------------------
-  // PREVIOUS YEAR QUESTIONS (Sanitized catalog + On-demand check/grade)
-  // ---------------------------------------------------------
-  app.get('/api/previous-questions', async (_req, res) => {
-    let list = mirror.previousQuestions;
-    if (useFirestore()) {
-      try {
-        const snap = await adminDb.collection('previous_questions').get();
-        if (!snap.empty) {
-          list = snap.docs.map(d => ({ id: d.id, ...(d.data() as Omit<ServerPreviousQuestion, 'id'>) }));
-        }
-      } catch {
-        // fallback to mirror
+  app.post('/api/practice/check', requireFirebaseAuth, practiceCheckRateLimiter, authenticateSession, async (req: AuthenticatedRequest, res) => {
+    try {
+      const uid = req.authUser!.uid;
+      const isOwner = isOwnerUser(req.authUser);
+      const { questionId, selectedOption } = req.body || {};
+
+      if (!questionId || typeof selectedOption !== 'number') {
+        return res.status(400).json({ error: 'INVALID_REQUEST', message: 'questionId and selectedOption required.' });
       }
-    }
-    const sorted = [...list].sort((a, b) => b.year - a.year);
-    res.json({ previousQuestions: sorted.map(sanitizePreviousQuestionForClient) });
-  });
 
-  app.post('/api/previous-questions/check', async (req, res) => {
-    const { questionId, selectedAnswer } = req.body || {};
-    if (!questionId) {
-      return res.status(400).json({ error: 'INVALID_REQUEST', message: 'questionId required.' });
-    }
-
-    let pq = mirror.previousQuestions.find(item => item.id === questionId);
-    if (useFirestore()) {
-      try {
-        const [qSnap, kSnap] = await Promise.all([
-          adminDb.collection('previous_questions').doc(String(questionId)).get(),
-          adminDb.collection('previousQuestionKeys').doc(String(questionId)).get()
-        ]);
-        if (qSnap.exists) {
-          const base = qSnap.data() as Omit<ServerPreviousQuestion, 'id'>;
-          const key = kSnap.exists ? (kSnap.data() as { correctAnswer?: string; explanation?: string }) : {};
-          pq = {
-            id: qSnap.id,
-            ...base,
-            correctAnswer: key.correctAnswer ?? base.correctAnswer ?? pq?.correctAnswer ?? '',
-            explanation: key.explanation ?? base.explanation ?? pq?.explanation ?? ''
-          };
-        }
-      } catch {
-        // use mirror
+      const qMap = await getAuthoritativeQuestionMap(
+        [String(questionId)],
+        mirror,
+        db,
+        allowMemoryFallback,
+        useFirestore()
+      );
+      const q = qMap.get(String(questionId));
+      if (!q) {
+        return res.status(404).json({ error: 'QUESTION_NOT_FOUND', message: 'Question not found.' });
       }
-    }
 
-    if (!pq) {
-      return res.status(404).json({ error: 'NOT_FOUND', message: 'Previous question not found.' });
-    }
-
-    const cleanSelected = typeof selectedAnswer === 'string' ? selectedAnswer.trim() : '';
-    const cleanCorrect = (pq.correctAnswer || '').trim();
-    const isCorrect = Boolean(cleanSelected && cleanCorrect && cleanSelected === cleanCorrect);
-
-    return res.json({
-      success: true,
-      questionId: pq.id,
-      isCorrect,
-      correctAnswer: pq.correctAnswer,
-      explanation: pq.explanation,
-      legalSection: pq.legalSection || '',
-      source: pq.source || ''
-    });
-  });
-
-  app.post('/api/previous-questions/grade', async (req, res) => {
-    const { questionIds, answers } = req.body || {};
-    if (!Array.isArray(questionIds) || questionIds.length === 0) {
-      return res.status(400).json({ error: 'INVALID_REQUEST', message: 'questionIds array required.' });
-    }
-
-    const answerMap: Record<string, string> = answers && typeof answers === 'object' ? answers : {};
-    const pqMap = new Map(mirror.previousQuestions.map(q => [q.id, q]));
-
-    if (useFirestore()) {
-      try {
-        const [qSnap, kSnap] = await Promise.all([
-          adminDb.collection('previous_questions').get(),
-          adminDb.collection('previousQuestionKeys').get()
-        ]);
-        if (!qSnap.empty) {
-          const kMap = new Map(kSnap.docs.map(d => [d.id, d.data()]));
-          qSnap.forEach(d => {
-            const base = d.data() as Partial<ServerPreviousQuestion>;
-            const key = kMap.get(d.id) as { correctAnswer?: string; explanation?: string } | undefined;
-            const fb = pqMap.get(d.id);
-            pqMap.set(d.id, {
-              ...(base as ServerPreviousQuestion),
-              id: d.id,
-              correctAnswer: key?.correctAnswer ?? base.correctAnswer ?? fb?.correctAnswer ?? '',
-              explanation: key?.explanation ?? base.explanation ?? fb?.explanation ?? ''
-            });
+      if (!q.isDemoSample && !isOwner) {
+        const subCheck = await checkUserHasActiveSubscription(
+          uid,
+          mirror,
+          db,
+          allowMemoryFallback,
+          useFirestore()
+        );
+        if (!subCheck.active) {
+          return res.status(403).json({
+            error: 'SUBSCRIPTION_REQUIRED',
+            message: 'বিষয়ভিত্তিক অনুশীলন ও উত্তর যাচাইয়ের জন্য সক্রিয় প্রো সাবস্ক্রিপশন প্রয়োজন।'
           });
         }
-      } catch {
-        // fallback to mirror
       }
+
+      const isCorrect = selectedOption === q.correctOptionIndex;
+      return res.json({
+        success: true,
+        questionId: q.id,
+        isCorrect,
+        correctOptionIndex: q.correctOptionIndex,
+        explanationBn: q.explanationBn || '',
+        explanationEn: q.explanationEn || '',
+        legalReference: q.legalReference || ''
+      });
+    } catch (err) {
+      return sendRouteError(res, 'POST /api/practice/check', err);
     }
-
-    let correctCount = 0;
-    let incorrectCount = 0;
-    let evaluatedTotal = 0;
-    const incorrectList: { question: ServerPreviousQuestion; selectedAnswer?: string }[] = [];
-
-    for (const qId of questionIds) {
-      const q = pqMap.get(String(qId));
-      if (!q) continue;
-      evaluatedTotal++;
-      const chosen = answerMap[q.id];
-      if (!chosen) {
-        // unanswered
-      } else if (chosen.trim() === (q.correctAnswer || '').trim()) {
-        correctCount++;
-      } else {
-        incorrectCount++;
-        incorrectList.push({ question: q, selectedAnswer: chosen });
-      }
-    }
-
-    const unansweredCount = Math.max(0, evaluatedTotal - (correctCount + incorrectCount));
-    const positiveMarks = correctCount * 1.0;
-    const negativeMarks = incorrectCount * 0.25;
-    const finalScore = Math.max(0, positiveMarks - negativeMarks);
-    const percentage = evaluatedTotal > 0 ? (finalScore / evaluatedTotal) * 100 : 0;
-
-    return res.json({
-      success: true,
-      evaluation: {
-        totalQuestions: evaluatedTotal,
-        correctCount,
-        incorrectCount,
-        unansweredCount,
-        positiveMarks,
-        negativeMarks,
-        finalScore: Number(finalScore.toFixed(2)),
-        percentage: Number(percentage.toFixed(1)),
-        isPassed: percentage >= 50,
-        incorrectList
-      }
-    });
   });
 
   // ---------------------------------------------------------
-  // SESSION & SUBSCRIPTION STATUS
+  // SESSION & SUBSCRIPTION STATUS (Persistent across Cloud Run instances)
   // ---------------------------------------------------------
-  app.post('/api/auth/session', requireFirebaseAuth, async (req: AuthenticatedRequest, res) => {
-    const userId = req.authUser!.uid;
-    const userEmail = req.authUser!.email || '';
-    const userName = req.body?.userName || req.authUser!.name || 'Student';
-    const deviceInfo = req.body?.deviceInfo;
+  app.post('/api/auth/session', requireFirebaseAuth, authSessionRateLimiter, async (req: AuthenticatedRequest, res) => {
+    try {
+      const userId = req.authUser!.uid;
+      const userEmail = req.authUser!.email || '';
+      const userName = String(req.body?.userName || req.authUser!.name || 'Student').slice(0, 100);
+      const deviceInfo = String(req.body?.deviceInfo || req.headers['user-agent'] || 'Web Browser').slice(0, 160);
 
-    const previousSessionId = mirror.userActiveSessions[userId];
-    if (previousSessionId && mirror.sessions[previousSessionId]) {
-      mirror.sessions[previousSessionId].status = 'revoked';
-      mirror.sessions[previousSessionId].revokedReason =
-        'Logged in from another device or tab (Single active session enforcement)';
-      mirror.auditLogs.unshift({
-        id: `log_${Date.now()}`,
+      const nowIso = new Date().toISOString();
+      const sessionId = `sess_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+      const newSession: StudentSession = {
+        sessionId,
         userId,
+        userEmail,
         userName,
-        action: 'SESSION_REVOKED_CONCURRENT',
-        details: `Previous session ${previousSessionId.substring(0, 8)}... revoked due to new login.`,
-        timestamp: new Date().toISOString()
+        deviceInfo,
+        createdAt: nowIso,
+        lastActiveAt: nowIso,
+        status: 'active'
+      };
+
+      if (useFirestore()) {
+        await db.runTransaction(async (tx) => {
+          const userSessRef = db.collection('userSessions').doc(userId);
+          const userSessSnap = await tx.get(userSessRef);
+          const prevSessionId = userSessSnap.exists
+            ? (userSessSnap.data()?.activeSessionId as string | undefined)
+            : undefined;
+
+          let prevSnapExists = false;
+          const prevSessRef = prevSessionId ? db.collection('sessions').doc(prevSessionId) : null;
+          if (prevSessRef) {
+            const prevSnap = await tx.get(prevSessRef);
+            prevSnapExists = prevSnap.exists;
+          }
+
+          if (prevSessRef && prevSnapExists) {
+            tx.update(prevSessRef, {
+              status: 'revoked',
+              revokedReason: 'Logged in from another device or tab (Single active session enforcement)'
+            });
+            const auditRef = db.collection('auditLogs').doc(`log_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`);
+            tx.set(auditRef, {
+              id: auditRef.id,
+              userId,
+              userName,
+              action: 'SESSION_REVOKED_CONCURRENT',
+              details: `Previous session ${prevSessionId!.substring(0, 8)}... revoked due to new login.`,
+              timestamp: nowIso
+            });
+          }
+
+          tx.set(db.collection('sessions').doc(sessionId), newSession);
+          tx.set(userSessRef, { activeSessionId: sessionId, updatedAt: nowIso });
+        });
+      } else {
+        if (!allowMemoryFallback) {
+          return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+        }
+        const previousSessionId = mirror.userActiveSessions[userId];
+        if (previousSessionId && mirror.sessions[previousSessionId]) {
+          mirror.sessions[previousSessionId].status = 'revoked';
+          mirror.sessions[previousSessionId].revokedReason =
+            'Logged in from another device or tab (Single active session enforcement)';
+          mirror.auditLogs.unshift({
+            id: `log_${Date.now()}`,
+            userId,
+            userName,
+            action: 'SESSION_REVOKED_CONCURRENT',
+            details: `Previous session ${previousSessionId.substring(0, 8)}... revoked due to new login.`,
+            timestamp: nowIso
+          });
+        }
+        mirror.sessions[sessionId] = newSession;
+        mirror.userActiveSessions[userId] = sessionId;
+      }
+
+      const subStatus = await checkUserHasActiveSubscription(
+        userId,
+        mirror,
+        db,
+        allowMemoryFallback,
+        useFirestore()
+      );
+      return res.json({
+        success: true,
+        sessionId,
+        session: newSession,
+        activeSubscription: subStatus.activeSubscription
       });
+    } catch (err) {
+      return sendRouteError(res, 'POST /api/auth/session', err, 'SESSION_CREATE_FAILED', 'Failed to establish session.');
     }
-
-    const sessionId = `sess_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
-    const newSession: StudentSession = {
-      sessionId,
-      userId,
-      userEmail,
-      userName,
-      deviceInfo: deviceInfo || req.headers['user-agent'] || 'Web Browser',
-      createdAt: new Date().toISOString(),
-      lastActiveAt: new Date().toISOString(),
-      status: 'active'
-    };
-
-    mirror.sessions[sessionId] = newSession;
-    mirror.userActiveSessions[userId] = sessionId;
-
-    const subStatus = await checkUserHasActiveSubscription(userId, mirror);
-    res.json({
-      success: true,
-      sessionId,
-      session: newSession,
-      activeSubscription: subStatus.activeSubscription
-    });
   });
 
   app.get('/api/auth/session/status', requireFirebaseAuth, authenticateSession, async (req: AuthenticatedRequest, res) => {
-    const uid = req.authUser!.uid;
-    const subStatus = await checkUserHasActiveSubscription(uid, mirror);
-    res.json({
-      active: true,
-      session: req.session || null,
-      activeSubscription: subStatus.activeSubscription
-    });
+    try {
+      const uid = req.authUser!.uid;
+      const subStatus = await checkUserHasActiveSubscription(
+        uid,
+        mirror,
+        db,
+        allowMemoryFallback,
+        useFirestore()
+      );
+      return res.json({
+        active: true,
+        session: req.session || null,
+        activeSubscription: subStatus.activeSubscription
+      });
+    } catch (err) {
+      return sendRouteError(res, 'GET /api/auth/session/status', err);
+    }
+  });
+
+  app.post('/api/auth/logout', requireFirebaseAuth, authenticateSession, async (req: AuthenticatedRequest, res) => {
+    try {
+      const uid = req.authUser!.uid;
+      const tokenHeader = req.headers['x-session-id'];
+      const sessionId = typeof tokenHeader === 'string' ? tokenHeader.trim() : req.session?.sessionId;
+      const nowIso = new Date().toISOString();
+
+      if (useFirestore()) {
+        if (sessionId) {
+          await db.runTransaction(async (tx) => {
+            const sessRef = db.collection('sessions').doc(sessionId);
+            const userSessRef = db.collection('userSessions').doc(uid);
+            const [sessSnap, userSessSnap] = await Promise.all([tx.get(sessRef), tx.get(userSessRef)]);
+            if (sessSnap.exists) {
+              tx.update(sessRef, {
+                status: 'revoked',
+                revokedReason: 'Logged out by user',
+                lastActiveAt: nowIso
+              });
+            }
+            if (userSessSnap.exists && userSessSnap.data()?.activeSessionId === sessionId) {
+              tx.delete(userSessRef);
+            }
+          });
+        }
+        return res.json({ success: true });
+      }
+
+      if (!allowMemoryFallback) {
+        return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+      }
+
+      if (sessionId && mirror.sessions[sessionId]) {
+        mirror.sessions[sessionId].status = 'revoked';
+        mirror.sessions[sessionId].revokedReason = 'Logged out by user';
+        mirror.sessions[sessionId].lastActiveAt = nowIso;
+      }
+      if (sessionId && mirror.userActiveSessions[uid] === sessionId) {
+        delete mirror.userActiveSessions[uid];
+      }
+      return res.json({ success: true });
+    } catch (err) {
+      return sendRouteError(res, 'POST /api/auth/logout', err, 'LOGOUT_FAILED', 'Failed to revoke session.');
+    }
   });
 
   // ---------------------------------------------------------
-  // PAYMENT SUBMISSION (Priority 1 Hardened)
+  // PAYMENT SUBMISSION (Priority 1 Hardened + Authoritative Firestore Pricing)
   // ---------------------------------------------------------
-  app.post('/api/payments/create', requireFirebaseAuth, authenticateSession, async (req: AuthenticatedRequest, res) => {
-    const uid = req.authUser!.uid;
-    const { method, senderNumber, transactionId, packageId, studentPhone, studentName } = req.body || {};
+  app.post('/api/payments/create', requireFirebaseAuth, paymentsCreateRateLimiter, authenticateSession, async (req: AuthenticatedRequest, res) => {
+    try {
+      const uid = req.authUser!.uid;
+      const { method, senderNumber, transactionId, packageId, studentPhone, studentName } = req.body || {};
 
-    if (!method || !senderNumber || !transactionId || !packageId) {
-      return res.status(400).json({
-        error: 'MISSING_FIELDS',
-        message: 'অনুগ্রহ করে সকল আবশ্যিক পেমেন্ট তথ্য প্রদান করুন। (Missing required payment fields)'
-      });
-    }
-
-    if (!['bKash', 'Nagad', 'Rocket'].includes(String(method))) {
-      return res.status(400).json({
-        error: 'INVALID_METHOD',
-        message: 'অবৈধ পেমেন্ট মাধ্যম। bKash বা Nagad ব্যবহার করুন।'
-      });
-    }
-
-    const cleanTrxId = String(transactionId)
-      .trim()
-      .toUpperCase()
-      .replace(/[^A-Z0-9]/g, '');
-
-    if (cleanTrxId.length < 4 || cleanTrxId.length > 64) {
-      return res.status(400).json({
-        error: 'INVALID_TRX_ID',
-        message: 'সঠিক ট্রানজাকশন আইডি (TrxID) প্রদান করুন (৪–৬৪ অক্ষর)।'
-      });
-    }
-
-    const docId = `trx_${cleanTrxId}`;
-
-    // 1. Authoritative package pricing from trusted backend (NEVER trusts client amount)
-    let pkg = mirror.packages.find(p => p.id === packageId && p.isActive);
-    if (!pkg && useFirestore()) {
-      try {
-        const pkgSnap = await adminDb.collection('packages').doc(String(packageId)).get();
-        if (pkgSnap.exists) {
-          const data = pkgSnap.data() as Omit<SubscriptionPackage, 'id'>;
-          if (data.isActive) pkg = { id: pkgSnap.id, ...data };
-        }
-      } catch {
-        // fallback handled below
-      }
-    }
-    if (!pkg) {
-      return res.status(404).json({
-        error: 'PACKAGE_NOT_FOUND',
-        message: 'নির্বাচিত সাবস্ক্রিপশন প্যাকেজটি পাওয়া যায়নি বা নিষ্ক্রিয় রয়েছে।'
-      });
-    }
-
-    const authoritativeAmount =
-      pkg.id === 'pkg_exam_pass' ? mirror.examDateConfig.examPassPrice : pkg.price;
-    const durationDays = pkg.durationDays || 90;
-    const validityType = pkg.validityType || 'days';
-
-    // 2. Check duplicate TrxID across ALL payment requests & statuses (including REJECTED!)
-    const existingLocal = mirror.paymentRequests.find(
-      p => p.id === docId || p.transactionId === cleanTrxId
-    );
-    if (existingLocal) {
-      return res.status(409).json({
-        error: 'DUPLICATE_TRX_ID',
-        message:
-          existingLocal.status === 'rejected'
-            ? 'এই ট্রানজাকশন আইডিটি (TrxID) পূর্বে বাতিল করা হয়েছে এবং পুনরায় জমা দেওয়া যাবে না।'
-            : 'এই ট্রানজাকশন আইডিটি (TrxID) ইতিপূর্বে ব্যবহার করা হয়েছে। একই TrxID পুনরায় গ্রহণযোগ্য নয়।'
-      });
-    }
-
-    const newReq: PaymentRequest = {
-      id: docId,
-      userId: uid,
-      studentName: String(studentName || req.authUser!.name || 'Student').trim().slice(0, 100),
-      studentPhone: String(studentPhone || senderNumber).trim().slice(0, 20),
-      method: method as 'bKash' | 'Nagad' | 'Rocket',
-      senderNumber: String(senderNumber).trim().slice(0, 20),
-      transactionId: cleanTrxId,
-      amount: authoritativeAmount,
-      packageId: pkg.id,
-      packageNameBn: pkg.nameBn,
-      packageNameEn: pkg.nameEn,
-      packageTitle: `${pkg.nameBn} - ৳${authoritativeAmount}`,
-      durationDays,
-      validityType,
-      status: 'pending',
-      requestedAt: new Date().toISOString()
-    };
-
-    // 3. Persist atomically to Firestore BEFORE confirming success
-    if (useFirestore()) {
-      try {
-        await adminDb.collection('paymentRequests').doc(docId).create({
-          userId: newReq.userId,
-          studentName: newReq.studentName,
-          studentPhone: newReq.studentPhone,
-          method: newReq.method,
-          senderNumber: newReq.senderNumber,
-          transactionId: newReq.transactionId,
-          amount: newReq.amount,
-          packageId: newReq.packageId,
-          packageNameBn: newReq.packageNameBn,
-          packageNameEn: newReq.packageNameEn,
-          packageTitle: newReq.packageTitle,
-          durationDays: newReq.durationDays,
-          validityType: newReq.validityType,
-          status: 'pending',
-          requestedAt: newReq.requestedAt,
-          verifiedAt: null,
-          verifiedBy: null,
-          rejectionReason: null,
-          subscriptionId: null
+      if (!method || !senderNumber || !transactionId || !packageId) {
+        return res.status(400).json({
+          error: 'MISSING_FIELDS',
+          message: 'অনুগ্রহ করে সকল আবশ্যিক পেমেন্ট তথ্য প্রদান করুন। (Missing required payment fields)'
         });
-      } catch (err: unknown) {
-        if (isAlreadyExistsError(err)) {
+      }
+
+      if (!['bKash', 'Nagad', 'Rocket'].includes(String(method))) {
+        return res.status(400).json({
+          error: 'INVALID_METHOD',
+          message: 'অবৈধ পেমেন্ট মাধ্যম। bKash বা Nagad ব্যবহার করুন।'
+        });
+      }
+
+      const cleanTrxId = String(transactionId)
+        .trim()
+        .toUpperCase()
+        .replace(/[^A-Z0-9]/g, '');
+
+      if (cleanTrxId.length < 4 || cleanTrxId.length > 64) {
+        return res.status(400).json({
+          error: 'INVALID_TRX_ID',
+          message: 'সঠিক ট্রানজাকশন আইডি (TrxID) প্রদান করুন (৪–৬৪ অক্ষর)।'
+        });
+      }
+
+      const docId = `trx_${cleanTrxId}`;
+
+      let pkg: SubscriptionPackage | undefined;
+      let authoritativeAmount = 0;
+
+      if (useFirestore()) {
+        const [pkgSnap, configSnap, dupQuerySnap] = await Promise.all([
+          db.collection('packages').doc(String(packageId)).get(),
+          db.collection('config').doc('examDate').get(),
+          db.collection('paymentRequests').where('transactionId', '==', cleanTrxId).limit(1).get()
+        ]);
+
+        if (!pkgSnap.exists) {
+          return res.status(404).json({
+            error: 'PACKAGE_NOT_FOUND',
+            message: 'নির্বাচিত সাবস্ক্রিপশন প্যাকেজটি ডাটাবেজে পাওয়া যায়নি।'
+          });
+        }
+        const pkgData = pkgSnap.data() as Omit<SubscriptionPackage, 'id'>;
+        if (!pkgData.isActive || pkgData.isArchived) {
+          return res.status(404).json({
+            error: 'PACKAGE_NOT_FOUND',
+            message: 'নির্বাচিত সাবস্ক্রিপশন প্যাকেজটি বর্তমানে নিষ্ক্রিয় রয়েছে।'
+          });
+        }
+        pkg = { id: pkgSnap.id, ...pkgData };
+
+        const examPassConfigPrice = configSnap.exists
+          ? Number(configSnap.data()?.examPassPrice)
+          : NaN;
+        authoritativeAmount =
+          pkg.id === 'pkg_exam_pass' && !isNaN(examPassConfigPrice) && examPassConfigPrice > 0
+            ? examPassConfigPrice
+            : Number(pkg.price);
+
+        if (!dupQuerySnap.empty) {
+          const existingDoc = dupQuerySnap.docs[0].data() as PaymentRequest;
           return res.status(409).json({
-            error: 'ALREADY_EXISTS',
-            message: 'এই ট্রানজাকশন আইডিটি (TrxID) ইতিপূর্বে সিস্টেমে নিবন্ধিত হয়েছে। পুনরায় জমা দেওয়া সম্ভব নয়।'
+            error: 'DUPLICATE_TRX_ID',
+            message:
+              existingDoc.status === 'rejected'
+                ? 'এই ট্রানজাকশন আইডিটি (TrxID) পূর্বে বাতিল করা হয়েছে এবং পুনরায় জমা দেওয়া যাবে না।'
+                : 'এই ট্রানজাকশন আইডিটি (TrxID) ইতিপূর্বে ব্যবহার করা হয়েছে। একই TrxID পুনরায় গ্রহণযোগ্য নয়।'
           });
         }
-        if (isPermissionOrCredentialError(err)) {
-          return res.status(403).json({
-            error: 'PERMISSION_DENIED',
-            message: 'ডাটাবেজে পেমেন্ট রিকোয়েস্ট সংরক্ষণ অনুমোদিত হয়নি। অনুগ্রহ করে অ্যাডমিনের সাথে যোগাযোগ করুন।'
+      } else {
+        if (!allowMemoryFallback) {
+          return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+        }
+        pkg = mirror.packages.find(p => p.id === packageId && p.isActive && !p.isArchived);
+        if (!pkg) {
+          return res.status(404).json({
+            error: 'PACKAGE_NOT_FOUND',
+            message: 'নির্বাচিত সাবস্ক্রিপশন প্যাকেজটি পাওয়া যায়নি বা নিষ্ক্রিয় রয়েছে।'
           });
         }
+        authoritativeAmount =
+          pkg.id === 'pkg_exam_pass' ? mirror.examDateConfig.examPassPrice : pkg.price;
+
+        const existingLocal = mirror.paymentRequests.find(
+          p => p.id === docId || p.transactionId === cleanTrxId
+        );
+        if (existingLocal) {
+          return res.status(409).json({
+            error: 'DUPLICATE_TRX_ID',
+            message:
+              existingLocal.status === 'rejected'
+                ? 'এই ট্রানজাকশন আইডিটি (TrxID) পূর্বে বাতিল করা হয়েছে এবং পুনরায় জমা দেওয়া যাবে না।'
+                : 'এই ট্রানজাকশন আইডিটি (TrxID) ইতিপূর্বে ব্যবহার করা হয়েছে। একই TrxID পুনরায় গ্রহণযোগ্য নয়।'
+          });
+        }
+      }
+
+      if (!Number.isFinite(authoritativeAmount) || authoritativeAmount <= 0) {
         return res.status(500).json({
-          error: 'PAYMENT_PERSIST_FAILED',
-          message: 'পেমেন্ট রিকোয়েস্ট সংরক্ষণে সমস্যা হয়েছে। অনুগ্রহ করে পুনরায় চেষ্টা করুন।'
+          error: 'INVALID_PACKAGE_CONFIGURATION',
+          message: 'প্যাকেজের মূল্য কনফিগারেশন সঠিক নয়।'
         });
       }
+
+      const durationDays = pkg.durationDays || 90;
+      const validityType = pkg.validityType || 'days';
+      const nowIso = new Date().toISOString();
+
+      const newReq: PaymentRequest = {
+        id: docId,
+        userId: uid,
+        studentName: String(studentName || req.authUser!.name || 'Student').trim().slice(0, 100),
+        studentPhone: String(studentPhone || senderNumber).trim().slice(0, 20),
+        method: method as 'bKash' | 'Nagad' | 'Rocket',
+        senderNumber: String(senderNumber).trim().slice(0, 20),
+        transactionId: cleanTrxId,
+        amount: authoritativeAmount,
+        packageId: pkg.id,
+        packageNameBn: pkg.nameBn,
+        packageNameEn: pkg.nameEn,
+        packageTitle: `${pkg.nameBn} - ৳${authoritativeAmount}`,
+        durationDays,
+        validityType,
+        status: 'pending',
+        requestedAt: nowIso
+      };
+
+      const auditEntry: AuditLog = {
+        id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+        userId: newReq.userId,
+        userName: newReq.studentName,
+        action: 'PAYMENT_SUBMITTED',
+        details: `${method} TrxID: ${cleanTrxId} (৳${newReq.amount}) for package "${pkg.nameEn}". Pending manual admin review.`,
+        timestamp: nowIso
+      };
+
+      if (useFirestore()) {
+        try {
+          const batch = db.batch();
+          batch.create(db.collection('paymentRequests').doc(docId), {
+            userId: newReq.userId,
+            studentName: newReq.studentName,
+            studentPhone: newReq.studentPhone,
+            method: newReq.method,
+            senderNumber: newReq.senderNumber,
+            transactionId: newReq.transactionId,
+            amount: newReq.amount,
+            packageId: newReq.packageId,
+            packageNameBn: newReq.packageNameBn,
+            packageNameEn: newReq.packageNameEn,
+            packageTitle: newReq.packageTitle,
+            durationDays: newReq.durationDays,
+            validityType: newReq.validityType,
+            status: 'pending',
+            requestedAt: newReq.requestedAt,
+            verifiedAt: null,
+            verifiedBy: null,
+            rejectionReason: null,
+            subscriptionId: null
+          });
+          batch.set(db.collection('auditLogs').doc(auditEntry.id), auditEntry);
+          await batch.commit();
+        } catch (err: unknown) {
+          if (isAlreadyExistsError(err)) {
+            return res.status(409).json({
+              error: 'ALREADY_EXISTS',
+              message: 'এই ট্রানজাকশন আইডিটি (TrxID) ইতিপূর্বে সিস্টেমে নিবন্ধিত হয়েছে। পুনরায় জমা দেওয়া সম্ভব নয়।'
+            });
+          }
+          if (isPermissionOrCredentialError(err)) {
+            const safe = getSafeDiagnosticError(err);
+            console.error('[SanadPrep][POST /api/payments/create] Permission/credential error:', safe.code ?? '', safe.message);
+            return res.status(403).json({
+              error: 'PERMISSION_DENIED',
+              message: 'ডাটাবেজে পেমেন্ট রিকোয়েস্ট সংরক্ষণ অনুমোদিত হয়নি। অনুগ্রহ করে অ্যাডমিনের সাথে যোগাযোগ করুন।'
+            });
+          }
+          return sendRouteError(
+            res,
+            'POST /api/payments/create',
+            err,
+            'PAYMENT_PERSIST_FAILED',
+            'পেমেন্ট রিকোয়েস্ট সংরক্ষণে সমস্যা হয়েছে। অনুগ্রহ করে পুনরায় চেষ্টা করুন।'
+          );
+        }
+      } else {
+        mirror.paymentRequests.unshift(newReq);
+        mirror.auditLogs.unshift(auditEntry);
+      }
+
+      return res.json({
+        success: true,
+        message: 'পেমেন্ট রিকোয়েস্ট সফলভাবে জমা হয়েছে। অ্যাডমিন ম্যানুয়ালি যাচাই করার পর এক্সেস চালু হবে।',
+        paymentRequest: newReq
+      });
+    } catch (err) {
+      return sendRouteError(
+        res,
+        'POST /api/payments/create',
+        err,
+        'PAYMENT_PERSIST_FAILED',
+        'পেমেন্ট রিকোয়েস্ট সংরক্ষণে সমস্যা হয়েছে।'
+      );
     }
-
-    mirror.paymentRequests.unshift(newReq);
-    mirror.auditLogs.unshift({
-      id: `log_${Date.now()}`,
-      userId: newReq.userId,
-      userName: newReq.studentName,
-      action: 'PAYMENT_SUBMITTED',
-      details: `${method} TrxID: ${cleanTrxId} (৳${newReq.amount}) for package "${pkg.nameEn}". Pending manual admin review.`,
-      timestamp: new Date().toISOString()
-    });
-
-    return res.json({
-      success: true,
-      message: 'পেমেন্ট রিকোয়েস্ট সফলভাবে জমা হয়েছে। অ্যাডমিন ম্যানুয়ালি যাচাই করার পর এক্সেস চালু হবে।',
-      paymentRequest: newReq
-    });
   });
 
-  app.get('/api/payments', requireFirebaseAuth, async (req: AuthenticatedRequest, res) => {
-    const isOwner = isOwnerUser(req.authUser);
-    let list = [...mirror.paymentRequests];
-    if (useFirestore()) {
-      try {
+  app.get('/api/payments', requireFirebaseAuth, authenticateSession, async (req: AuthenticatedRequest, res) => {
+    try {
+      const isOwner = isOwnerUser(req.authUser);
+      if (useFirestore()) {
         const snap = isOwner
-          ? await adminDb.collection('paymentRequests').get()
-          : await adminDb.collection('paymentRequests').where('userId', '==', req.authUser!.uid).get();
-        if (!snap.empty) {
-          list = snap.docs.map(d => ({ id: d.id, ...(d.data() as Omit<PaymentRequest, 'id'>) }));
-        }
-      } catch {
-        // fallback to mirror
+          ? await db.collection('paymentRequests').get()
+          : await db.collection('paymentRequests').where('userId', '==', req.authUser!.uid).get();
+        const list = snap.docs.map(d => ({ id: d.id, ...(d.data() as Omit<PaymentRequest, 'id'>) }));
+        return res.json({ paymentRequests: list });
       }
-    }
-    if (isOwner) {
+      if (!allowMemoryFallback) {
+        return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+      }
+      const list = isOwner
+        ? [...mirror.paymentRequests]
+        : mirror.paymentRequests.filter(p => p.userId === req.authUser!.uid);
       return res.json({ paymentRequests: list });
+    } catch (err) {
+      return sendRouteError(res, 'GET /api/payments', err);
     }
-    return res.json({ paymentRequests: list.filter(p => p.userId === req.authUser!.uid) });
   });
 
   app.post('/api/admin/payments/:id/approve', requireFirebaseAuth, requireOwnerAdmin, async (req: AuthenticatedRequest, res) => {
-    const id = String(req.params.id);
-    const { verifierName } = req.body || {};
+    try {
+      const id = String(req.params.id);
+      const { verifierName } = req.body || {};
+      const verifier = String(verifierName || req.authUser!.email || 'Owner Admin');
 
-    let reqItem = mirror.paymentRequests.find(p => p.id === id);
-    if (!reqItem && useFirestore()) {
-      try {
-        const snap = await adminDb.collection('paymentRequests').doc(id).get();
-        if (snap.exists) {
-          reqItem = { id: snap.id, ...(snap.data() as Omit<PaymentRequest, 'id'>) };
-        }
-      } catch {
-        // ignore
+      if (useFirestore()) {
+        const { updatedPay, newSubscription } = await db.runTransaction(async (tx) => {
+          const payRef = db.collection('paymentRequests').doc(id);
+          const paySnap = await tx.get(payRef);
+          if (!paySnap.exists) {
+            throw new HttpError(404, 'NOT_FOUND', 'Payment request not found');
+          }
+          const reqItem = { id: paySnap.id, ...(paySnap.data() as Omit<PaymentRequest, 'id'>) };
+
+          if (reqItem.status === 'approved') {
+            throw new HttpError(400, 'ALREADY_APPROVED', 'Payment already approved');
+          }
+          if (reqItem.status === 'rejected') {
+            throw new HttpError(400, 'ALREADY_REJECTED', 'Rejected payment request cannot be approved');
+          }
+
+          const [sameTrxPaySnap, sameTrxSubSnap, pkgSnap, configSnap] = await Promise.all([
+            tx.get(db.collection('paymentRequests').where('transactionId', '==', reqItem.transactionId)),
+            tx.get(db.collection('subscriptions').where('transactionId', '==', reqItem.transactionId)),
+            tx.get(db.collection('packages').doc(reqItem.packageId)),
+            tx.get(db.collection('config').doc('examDate'))
+          ]);
+
+          const hasDuplicateApprovedPay = sameTrxPaySnap.docs.some(
+            d => d.id !== id && (d.data()?.status === 'approved')
+          );
+          const hasExistingSubForTrx = !sameTrxSubSnap.empty;
+          if (hasDuplicateApprovedPay || hasExistingSubForTrx) {
+            throw new HttpError(
+              409,
+              'TRX_ALREADY_APPROVED',
+              'এই TrxID দিয়ে ইতিপূর্বে আরেকটি পেমেন্ট অনুমোদন করা হয়েছে!'
+            );
+          }
+
+          const pkgData = pkgSnap.exists ? (pkgSnap.data() as Partial<SubscriptionPackage>) : undefined;
+          const targetExamDate = configSnap.exists
+            ? (configSnap.data()?.targetExamDate as string | undefined)
+            : mirror.examDateConfig.targetExamDate;
+          const validityType = pkgData?.validityType || reqItem.validityType || 'days';
+          const durationDays = pkgData?.durationDays || reqItem.durationDays || 90;
+          const packageNameBn = pkgData?.nameBn || reqItem.packageNameBn;
+          const packageNameEn = pkgData?.nameEn || reqItem.packageNameEn;
+
+          const activatedAt = new Date().toISOString();
+          const expiresAt = calculateSubscriptionExpiry(validityType, durationDays, targetExamDate);
+
+          const subId = `sub_${reqItem.userId}_${reqItem.transactionId}`;
+          const createdSub: UserSubscription = {
+            id: subId,
+            userId: reqItem.userId,
+            studentName: reqItem.studentName,
+            studentPhone: reqItem.studentPhone,
+            packageId: reqItem.packageId,
+            packageNameBn,
+            packageNameEn,
+            pricePaid: reqItem.amount,
+            paymentRequestId: reqItem.id,
+            paymentMethod: reqItem.method as 'bKash' | 'Nagad',
+            transactionId: reqItem.transactionId,
+            activatedAt,
+            expiresAt,
+            validityType,
+            status: 'active',
+            targetExamDateSnapshot: validityType === 'exam_date' ? targetExamDate : undefined,
+            createdAt: activatedAt
+          };
+
+          const subRef = db.collection('subscriptions').doc(subId);
+          const userRef = db.collection('users').doc(reqItem.userId);
+          const auditRef = db.collection('auditLogs').doc(`log_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`);
+
+          tx.update(payRef, {
+            status: 'approved',
+            verifiedAt: activatedAt,
+            verifiedBy: verifier,
+            subscriptionId: subId
+          });
+          tx.set(subRef, {
+            userId: createdSub.userId,
+            studentName: createdSub.studentName,
+            studentPhone: createdSub.studentPhone,
+            packageId: createdSub.packageId,
+            packageNameBn: createdSub.packageNameBn,
+            packageNameEn: createdSub.packageNameEn,
+            pricePaid: createdSub.pricePaid,
+            paymentRequestId: createdSub.paymentRequestId,
+            paymentMethod: createdSub.paymentMethod,
+            transactionId: createdSub.transactionId,
+            activatedAt: isoToTimestamp(activatedAt),
+            expiresAt: isoToTimestamp(expiresAt),
+            validityType: createdSub.validityType,
+            status: 'active',
+            targetExamDateSnapshot: createdSub.targetExamDateSnapshot || null,
+            createdAt: activatedAt
+          });
+          tx.set(
+            userRef,
+            {
+              subscriptionStatus: 'pro',
+              subscriptionExpiresAt: isoToTimestamp(expiresAt),
+              activePackageId: reqItem.packageId,
+              activePackageNameBn: packageNameBn,
+              activePackageNameEn: packageNameEn
+            },
+            { merge: true }
+          );
+          tx.set(auditRef, {
+            id: auditRef.id,
+            userId: req.authUser!.uid,
+            userName: verifier,
+            action: 'PAYMENT_APPROVED',
+            details: `Approved ${reqItem.method} TrxID: ${reqItem.transactionId} (৳${reqItem.amount}) for UID ${reqItem.userId}.`,
+            timestamp: activatedAt
+          });
+
+          return {
+            updatedPay: {
+              ...reqItem,
+              status: 'approved' as const,
+              verifiedAt: activatedAt,
+              verifiedBy: verifier,
+              subscriptionId: subId
+            },
+            newSubscription: createdSub
+          };
+        });
+
+        return res.json({
+          success: true,
+          paymentRequest: updatedPay,
+          subscription: newSubscription
+        });
       }
-    }
 
-    if (!reqItem) {
-      return res.status(404).json({ error: 'NOT_FOUND', message: 'Payment request not found' });
-    }
-    if (reqItem.status === 'approved') {
-      return res.status(400).json({ error: 'ALREADY_APPROVED', message: 'Payment already approved' });
-    }
+      if (!allowMemoryFallback) {
+        return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+      }
 
-    const duplicateApproved = mirror.paymentRequests.find(
-      p => p.id !== id && p.transactionId === reqItem!.transactionId && p.status === 'approved'
-    );
-    if (duplicateApproved) {
-      return res.status(409).json({
-        error: 'TRX_ALREADY_APPROVED',
-        message: 'এই TrxID দিয়ে ইতিপূর্বে আরেকটি পেমেন্ট অনুমোদন করা হয়েছে!'
-      });
-    }
-
-    const pkg = mirror.packages.find(p => p.id === reqItem!.packageId) || {
-      id: reqItem.packageId,
-      nameBn: reqItem.packageNameBn,
-      nameEn: reqItem.packageNameEn,
-      validityType: reqItem.validityType || ('days' as const),
-      durationDays: reqItem.durationDays || 90
-    };
-
-    const activatedAt = new Date().toISOString();
-    const expiresAt = calculateSubscriptionExpiry(
-      pkg.validityType,
-      pkg.durationDays,
-      mirror.examDateConfig.targetExamDate
-    );
-
-    const newSubscription: UserSubscription = {
-      id: `sub_${reqItem.userId}_${reqItem.transactionId}`,
-      userId: reqItem.userId,
-      studentName: reqItem.studentName,
-      studentPhone: reqItem.studentPhone,
-      packageId: reqItem.packageId,
-      packageNameBn: reqItem.packageNameBn,
-      packageNameEn: reqItem.packageNameEn,
-      pricePaid: reqItem.amount,
-      paymentRequestId: reqItem.id,
-      paymentMethod: reqItem.method as 'bKash' | 'Nagad',
-      transactionId: reqItem.transactionId,
-      activatedAt,
-      expiresAt,
-      validityType: pkg.validityType,
-      status: 'active',
-      targetExamDateSnapshot: pkg.validityType === 'exam_date' ? mirror.examDateConfig.targetExamDate : undefined,
-      createdAt: activatedAt
-    };
-
-    const verifier = String(verifierName || req.authUser!.email || 'Owner Admin');
-
-    if (useFirestore()) {
-      try {
-        const batch = adminDb.batch();
-        const payRef = adminDb.collection('paymentRequests').doc(id);
-        const subRef = adminDb.collection('subscriptions').doc(newSubscription.id);
-        const userRef = adminDb.collection('users').doc(reqItem.userId);
-
-        batch.update(payRef, {
-          status: 'approved',
-          verifiedAt: activatedAt,
-          verifiedBy: verifier,
-          subscriptionId: newSubscription.id
-        });
-        batch.set(subRef, {
-          userId: newSubscription.userId,
-          studentName: newSubscription.studentName,
-          studentPhone: newSubscription.studentPhone,
-          packageId: newSubscription.packageId,
-          packageNameBn: newSubscription.packageNameBn,
-          packageNameEn: newSubscription.packageNameEn,
-          pricePaid: newSubscription.pricePaid,
-          paymentRequestId: newSubscription.paymentRequestId,
-          paymentMethod: newSubscription.paymentMethod,
-          transactionId: newSubscription.transactionId,
-          activatedAt: isoToTimestamp(activatedAt),
-          expiresAt: isoToTimestamp(expiresAt),
-          validityType: newSubscription.validityType,
-          status: 'active',
-          targetExamDateSnapshot: newSubscription.targetExamDateSnapshot || null,
-          createdAt: activatedAt
-        });
-        batch.set(
-          userRef,
-          {
-            subscriptionStatus: 'pro',
-            subscriptionExpiresAt: isoToTimestamp(expiresAt),
-            activePackageId: reqItem.packageId,
-            activePackageNameBn: reqItem.packageNameBn,
-            activePackageNameEn: reqItem.packageNameEn
-          },
-          { merge: true }
-        );
-        await batch.commit();
-      } catch (err) {
-        return res.status(500).json({
-          error: 'APPROVAL_PERSIST_FAILED',
-          message: err instanceof Error ? err.message : 'Failed to commit approval to Firestore'
+      // Development-only memory fallback
+      const reqItem = mirror.paymentRequests.find(p => p.id === id);
+      if (!reqItem) {
+        return res.status(404).json({ error: 'NOT_FOUND', message: 'Payment request not found' });
+      }
+      if (reqItem.status === 'approved') {
+        return res.status(400).json({ error: 'ALREADY_APPROVED', message: 'Payment already approved' });
+      }
+      const duplicateApproved = mirror.paymentRequests.find(
+        p => p.id !== id && p.transactionId === reqItem.transactionId && p.status === 'approved'
+      );
+      if (duplicateApproved) {
+        return res.status(409).json({
+          error: 'TRX_ALREADY_APPROVED',
+          message: 'এই TrxID দিয়ে ইতিপূর্বে আরেকটি পেমেন্ট অনুমোদন করা হয়েছে!'
         });
       }
-    }
 
-    reqItem.status = 'approved';
-    reqItem.verifiedAt = activatedAt;
-    reqItem.verifiedBy = verifier;
-    reqItem.subscriptionId = newSubscription.id;
-    mirror.subscriptions.unshift(newSubscription);
-
-    const existingUser = mirror.users[reqItem.userId];
-    mirror.users[reqItem.userId] = {
-      ...(existingUser || {
-        uid: reqItem.userId,
-        name: reqItem.studentName,
-        email: '',
-        phone: reqItem.studentPhone,
-        role: 'student',
+      const pkg = mirror.packages.find(p => p.id === reqItem.packageId) || {
+        id: reqItem.packageId,
+        nameBn: reqItem.packageNameBn,
+        nameEn: reqItem.packageNameEn,
+        validityType: reqItem.validityType || ('days' as const),
+        durationDays: reqItem.durationDays || 90
+      };
+      const activatedAt = new Date().toISOString();
+      const expiresAt = calculateSubscriptionExpiry(
+        pkg.validityType,
+        pkg.durationDays,
+        mirror.examDateConfig.targetExamDate
+      );
+      const newSubscription: UserSubscription = {
+        id: `sub_${reqItem.userId}_${reqItem.transactionId}`,
+        userId: reqItem.userId,
+        studentName: reqItem.studentName,
+        studentPhone: reqItem.studentPhone,
+        packageId: reqItem.packageId,
+        packageNameBn: reqItem.packageNameBn,
+        packageNameEn: reqItem.packageNameEn,
+        pricePaid: reqItem.amount,
+        paymentRequestId: reqItem.id,
+        paymentMethod: reqItem.method as 'bKash' | 'Nagad',
+        transactionId: reqItem.transactionId,
+        activatedAt,
+        expiresAt,
+        validityType: pkg.validityType,
+        status: 'active',
+        targetExamDateSnapshot: pkg.validityType === 'exam_date' ? mirror.examDateConfig.targetExamDate : undefined,
         createdAt: activatedAt
-      }),
-      subscriptionStatus: 'pro',
-      subscriptionExpiresAt: expiresAt,
-      activePackageId: reqItem.packageId,
-      activePackageNameBn: reqItem.packageNameBn,
-      activePackageNameEn: reqItem.packageNameEn
-    };
+      };
+      reqItem.status = 'approved';
+      reqItem.verifiedAt = activatedAt;
+      reqItem.verifiedBy = verifier;
+      reqItem.subscriptionId = newSubscription.id;
+      mirror.subscriptions.unshift(newSubscription);
+      const existingUser = mirror.users[reqItem.userId];
+      mirror.users[reqItem.userId] = {
+        ...(existingUser || {
+          uid: reqItem.userId,
+          name: reqItem.studentName,
+          email: '',
+          phone: reqItem.studentPhone,
+          role: 'student',
+          createdAt: activatedAt
+        }),
+        subscriptionStatus: 'pro',
+        subscriptionExpiresAt: expiresAt,
+        activePackageId: reqItem.packageId,
+        activePackageNameBn: reqItem.packageNameBn,
+        activePackageNameEn: reqItem.packageNameEn
+      };
+      mirror.auditLogs.unshift({
+        id: `log_${Date.now()}`,
+        userId: req.authUser!.uid,
+        userName: verifier,
+        action: 'PAYMENT_APPROVED',
+        details: `Approved ${reqItem.method} TrxID: ${reqItem.transactionId} (৳${reqItem.amount}) for UID ${reqItem.userId}.`,
+        timestamp: activatedAt
+      });
 
-    mirror.auditLogs.unshift({
-      id: `log_${Date.now()}`,
-      userId: req.authUser!.uid,
-      userName: verifier,
-      action: 'PAYMENT_APPROVED',
-      details: `Approved ${reqItem.method} TrxID: ${reqItem.transactionId} (৳${reqItem.amount}) for UID ${reqItem.userId}.`,
-      timestamp: new Date().toISOString()
-    });
-
-    return res.json({
-      success: true,
-      paymentRequest: reqItem,
-      subscription: newSubscription
-    });
+      return res.json({
+        success: true,
+        paymentRequest: reqItem,
+        subscription: newSubscription
+      });
+    } catch (err) {
+      return sendRouteError(
+        res,
+        'POST /api/admin/payments/:id/approve',
+        err,
+        'APPROVAL_PERSIST_FAILED',
+        'Failed to commit payment approval.'
+      );
+    }
   });
 
   app.post('/api/admin/payments/:id/reject', requireFirebaseAuth, requireOwnerAdmin, async (req: AuthenticatedRequest, res) => {
-    const id = String(req.params.id);
-    const { reason, verifierName } = req.body || {};
+    try {
+      const id = String(req.params.id);
+      const { reason, verifierName } = req.body || {};
+      const verifier = String(verifierName || req.authUser!.email || 'Owner Admin');
+      const rejectionReason = String(reason || 'Unverified Transaction ID or Amount Mismatch');
+      const verifiedAt = new Date().toISOString();
 
-    let reqItem = mirror.paymentRequests.find(p => p.id === id);
-    if (!reqItem && useFirestore()) {
-      try {
-        const snap = await adminDb.collection('paymentRequests').doc(id).get();
-        if (snap.exists) {
-          reqItem = { id: snap.id, ...(snap.data() as Omit<PaymentRequest, 'id'>) };
-        }
-      } catch {
-        // ignore
-      }
-    }
-    if (!reqItem) {
-      return res.status(404).json({ error: 'NOT_FOUND', message: 'Payment request not found' });
-    }
-
-    const verifier = String(verifierName || req.authUser!.email || 'Owner Admin');
-    const rejectionReason = String(reason || 'Unverified Transaction ID or Amount Mismatch');
-    const verifiedAt = new Date().toISOString();
-
-    if (useFirestore()) {
-      try {
-        await adminDb.collection('paymentRequests').doc(id).update({
-          status: 'rejected',
-          rejectionReason,
-          verifiedAt,
-          verifiedBy: verifier
+      if (useFirestore()) {
+        const updatedPay = await db.runTransaction(async (tx) => {
+          const payRef = db.collection('paymentRequests').doc(id);
+          const snap = await tx.get(payRef);
+          if (!snap.exists) {
+            throw new HttpError(404, 'NOT_FOUND', 'Payment request not found');
+          }
+          const reqItem = { id: snap.id, ...(snap.data() as Omit<PaymentRequest, 'id'>) };
+          if (reqItem.status === 'approved') {
+            throw new HttpError(400, 'ALREADY_APPROVED', 'Approved payment request cannot be rejected');
+          }
+          const auditRef = db.collection('auditLogs').doc(`log_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`);
+          tx.update(payRef, {
+            status: 'rejected',
+            rejectionReason,
+            verifiedAt,
+            verifiedBy: verifier
+          });
+          tx.set(auditRef, {
+            id: auditRef.id,
+            userId: req.authUser!.uid,
+            userName: verifier,
+            action: 'PAYMENT_REJECTED',
+            details: `Rejected ${reqItem.method} TrxID: ${reqItem.transactionId}. Reason: ${rejectionReason}`,
+            timestamp: verifiedAt
+          });
+          return {
+            ...reqItem,
+            status: 'rejected' as const,
+            rejectionReason,
+            verifiedAt,
+            verifiedBy: verifier
+          };
         });
-      } catch (err) {
-        return res.status(500).json({
-          error: 'REJECTION_PERSIST_FAILED',
-          message: err instanceof Error ? err.message : 'Failed to reject payment in Firestore'
-        });
+        return res.json({ success: true, paymentRequest: updatedPay });
       }
+
+      if (!allowMemoryFallback) {
+        return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+      }
+
+      const reqItem = mirror.paymentRequests.find(p => p.id === id);
+      if (!reqItem) {
+        return res.status(404).json({ error: 'NOT_FOUND', message: 'Payment request not found' });
+      }
+      if (reqItem.status === 'approved') {
+        return res.status(400).json({ error: 'ALREADY_APPROVED', message: 'Approved payment request cannot be rejected' });
+      }
+      reqItem.status = 'rejected';
+      reqItem.rejectionReason = rejectionReason;
+      reqItem.verifiedAt = verifiedAt;
+      reqItem.verifiedBy = verifier;
+      mirror.auditLogs.unshift({
+        id: `log_${Date.now()}`,
+        userId: req.authUser!.uid,
+        userName: verifier,
+        action: 'PAYMENT_REJECTED',
+        details: `Rejected ${reqItem.method} TrxID: ${reqItem.transactionId}. Reason: ${rejectionReason}`,
+        timestamp: verifiedAt
+      });
+
+      return res.json({ success: true, paymentRequest: reqItem });
+    } catch (err) {
+      return sendRouteError(
+        res,
+        'POST /api/admin/payments/:id/reject',
+        err,
+        'REJECTION_PERSIST_FAILED',
+        'Failed to reject payment in Firestore.'
+      );
     }
-
-    reqItem.status = 'rejected';
-    reqItem.rejectionReason = rejectionReason;
-    reqItem.verifiedAt = verifiedAt;
-    reqItem.verifiedBy = verifier;
-
-    mirror.auditLogs.unshift({
-      id: `log_${Date.now()}`,
-      userId: req.authUser!.uid,
-      userName: verifier,
-      action: 'PAYMENT_REJECTED',
-      details: `Rejected ${reqItem.method} TrxID: ${reqItem.transactionId}. Reason: ${rejectionReason}`,
-      timestamp: new Date().toISOString()
-    });
-
-    return res.json({
-      success: true,
-      paymentRequest: reqItem
-    });
   });
 
   // ---------------------------------------------------------
   // ADMIN PACKAGES, CONFIG, SETTINGS & USER MANAGEMENT
   // ---------------------------------------------------------
-  app.get('/api/admin/packages', requireFirebaseAuth, requireOwnerAdmin, (_req, res) => {
-    res.json({ packages: mirror.packages, examDateConfig: mirror.examDateConfig });
+  app.get('/api/admin/packages', requireFirebaseAuth, requireOwnerAdmin, async (_req, res) => {
+    try {
+      if (useFirestore()) {
+        const [pkgSnap, configSnap] = await Promise.all([
+          db.collection('packages').get(),
+          db.collection('config').doc('examDate').get()
+        ]);
+        const packagesList = pkgSnap.docs.map(d => ({
+          id: d.id,
+          ...(d.data() as Omit<SubscriptionPackage, 'id'>)
+        }));
+        const examDateConfig = configSnap.exists
+          ? { ...mirror.examDateConfig, ...(configSnap.data() as Partial<ExamDateConfig>) }
+          : mirror.examDateConfig;
+        return res.json({ packages: packagesList, examDateConfig });
+      }
+      if (!allowMemoryFallback) {
+        return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+      }
+      return res.json({ packages: mirror.packages, examDateConfig: mirror.examDateConfig });
+    } catch (err) {
+      return sendRouteError(res, 'GET /api/admin/packages', err);
+    }
   });
 
   app.post('/api/admin/packages/update', requireFirebaseAuth, requireOwnerAdmin, async (req: AuthenticatedRequest, res) => {
-    const { id, price, durationDays, isActive } = req.body || {};
-    const pkg = mirror.packages.find(p => p.id === id);
-    if (!pkg) {
-      return res.status(404).json({ error: 'Package not found' });
+    try {
+      const { id, price, durationDays, isActive } = req.body || {};
+      if (!id || typeof id !== 'string') {
+        return res.status(400).json({ error: 'INVALID_PACKAGE_ID', message: 'Package id is required' });
+      }
+
+      if (useFirestore()) {
+        const pkgRef = db.collection('packages').doc(id);
+        const snap = await pkgRef.get();
+        if (!snap.exists) {
+          return res.status(404).json({ error: 'PACKAGE_NOT_FOUND', message: 'Package not found in Firestore' });
+        }
+        const existing = { id: snap.id, ...(snap.data() as Omit<SubscriptionPackage, 'id'>) };
+        const updatedPkg: SubscriptionPackage = {
+          ...existing,
+          ...(price !== undefined ? { price: Number(price) } : {}),
+          ...(durationDays !== undefined ? { durationDays: Number(durationDays) } : {}),
+          ...(isActive !== undefined ? { isActive: Boolean(isActive) } : {}),
+          updatedAt: new Date().toISOString()
+        };
+
+        const batch = db.batch();
+        batch.set(pkgRef, updatedPkg, { merge: true });
+        if (updatedPkg.id === 'pkg_exam_pass' && price !== undefined) {
+          batch.set(
+            db.collection('config').doc('examDate'),
+            { examPassPrice: Number(price), lastUpdated: updatedPkg.updatedAt },
+            { merge: true }
+          );
+        }
+        const auditEntry: AuditLog = {
+          id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          userId: req.authUser!.uid,
+          userName: req.authUser!.email || 'Owner Admin',
+          action: 'UPDATE_PACKAGE',
+          details: `Updated package ${updatedPkg.nameEn}: Price=${updatedPkg.price}, Duration=${updatedPkg.durationDays}d, Active=${updatedPkg.isActive}`,
+          timestamp: updatedPkg.updatedAt!
+        };
+        batch.set(db.collection('auditLogs').doc(auditEntry.id), auditEntry);
+        await batch.commit();
+
+        return res.json({ success: true, package: updatedPkg });
+      }
+
+      if (!allowMemoryFallback) {
+        return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+      }
+
+      const pkg = mirror.packages.find(p => p.id === id);
+      if (!pkg) {
+        return res.status(404).json({ error: 'Package not found' });
+      }
+      if (price !== undefined) pkg.price = Number(price);
+      if (durationDays !== undefined) pkg.durationDays = Number(durationDays);
+      if (isActive !== undefined) pkg.isActive = Boolean(isActive);
+      pkg.updatedAt = new Date().toISOString();
+
+      if (pkg.id === 'pkg_exam_pass' && price !== undefined) {
+        mirror.examDateConfig.examPassPrice = Number(price);
+      }
+
+      mirror.auditLogs.unshift({
+        id: `log_${Date.now()}`,
+        userId: req.authUser!.uid,
+        userName: req.authUser!.email || 'Owner Admin',
+        action: 'UPDATE_PACKAGE',
+        details: `Updated package ${pkg.nameEn}: Price=${pkg.price}, Duration=${pkg.durationDays}d, Active=${pkg.isActive}`,
+        timestamp: pkg.updatedAt
+      });
+
+      return res.json({ success: true, package: pkg });
+    } catch (err) {
+      return sendRouteError(res, 'POST /api/admin/packages/update', err);
     }
-    if (price !== undefined) pkg.price = Number(price);
-    if (durationDays !== undefined) pkg.durationDays = Number(durationDays);
-    if (isActive !== undefined) pkg.isActive = Boolean(isActive);
-    pkg.updatedAt = new Date().toISOString();
-
-    if (pkg.id === 'pkg_exam_pass' && price !== undefined) {
-      mirror.examDateConfig.examPassPrice = Number(price);
-    }
-
-    if (useFirestore()) {
-      await adminDb.collection('packages').doc(pkg.id).set(pkg, { merge: true }).catch(() => {});
-    }
-
-    mirror.auditLogs.unshift({
-      id: `log_${Date.now()}`,
-      userId: req.authUser!.uid,
-      userName: req.authUser!.email || 'Owner Admin',
-      action: 'UPDATE_PACKAGE',
-      details: `Updated package ${pkg.nameEn}: Price=${pkg.price}, Duration=${pkg.durationDays}d, Active=${pkg.isActive}`,
-      timestamp: new Date().toISOString()
-    });
-
-    res.json({ success: true, package: pkg });
   });
 
   app.post('/api/admin/exam-config', requireFirebaseAuth, requireOwnerAdmin, async (req: AuthenticatedRequest, res) => {
-    const { targetExamDate, examDatePolicy, examPassPrice, examTitleBn, examTitleEn } = req.body || {};
-    if (targetExamDate) mirror.examDateConfig.targetExamDate = targetExamDate;
-    if (examDatePolicy) mirror.examDateConfig.examDatePolicy = examDatePolicy;
-    if (examPassPrice !== undefined) {
-      mirror.examDateConfig.examPassPrice = Number(examPassPrice);
-      const epPkg = mirror.packages.find(p => p.id === 'pkg_exam_pass');
-      if (epPkg) epPkg.price = Number(examPassPrice);
-    }
-    if (examTitleBn) mirror.examDateConfig.examTitleBn = examTitleBn;
-    if (examTitleEn) mirror.examDateConfig.examTitleEn = examTitleEn;
-    mirror.examDateConfig.lastUpdated = new Date().toISOString();
+    try {
+      const { targetExamDate, examDatePolicy, examPassPrice, examTitleBn, examTitleEn } = req.body || {};
+      const nowIso = new Date().toISOString();
 
-    let affectedSubscribers = 0;
-    if (mirror.examDateConfig.examDatePolicy === 'extend_all' && targetExamDate) {
-      const nextIso = new Date(targetExamDate).toISOString();
-      mirror.subscriptions.forEach(sub => {
-        if (sub.packageId === 'pkg_exam_pass' && sub.status === 'active') {
-          sub.expiresAt = nextIso;
-          sub.targetExamDateSnapshot = targetExamDate;
-          affectedSubscribers++;
+      if (useFirestore()) {
+        const configRef = db.collection('config').doc('examDate');
+        const configSnap = await configRef.get();
+        const currentConfig: ExamDateConfig = {
+          ...mirror.examDateConfig,
+          ...(configSnap.exists ? (configSnap.data() as Partial<ExamDateConfig>) : {})
+        };
+
+        const nextConfig: ExamDateConfig = {
+          ...currentConfig,
+          ...(targetExamDate ? { targetExamDate } : {}),
+          ...(examDatePolicy ? { examDatePolicy } : {}),
+          ...(examPassPrice !== undefined ? { examPassPrice: Number(examPassPrice) } : {}),
+          ...(examTitleBn ? { examTitleBn } : {}),
+          ...(examTitleEn ? { examTitleEn } : {}),
+          lastUpdated: nowIso
+        };
+
+        let affectedSubscribers = 0;
+        const pendingUpdates: Array<{ subId: string; userId: string }> = [];
+
+        if (nextConfig.examDatePolicy === 'extend_all' && targetExamDate) {
+          const subSnap = await db.collection('subscriptions').where('packageId', '==', 'pkg_exam_pass').get();
+          subSnap.forEach(d => {
+            const data = d.data();
+            if (data.status === 'active') {
+              pendingUpdates.push({ subId: d.id, userId: String(data.userId) });
+            }
+          });
+          affectedSubscribers = pendingUpdates.length;
         }
+
+        const nextTs = targetExamDate ? isoToTimestamp(new Date(targetExamDate).toISOString()) : null;
+        const writeOps: Array<(batch: ReturnType<Firestore['batch']>) => void> = [];
+
+        writeOps.push(batch => batch.set(configRef, nextConfig, { merge: true }));
+
+        if (examPassPrice !== undefined) {
+          const pkgRef = db.collection('packages').doc('pkg_exam_pass');
+          const pkgSnap = await pkgRef.get();
+          if (pkgSnap.exists) {
+            writeOps.push(batch =>
+              batch.update(pkgRef, { price: Number(examPassPrice), updatedAt: nowIso })
+            );
+          }
+        }
+
+        for (const item of pendingUpdates) {
+          if (nextTs) {
+            writeOps.push(batch =>
+              batch.update(db.collection('subscriptions').doc(item.subId), {
+                expiresAt: nextTs,
+                targetExamDateSnapshot: targetExamDate
+              })
+            );
+            writeOps.push(batch =>
+              batch.set(
+                db.collection('users').doc(item.userId),
+                { subscriptionExpiresAt: nextTs },
+                { merge: true }
+              )
+            );
+          }
+        }
+
+        const auditEntry: AuditLog = {
+          id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          userId: req.authUser!.uid,
+          userName: req.authUser!.email || 'Owner Admin',
+          action: 'UPDATE_EXAM_DATE_CONFIG',
+          details: `Updated exam date config (${nextConfig.targetExamDate}). Policy: ${nextConfig.examDatePolicy}. Affected: ${affectedSubscribers}.`,
+          timestamp: nowIso
+        };
+        writeOps.push(batch => batch.set(db.collection('auditLogs').doc(auditEntry.id), auditEntry));
+
+        for (let i = 0; i < writeOps.length; i += 400) {
+          const batch = db.batch();
+          for (const op of writeOps.slice(i, i + 400)) {
+            op(batch);
+          }
+          await batch.commit();
+        }
+
+        return res.json({
+          success: true,
+          examDateConfig: nextConfig,
+          affectedSubscribers
+        });
+      }
+
+      if (!allowMemoryFallback) {
+        return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+      }
+
+      if (targetExamDate) mirror.examDateConfig.targetExamDate = targetExamDate;
+      if (examDatePolicy) mirror.examDateConfig.examDatePolicy = examDatePolicy;
+      if (examPassPrice !== undefined) {
+        mirror.examDateConfig.examPassPrice = Number(examPassPrice);
+        const epPkg = mirror.packages.find(p => p.id === 'pkg_exam_pass');
+        if (epPkg) epPkg.price = Number(examPassPrice);
+      }
+      if (examTitleBn) mirror.examDateConfig.examTitleBn = examTitleBn;
+      if (examTitleEn) mirror.examDateConfig.examTitleEn = examTitleEn;
+      mirror.examDateConfig.lastUpdated = nowIso;
+
+      let affectedSubscribers = 0;
+      if (mirror.examDateConfig.examDatePolicy === 'extend_all' && targetExamDate) {
+        const nextIso = new Date(targetExamDate).toISOString();
+        mirror.subscriptions.forEach(sub => {
+          if (sub.packageId === 'pkg_exam_pass' && sub.status === 'active') {
+            sub.expiresAt = nextIso;
+            sub.targetExamDateSnapshot = targetExamDate;
+            affectedSubscribers++;
+          }
+        });
+      }
+
+      return res.json({
+        success: true,
+        examDateConfig: mirror.examDateConfig,
+        affectedSubscribers
       });
+    } catch (err) {
+      return sendRouteError(res, 'POST /api/admin/exam-config', err);
     }
-
-    if (useFirestore()) {
-      await adminDb.collection('config').doc('examDate').set(mirror.examDateConfig, { merge: true }).catch(() => {});
-    }
-
-    res.json({
-      success: true,
-      examDateConfig: mirror.examDateConfig,
-      affectedSubscribers
-    });
   });
 
-  app.post('/api/admin/payment-settings', requireFirebaseAuth, requireOwnerAdmin, (req: AuthenticatedRequest, res) => {
-    const { bkashNumber, nagadNumber, whatsappNumber, whatsappMessage } = req.body || {};
-    if (bkashNumber) mirror.paymentSettings.bkashNumber = String(bkashNumber).trim();
-    if (nagadNumber) mirror.paymentSettings.nagadNumber = String(nagadNumber).trim();
-    if (whatsappNumber) {
-      mirror.paymentSettings.whatsappNumber = String(whatsappNumber).trim();
-      mirror.supportSettings.whatsappNumber = String(whatsappNumber).trim();
+  app.post('/api/admin/payment-settings', requireFirebaseAuth, requireOwnerAdmin, async (req: AuthenticatedRequest, res) => {
+    try {
+      const { bkashNumber, nagadNumber, packagePrice, instructionsBn, instructionsEn, whatsappNumber, whatsappMessage } =
+        req.body || {};
+
+      const bdWalletRegex = /^01[3-9]\d{8}$/;
+      if (bkashNumber !== undefined && !bdWalletRegex.test(String(bkashNumber).trim())) {
+        return res.status(400).json({
+          error: 'INVALID_PAYMENT_NUMBER',
+          message: 'bKash নম্বরটি সঠিক ১১ ডিজিটের বাংলাদেশি মোবাইল নম্বর হতে হবে (যেমন: 017xxxxxxxx)।'
+        });
+      }
+      if (nagadNumber !== undefined && !bdWalletRegex.test(String(nagadNumber).trim())) {
+        return res.status(400).json({
+          error: 'INVALID_PAYMENT_NUMBER',
+          message: 'Nagad নম্বরটি সঠিক ১১ ডিজিটের বাংলাদেশি মোবাইল নম্বর হতে হবে (যেমন: 017xxxxxxxx)।'
+        });
+      }
+      if (packagePrice !== undefined) {
+        const parsedPrice = Number(packagePrice);
+        if (!Number.isFinite(parsedPrice) || parsedPrice <= 0) {
+          return res.status(400).json({ error: 'INVALID_PACKAGE_PRICE', message: 'Valid positive packagePrice is required.' });
+        }
+      }
+      if (whatsappNumber !== undefined) {
+        const waDigits = String(whatsappNumber).replace(/[^0-9]/g, '');
+        if (waDigits.length < 10 || waDigits.length > 15) {
+          return res.status(400).json({ error: 'INVALID_WHATSAPP_NUMBER', message: 'Valid WhatsApp number (10-15 digits) is required.' });
+        }
+      }
+
+      if (useFirestore()) {
+        const payRef = db.collection('config').doc('paymentSettings');
+        const supRef = db.collection('config').doc('supportSettings');
+        const [paySnap, supSnap] = await Promise.all([payRef.get(), supRef.get()]);
+
+        const currentPay: PaymentSettings = {
+          ...mirror.paymentSettings,
+          ...(paySnap.exists ? (paySnap.data() as Partial<PaymentSettings>) : {})
+        };
+        const currentSup: SupportContactSettings = {
+          ...mirror.supportSettings,
+          ...(supSnap.exists ? (supSnap.data() as Partial<SupportContactSettings>) : {})
+        };
+
+        const nextPay: PaymentSettings = {
+          ...currentPay,
+          ...(bkashNumber ? { bkashNumber: String(bkashNumber).trim() } : {}),
+          ...(nagadNumber ? { nagadNumber: String(nagadNumber).trim() } : {}),
+          ...(packagePrice !== undefined ? { packagePrice: Number(packagePrice) } : {}),
+          ...(instructionsBn ? { instructionsBn: String(instructionsBn).trim() } : {}),
+          ...(instructionsEn ? { instructionsEn: String(instructionsEn).trim() } : {}),
+          ...(whatsappNumber ? { whatsappNumber: String(whatsappNumber).trim() } : {}),
+          ...(whatsappMessage ? { whatsappMessage: String(whatsappMessage).trim() } : {})
+        };
+
+        const nextSup: SupportContactSettings = {
+          ...currentSup,
+          ...(whatsappNumber ? { whatsappNumber: String(whatsappNumber).trim() } : {}),
+          ...(whatsappMessage ? { whatsappMessage: String(whatsappMessage).trim() } : {})
+        };
+
+        const nowIso = new Date().toISOString();
+        const auditEntry: AuditLog = {
+          id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          userId: req.authUser!.uid,
+          userName: req.authUser!.email || 'Owner Admin',
+          action: 'UPDATE_PAYMENT_SETTINGS',
+          details: `Updated Payment Numbers: bKash=${nextPay.bkashNumber}, Nagad=${nextPay.nagadNumber}`,
+          timestamp: nowIso
+        };
+
+        const batch = db.batch();
+        batch.set(payRef, { ...nextPay, updatedAt: nowIso }, { merge: true });
+        batch.set(supRef, { ...nextSup, updatedAt: nowIso }, { merge: true });
+        batch.set(db.collection('auditLogs').doc(auditEntry.id), auditEntry);
+        await batch.commit();
+
+        return res.json({
+          success: true,
+          paymentSettings: nextPay,
+          supportSettings: nextSup
+        });
+      }
+
+      if (!allowMemoryFallback) {
+        return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+      }
+
+      if (bkashNumber) mirror.paymentSettings.bkashNumber = String(bkashNumber).trim();
+      if (nagadNumber) mirror.paymentSettings.nagadNumber = String(nagadNumber).trim();
+      if (packagePrice !== undefined) mirror.paymentSettings.packagePrice = Number(packagePrice);
+      if (instructionsBn) mirror.paymentSettings.instructionsBn = String(instructionsBn).trim();
+      if (instructionsEn) mirror.paymentSettings.instructionsEn = String(instructionsEn).trim();
+      if (whatsappNumber) {
+        mirror.paymentSettings.whatsappNumber = String(whatsappNumber).trim();
+        mirror.supportSettings.whatsappNumber = String(whatsappNumber).trim();
+      }
+      if (whatsappMessage) {
+        mirror.paymentSettings.whatsappMessage = String(whatsappMessage).trim();
+        mirror.supportSettings.whatsappMessage = String(whatsappMessage).trim();
+      }
+      return res.json({
+        success: true,
+        paymentSettings: mirror.paymentSettings,
+        supportSettings: mirror.supportSettings
+      });
+    } catch (err) {
+      return sendRouteError(res, 'POST /api/admin/payment-settings', err);
     }
-    if (whatsappMessage) {
-      mirror.paymentSettings.whatsappMessage = String(whatsappMessage).trim();
-      mirror.supportSettings.whatsappMessage = String(whatsappMessage).trim();
-    }
-    res.json({
-      success: true,
-      paymentSettings: mirror.paymentSettings,
-      supportSettings: mirror.supportSettings
-    });
   });
 
-  app.post('/api/admin/support-settings', requireFirebaseAuth, requireOwnerAdmin, (req: AuthenticatedRequest, res) => {
-    const { whatsappNumber, whatsappMessage } = req.body || {};
-    if (whatsappNumber) {
-      mirror.supportSettings.whatsappNumber = String(whatsappNumber).trim();
-      mirror.paymentSettings.whatsappNumber = String(whatsappNumber).trim();
+  app.post('/api/admin/support-settings', requireFirebaseAuth, requireOwnerAdmin, async (req: AuthenticatedRequest, res) => {
+    try {
+      const { whatsappNumber, whatsappMessage } = req.body || {};
+
+      if (whatsappNumber !== undefined) {
+        const waDigits = String(whatsappNumber).replace(/[^0-9]/g, '');
+        if (waDigits.length < 10 || waDigits.length > 15) {
+          return res.status(400).json({ error: 'INVALID_WHATSAPP_NUMBER', message: 'Valid WhatsApp number (10-15 digits) is required.' });
+        }
+      }
+
+      if (useFirestore()) {
+        const supRef = db.collection('config').doc('supportSettings');
+        const payRef = db.collection('config').doc('paymentSettings');
+        const [supSnap, paySnap] = await Promise.all([supRef.get(), payRef.get()]);
+
+        const currentSup: SupportContactSettings = {
+          ...mirror.supportSettings,
+          ...(supSnap.exists ? (supSnap.data() as Partial<SupportContactSettings>) : {})
+        };
+        const currentPay: PaymentSettings = {
+          ...mirror.paymentSettings,
+          ...(paySnap.exists ? (paySnap.data() as Partial<PaymentSettings>) : {})
+        };
+
+        const nextSup: SupportContactSettings = {
+          ...currentSup,
+          ...(whatsappNumber ? { whatsappNumber: String(whatsappNumber).trim() } : {}),
+          ...(whatsappMessage ? { whatsappMessage: String(whatsappMessage).trim() } : {})
+        };
+
+        const nowIso = new Date().toISOString();
+        const auditEntry: AuditLog = {
+          id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          userId: req.authUser!.uid,
+          userName: req.authUser!.email || 'Owner Admin',
+          action: 'UPDATE_SUPPORT_SETTINGS',
+          details: `Updated WhatsApp Support: ${nextSup.whatsappNumber}`,
+          timestamp: nowIso
+        };
+
+        const batch = db.batch();
+        batch.set(supRef, { ...nextSup, updatedAt: nowIso }, { merge: true });
+        batch.set(
+          payRef,
+          {
+            ...currentPay,
+            whatsappNumber: nextSup.whatsappNumber,
+            whatsappMessage: nextSup.whatsappMessage,
+            updatedAt: nowIso
+          },
+          { merge: true }
+        );
+        batch.set(db.collection('auditLogs').doc(auditEntry.id), auditEntry);
+        await batch.commit();
+
+        return res.json({ success: true, supportSettings: nextSup });
+      }
+
+      if (!allowMemoryFallback) {
+        return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+      }
+
+      if (whatsappNumber) {
+        mirror.supportSettings.whatsappNumber = String(whatsappNumber).trim();
+        mirror.paymentSettings.whatsappNumber = String(whatsappNumber).trim();
+      }
+      if (whatsappMessage) {
+        mirror.supportSettings.whatsappMessage = String(whatsappMessage).trim();
+        mirror.paymentSettings.whatsappMessage = String(whatsappMessage).trim();
+      }
+      return res.json({ success: true, supportSettings: mirror.supportSettings });
+    } catch (err) {
+      return sendRouteError(res, 'POST /api/admin/support-settings', err);
     }
-    if (whatsappMessage) {
-      mirror.supportSettings.whatsappMessage = String(whatsappMessage).trim();
-      mirror.paymentSettings.whatsappMessage = String(whatsappMessage).trim();
-    }
-    res.json({ success: true, supportSettings: mirror.supportSettings });
   });
 
   app.post('/api/admin/users/update', requireFirebaseAuth, requireOwnerAdmin, async (req: AuthenticatedRequest, res) => {
-    const {
-      userId,
-      subscriptionId,
-      name,
-      email,
-      phone,
-      role,
-      subscriptionStatus,
-      packageId,
-      packageNameBn,
-      packageNameEn,
-      expiresAt,
-      isSessionRevoked
-    } = req.body || {};
+    try {
+      const {
+        userId,
+        subscriptionId,
+        name,
+        email,
+        phone,
+        role,
+        subscriptionStatus,
+        packageId,
+        packageNameBn,
+        packageNameEn,
+        expiresAt,
+        isSessionRevoked
+      } = req.body || {};
 
-    if (!userId) {
-      return res.status(400).json({ error: 'MISSING_USER_ID', message: 'userId is required' });
-    }
+      if (!userId || typeof userId !== 'string' || !userId.trim()) {
+        return res.status(400).json({ error: 'MISSING_USER_ID', message: 'userId is required' });
+      }
+      const cleanName = typeof name === 'string' ? name.trim().slice(0, 100) : '';
+      if (!cleanName) {
+        return res.status(400).json({ error: 'INVALID_USER_NAME', message: 'Valid user name is required.' });
+      }
+      const allowedStatuses = new Set(['free', 'pro', 'expired']);
+      const safeSubStatus = allowedStatuses.has(String(subscriptionStatus))
+        ? (String(subscriptionStatus) as 'free' | 'pro' | 'expired')
+        : 'free';
 
-    const safeRole: UserRole = role === 'admin' && userId !== OWNER_ADMIN_UID ? 'student' : (role || 'student');
-    const cleanExpiresIso = expiresAt ? new Date(expiresAt).toISOString() : undefined;
+      const targetUid = userId.trim();
+      const allowedRoles = new Set<UserRole>(['student', 'question_manager', 'admin']);
+      const requestedRole = allowedRoles.has(role as UserRole) ? (role as UserRole) : 'student';
+      const safeRole: UserRole =
+        requestedRole === 'admin' && targetUid !== OWNER_ADMIN_UID ? 'student' : requestedRole;
 
-    if (useFirestore()) {
-      await adminDb
-        .collection('users')
-        .doc(String(userId))
-        .set(
-          {
-            name,
-            email,
-            phone,
-            role: safeRole,
-            subscriptionStatus,
-            subscriptionExpiresAt: isoToTimestamp(cleanExpiresIso),
-            activePackageId: packageId || null,
-            activePackageNameBn: packageNameBn || null,
-            activePackageNameEn: packageNameEn || null
+      let cleanExpiresIso: string | undefined;
+      if (expiresAt !== undefined && expiresAt !== null && String(expiresAt).trim() !== '') {
+        const parsedExp = new Date(String(expiresAt));
+        if (isNaN(parsedExp.getTime())) {
+          return res.status(400).json({ error: 'INVALID_EXPIRES_AT', message: 'Invalid expiresAt date format.' });
+        }
+        cleanExpiresIso = parsedExp.toISOString();
+      }
+      const nowIso = new Date().toISOString();
+
+      const cleanEmail = typeof email === 'string' ? email.trim() : '';
+      const cleanPhone = typeof phone === 'string' ? phone.trim() : '';
+
+      if (useFirestore()) {
+        const userRef = db.collection('users').doc(targetUid);
+        const [userSnap, userSessSnap, subSnap] = await Promise.all([
+          userRef.get(),
+          isSessionRevoked ? db.collection('userSessions').doc(targetUid).get() : Promise.resolve(null),
+          subscriptionId
+            ? db.collection('subscriptions').doc(String(subscriptionId)).get()
+            : db.collection('subscriptions').where('userId', '==', targetUid).limit(1).get()
+        ]);
+
+        const existingUserData = userSnap.exists ? userSnap.data() : {};
+        const batch = db.batch();
+        const userPayload = {
+          uid: targetUid,
+          name: cleanName,
+          email: cleanEmail,
+          phone: cleanPhone,
+          role: safeRole,
+          subscriptionStatus: safeSubStatus,
+          subscriptionExpiresAt: isoToTimestamp(cleanExpiresIso),
+          activePackageId: packageId || null,
+          activePackageNameBn: packageNameBn || null,
+          activePackageNameEn: packageNameEn || null,
+          createdAt: existingUserData?.createdAt || nowIso
+        };
+        batch.set(userRef, userPayload, { merge: true });
+
+        let persistedSubscription: UserSubscription | null = null;
+        const resolvedSubDoc =
+          subscriptionId && 'exists' in subSnap
+            ? (subSnap.exists ? subSnap : null)
+            : !subscriptionId && 'docs' in subSnap && subSnap.docs.length > 0
+            ? subSnap.docs[0]
+            : null;
+
+        if (subscriptionId || resolvedSubDoc || safeSubStatus === 'pro') {
+          const targetSubId = subscriptionId
+            ? String(subscriptionId)
+            : resolvedSubDoc
+            ? resolvedSubDoc.id
+            : `sub_admin_${targetUid}`;
+          const existingSubData = resolvedSubDoc?.data() as Record<string, unknown> | undefined;
+          const pkgMatch = mirror.packages.find(p => p.id === (packageId || existingSubData?.packageId)) || mirror.packages[0];
+          const nextSubStatus =
+            safeSubStatus === 'pro' ? 'active' : safeSubStatus === 'expired' ? 'expired' : 'cancelled';
+          const effectiveExpiresIso =
+            cleanExpiresIso ||
+            timestampToIso(existingSubData?.expiresAt) ||
+            new Date(Date.now() + 90 * 24 * 3600 * 1000).toISOString();
+
+          const subFirestorePayload: Record<string, unknown> = {
+            id: targetSubId,
+            userId: targetUid,
+            studentName: cleanName,
+            studentPhone: cleanPhone,
+            packageId: packageId || (existingSubData?.packageId as string) || pkgMatch.id,
+            packageNameBn: packageNameBn || (existingSubData?.packageNameBn as string) || pkgMatch.nameBn,
+            packageNameEn: packageNameEn || (existingSubData?.packageNameEn as string) || pkgMatch.nameEn,
+            pricePaid: typeof existingSubData?.pricePaid === 'number' ? existingSubData.pricePaid : pkgMatch.price,
+            paymentRequestId: (existingSubData?.paymentRequestId as string) || `admin_grant_${targetUid}`,
+            paymentMethod: (existingSubData?.paymentMethod as string) || 'bKash',
+            transactionId: (existingSubData?.transactionId as string) || `ADMIN_GRANT_${Date.now().toString().slice(-6)}`,
+            validityType: (existingSubData?.validityType as 'days' | 'exam_date') || pkgMatch.validityType,
+            status: nextSubStatus,
+            activatedAt: (existingSubData?.activatedAt as string) || nowIso,
+            expiresAt: isoToTimestamp(effectiveExpiresIso),
+            createdAt: (existingSubData?.createdAt as string) || nowIso,
+            updatedAt: nowIso
+          };
+
+          batch.set(db.collection('subscriptions').doc(targetSubId), subFirestorePayload, { merge: true });
+          persistedSubscription = {
+            ...(subFirestorePayload as unknown as UserSubscription),
+            expiresAt: effectiveExpiresIso
+          };
+        }
+
+        if (isSessionRevoked && userSessSnap?.exists) {
+          const activeSessId = userSessSnap.data()?.activeSessionId as string | undefined;
+          if (activeSessId) {
+            batch.set(
+              db.collection('sessions').doc(activeSessId),
+              { status: 'revoked', revokedReason: 'Revoked by administrator' },
+              { merge: true }
+            );
+          }
+        }
+
+        const auditEntry: AuditLog = {
+          id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          userId: req.authUser!.uid,
+          userName: req.authUser!.email || 'Owner Admin',
+          action: 'USER_EDITED_BY_ADMIN',
+          details: `Admin updated user ${targetUid} (role=${safeRole}, status=${safeSubStatus}).`,
+          timestamp: nowIso
+        };
+        batch.set(db.collection('auditLogs').doc(auditEntry.id), auditEntry);
+        await batch.commit();
+
+        return res.json({
+          success: true,
+          user: {
+            ...userPayload,
+            subscriptionExpiresAt: cleanExpiresIso
           },
-          { merge: true }
-        )
-        .catch(() => {});
-
-      if (subscriptionId) {
-        await adminDb
-          .collection('subscriptions')
-          .doc(String(subscriptionId))
-          .set(
-            {
-              studentName: name,
-              studentPhone: phone,
-              status: subscriptionStatus === 'pro' ? 'active' : subscriptionStatus === 'expired' ? 'expired' : 'cancelled',
-              ...(cleanExpiresIso ? { expiresAt: isoToTimestamp(cleanExpiresIso) } : {})
-            },
-            { merge: true }
-          )
-          .catch(() => {});
+          subscription: persistedSubscription
+        });
       }
-    }
 
-    const existing = mirror.users[userId];
-    mirror.users[userId] = {
-      ...(existing || { uid: userId, createdAt: new Date().toISOString() }),
-      uid: userId,
-      name,
-      email,
-      phone,
-      role: safeRole,
-      subscriptionStatus,
-      subscriptionExpiresAt: cleanExpiresIso,
-      activePackageId: packageId,
-      activePackageNameBn: packageNameBn,
-      activePackageNameEn: packageNameEn
-    };
-
-    if (isSessionRevoked) {
-      const sessId = mirror.userActiveSessions[userId];
-      if (sessId && mirror.sessions[sessId]) {
-        mirror.sessions[sessId].status = 'revoked';
-        mirror.sessions[sessId].revokedReason = 'Revoked by administrator';
+      if (!allowMemoryFallback) {
+        return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
       }
-    }
 
-    return res.json({ success: true, user: mirror.users[userId] });
+      const existing = mirror.users[targetUid];
+      mirror.users[targetUid] = {
+        ...(existing || { uid: targetUid, createdAt: nowIso }),
+        uid: targetUid,
+        name: cleanName,
+        email: cleanEmail,
+        phone: cleanPhone,
+        role: safeRole,
+        subscriptionStatus: safeSubStatus,
+        subscriptionExpiresAt: cleanExpiresIso,
+        activePackageId: packageId,
+        activePackageNameBn: packageNameBn,
+        activePackageNameEn: packageNameEn
+      };
+
+      let mirrorSub: UserSubscription | null = null;
+      const existingSubIdx = mirror.subscriptions.findIndex(
+        s => s.userId === targetUid || (subscriptionId && s.id === subscriptionId)
+      );
+      if (existingSubIdx >= 0) {
+        const prevSub = mirror.subscriptions[existingSubIdx];
+        mirrorSub = {
+          ...prevSub,
+          studentName: cleanName,
+          studentPhone: cleanPhone,
+          packageId: packageId || prevSub.packageId,
+          packageNameBn: packageNameBn || prevSub.packageNameBn,
+          packageNameEn: packageNameEn || prevSub.packageNameEn,
+          status: safeSubStatus === 'pro' ? 'active' : safeSubStatus === 'expired' ? 'expired' : 'cancelled',
+          expiresAt: cleanExpiresIso || prevSub.expiresAt
+        };
+        mirror.subscriptions[existingSubIdx] = mirrorSub;
+      } else if (safeSubStatus === 'pro') {
+        const pkgMatch = mirror.packages.find(p => p.id === packageId) || mirror.packages[0];
+        mirrorSub = {
+          id: `sub_admin_${targetUid}`,
+          userId: targetUid,
+          studentName: cleanName,
+          studentPhone: cleanPhone,
+          packageId: pkgMatch.id,
+          packageNameBn: packageNameBn || pkgMatch.nameBn,
+          packageNameEn: packageNameEn || pkgMatch.nameEn,
+          pricePaid: pkgMatch.price,
+          paymentRequestId: `admin_grant_${Date.now()}`,
+          paymentMethod: 'bKash',
+          transactionId: `ADMIN_GRANT_${Date.now().toString().slice(-6)}`,
+          activatedAt: nowIso,
+          expiresAt: cleanExpiresIso || new Date(Date.now() + 90 * 24 * 3600 * 1000).toISOString(),
+          validityType: pkgMatch.validityType,
+          status: 'active',
+          createdAt: nowIso
+        };
+        mirror.subscriptions.unshift(mirrorSub);
+      }
+
+      if (isSessionRevoked) {
+        const sessId = mirror.userActiveSessions[targetUid];
+        if (sessId && mirror.sessions[sessId]) {
+          mirror.sessions[sessId].status = 'revoked';
+          mirror.sessions[sessId].revokedReason = 'Revoked by administrator';
+        }
+      }
+
+      return res.json({ success: true, user: mirror.users[targetUid], subscription: mirrorSub });
+    } catch (err) {
+      return sendRouteError(res, 'POST /api/admin/users/update', err);
+    }
   });
 
   // ---------------------------------------------------------
-  // ADMIN QUESTIONS, PREVIOUS QUESTIONS & EXAMS CRUD
+  // ADMIN QUESTIONS & EXAMS CRUD
   // (Owner Admin Only - exposes answer keys only here)
   // ---------------------------------------------------------
   app.get('/api/admin/questions', requireFirebaseAuth, requireOwnerAdmin, async (_req, res) => {
-    const list = await getAllQuestionsAuthoritative(mirror);
-    res.json({ questions: list });
+    try {
+      const list = await getAllQuestionsAuthoritative(
+        mirror,
+        db,
+        allowMemoryFallback,
+        useFirestore(),
+        { ttlMs: options?.questionBankCacheTtlMs }
+      );
+      return res.json({ questions: list });
+    } catch (err) {
+      return sendRouteError(res, 'GET /api/admin/questions', err);
+    }
   });
 
   app.post('/api/admin/questions', requireFirebaseAuth, requireOwnerAdmin, async (req: AuthenticatedRequest, res) => {
-    const q = req.body as ServerQuestion;
-    if (!q || !q.questionBn || !Array.isArray(q.optionsBn)) {
-      return res.status(400).json({ error: 'INVALID_QUESTION' });
+    try {
+      const q = req.body as Partial<ServerQuestion> | undefined;
+      const validSubjectIds = new Set(mirror.subjects.map(s => s.id));
+      const cleanQuestionBn = typeof q?.questionBn === 'string' ? q.questionBn.trim() : '';
+      const cleanOptionsBn = Array.isArray(q?.optionsBn)
+        ? q.optionsBn.map(opt => (typeof opt === 'string' ? opt.trim() : ''))
+        : [];
+      const correctIdx = q?.correctOptionIndex;
+
+      if (
+        !q ||
+        !cleanQuestionBn ||
+        typeof q.subjectId !== 'string' ||
+        !validSubjectIds.has(q.subjectId) ||
+        cleanOptionsBn.length !== 4 ||
+        cleanOptionsBn.some(opt => !opt) ||
+        typeof correctIdx !== 'number' ||
+        !Number.isInteger(correctIdx) ||
+        correctIdx < 0 ||
+        correctIdx > 3
+      ) {
+        return res.status(400).json({
+          error: 'INVALID_QUESTION',
+          message: 'Valid subjectId, questionBn, 4 non-empty optionsBn, and integer correctOptionIndex (0-3) are required.'
+        });
+      }
+
+      const cleanOptionsEn =
+        Array.isArray(q.optionsEn) && q.optionsEn.length === 4 && q.optionsEn.every(opt => typeof opt === 'string' && opt.trim())
+          ? q.optionsEn.map(opt => opt.trim())
+          : cleanOptionsBn;
+
+      const now = new Date().toISOString();
+      const fullQ: ServerQuestion = {
+        id: typeof q.id === 'string' && q.id.trim() ? q.id.trim() : `q_custom_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+        subjectId: q.subjectId,
+        topicId: typeof q.topicId === 'string' && q.topicId.trim() ? q.topicId.trim() : undefined,
+        questionBn: cleanQuestionBn,
+        questionEn: typeof q.questionEn === 'string' && q.questionEn.trim() ? q.questionEn.trim() : cleanQuestionBn,
+        optionsBn: cleanOptionsBn,
+        optionsEn: cleanOptionsEn,
+        correctOptionIndex: correctIdx,
+        explanationBn: typeof q.explanationBn === 'string' ? q.explanationBn.trim() : '',
+        explanationEn: typeof q.explanationEn === 'string' ? q.explanationEn.trim() : '',
+        legalReference: typeof q.legalReference === 'string' ? q.legalReference.trim() : '',
+        difficulty: q.difficulty === 'easy' || q.difficulty === 'hard' ? q.difficulty : 'medium',
+        status: q.status === 'draft' || q.status === 'reviewed' ? q.status : 'published',
+        isDemoSample: Boolean(q.isDemoSample),
+        createdAt: typeof q.createdAt === 'string' && q.createdAt.trim() ? q.createdAt : now,
+        updatedAt: now,
+        createdBy: typeof q.createdBy === 'string' && q.createdBy.trim() ? q.createdBy.trim() : 'Owner Admin'
+      };
+
+      if (useFirestore()) {
+        const batch = db.batch();
+        batch.set(db.collection('questions').doc(fullQ.id), sanitizeQuestionForClient(fullQ));
+        batch.set(db.collection('questionKeys').doc(fullQ.id), {
+          correctOptionIndex: fullQ.correctOptionIndex,
+          explanationBn: fullQ.explanationBn || '',
+          explanationEn: fullQ.explanationEn || '',
+          legalReference: fullQ.legalReference || '',
+          updatedAt: now
+        });
+        batch.set(
+          db.collection('config').doc('questionBankVersion'),
+          createQuestionBankVersionPayload(now),
+          { merge: true }
+        );
+        const auditEntry: AuditLog = {
+          id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          userId: req.authUser!.uid,
+          userName: req.authUser!.email || 'Owner Admin',
+          action: 'SAVE_QUESTION',
+          details: `Saved question ${fullQ.id} (${fullQ.subjectId})`,
+          timestamp: now
+        };
+        batch.set(db.collection('auditLogs').doc(auditEntry.id), auditEntry);
+        await batch.commit();
+        invalidateQuestionBankCache(db);
+      } else {
+        if (!allowMemoryFallback) {
+          return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+        }
+        const existingIdx = mirror.questions.findIndex(item => item.id === fullQ.id);
+        if (existingIdx >= 0) mirror.questions[existingIdx] = fullQ;
+        else mirror.questions.unshift(fullQ);
+      }
+      return res.json({ success: true, question: fullQ });
+    } catch (err) {
+      return sendRouteError(res, 'POST /api/admin/questions', err);
     }
-    const now = new Date().toISOString();
-    const fullQ: ServerQuestion = {
-      ...q,
-      id: q.id || `q_custom_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-      createdAt: q.createdAt || now,
-      updatedAt: now
-    };
-    if (useFirestore()) {
-      const batch = adminDb.batch();
-      batch.set(adminDb.collection('questions').doc(fullQ.id), sanitizeQuestionForClient(fullQ));
-      batch.set(adminDb.collection('questionKeys').doc(fullQ.id), {
-        correctOptionIndex: fullQ.correctOptionIndex,
-        explanationBn: fullQ.explanationBn || '',
-        explanationEn: fullQ.explanationEn || '',
-        legalReference: fullQ.legalReference || '',
-        updatedAt: now
-      });
-      await batch.commit().catch(() => {});
-    }
-    mirror.questions.unshift(fullQ);
-    res.json({ success: true, question: fullQ });
   });
 
-  app.delete('/api/admin/questions/:id', requireFirebaseAuth, requireOwnerAdmin, async (req, res) => {
-    const id = String(req.params.id);
-    if (useFirestore()) {
-      const batch = adminDb.batch();
-      batch.delete(adminDb.collection('questions').doc(id));
-      batch.delete(adminDb.collection('questionKeys').doc(id));
-      await batch.commit().catch(() => {});
+  app.delete('/api/admin/questions/:id', requireFirebaseAuth, requireOwnerAdmin, async (req: AuthenticatedRequest, res) => {
+    try {
+      const id = String(req.params.id);
+      const now = new Date().toISOString();
+      if (useFirestore()) {
+        const batch = db.batch();
+        batch.delete(db.collection('questions').doc(id));
+        batch.delete(db.collection('questionKeys').doc(id));
+        batch.set(
+          db.collection('config').doc('questionBankVersion'),
+          createQuestionBankVersionPayload(now),
+          { merge: true }
+        );
+        const auditEntry: AuditLog = {
+          id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          userId: req.authUser!.uid,
+          userName: req.authUser!.email || 'Owner Admin',
+          action: 'DELETE_QUESTION',
+          details: `Deleted question ${id}`,
+          timestamp: now
+        };
+        batch.set(db.collection('auditLogs').doc(auditEntry.id), auditEntry);
+        await batch.commit();
+        invalidateQuestionBankCache(db);
+      } else {
+        if (!allowMemoryFallback) {
+          return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+        }
+        mirror.questions = mirror.questions.filter(q => q.id !== id);
+      }
+      return res.json({ success: true });
+    } catch (err) {
+      return sendRouteError(res, 'DELETE /api/admin/questions/:id', err);
     }
-    mirror.questions = mirror.questions.filter(q => q.id !== id);
-    res.json({ success: true });
   });
 
-  app.get('/api/admin/previous-questions', requireFirebaseAuth, requireOwnerAdmin, async (_req, res) => {
-    res.json({ previousQuestions: mirror.previousQuestions });
-  });
 
-  app.post('/api/admin/previous-questions', requireFirebaseAuth, requireOwnerAdmin, async (req, res) => {
-    const pq = req.body as ServerPreviousQuestion;
-    if (!pq || !pq.question) {
-      return res.status(400).json({ error: 'INVALID_PREVIOUS_QUESTION' });
-    }
-    const id = pq.id || `pq_${pq.year}_${Date.now()}`;
-    const fullPq: ServerPreviousQuestion = { ...pq, id };
-    if (useFirestore()) {
-      const batch = adminDb.batch();
-      batch.set(adminDb.collection('previous_questions').doc(id), sanitizePreviousQuestionForClient(fullPq));
-      batch.set(adminDb.collection('previousQuestionKeys').doc(id), {
-        correctAnswer: fullPq.correctAnswer || '',
-        explanation: fullPq.explanation || '',
-        updatedAt: new Date().toISOString()
-      });
-      await batch.commit().catch(() => {});
-    }
-    const idx = mirror.previousQuestions.findIndex(x => x.id === id);
-    if (idx >= 0) mirror.previousQuestions[idx] = fullPq;
-    else mirror.previousQuestions.unshift(fullPq);
-    res.json({ success: true, previousQuestion: fullPq });
-  });
+  app.post('/api/admin/exams/save', requireFirebaseAuth, requireOwnerAdmin, async (req: AuthenticatedRequest, res) => {
+    try {
+      const exam = req.body as Exam;
+      if (!exam || !exam.id) {
+        return res.status(400).json({ error: 'INVALID_EXAM' });
+      }
+      const normalized: Exam = {
+        ...exam,
+        isActive: exam.isActive !== undefined ? exam.isActive : !exam.isPaid,
+        scheduledDate: exam.scheduledDate || undefined
+      };
+      const now = new Date().toISOString();
 
-  app.post('/api/admin/exams/save', requireFirebaseAuth, requireOwnerAdmin, async (req, res) => {
-    const exam = req.body as Exam;
-    if (!exam || !exam.id) {
-      return res.status(400).json({ error: 'INVALID_EXAM' });
+      if (useFirestore()) {
+        const batch = db.batch();
+        batch.set(
+          db.collection('exams').doc(normalized.id),
+          { ...normalized, scheduledDate: normalized.scheduledDate ?? null, updatedAt: now },
+          { merge: true }
+        );
+        const auditEntry: AuditLog = {
+          id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          userId: req.authUser!.uid,
+          userName: req.authUser!.email || 'Owner Admin',
+          action: 'SAVE_EXAM',
+          details: `Saved exam ${normalized.id} (isActive=${normalized.isActive}, isPaid=${normalized.isPaid})`,
+          timestamp: now
+        };
+        batch.set(db.collection('auditLogs').doc(auditEntry.id), auditEntry);
+        await batch.commit();
+      } else {
+        if (!allowMemoryFallback) {
+          return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+        }
+        const idx = mirror.exams.findIndex(e => e.id === normalized.id);
+        if (idx >= 0) mirror.exams[idx] = normalized;
+        else mirror.exams.unshift(normalized);
+      }
+      return res.json({ success: true, exam: normalized });
+    } catch (err) {
+      return sendRouteError(res, 'POST /api/admin/exams/save', err);
     }
-    const normalized: Exam = {
-      ...exam,
-      isActive: exam.isActive !== undefined ? exam.isActive : !exam.isPaid,
-      scheduledDate: exam.scheduledDate || undefined
-    };
-    if (useFirestore()) {
-      await adminDb
-        .collection('exams')
-        .doc(normalized.id)
-        .set({ ...normalized, scheduledDate: normalized.scheduledDate ?? null }, { merge: true })
-        .catch(() => {});
-    }
-    const idx = mirror.exams.findIndex(e => e.id === normalized.id);
-    if (idx >= 0) mirror.exams[idx] = normalized;
-    else mirror.exams.unshift(normalized);
-    res.json({ success: true, exam: normalized });
   });
 
   app.post('/api/admin/migrate-timestamps', requireFirebaseAuth, requireOwnerAdmin, async (_req, res) => {
-    if (!useFirestore()) {
-      return res.json({
-        success: false,
-        persistenceMode: persistenceState.mode,
-        message: 'Firestore Admin IAM is not attached in this environment. Use migration script with service account or Cloud Run.'
-      });
+    try {
+      if (!useFirestore()) {
+        return res.status(isProductionMode ? 503 : 200).json({
+          success: false,
+          persistenceMode: isProductionMode ? 'unavailable' : persistenceState.mode,
+          message: 'Firestore Admin IAM is not attached in this environment. Use migration script with service account or Cloud Run.'
+        });
+      }
+      const summary = await migrateAllSubscriptionTimestampsAdmin();
+      return res.json({ success: true, ...summary });
+    } catch (err) {
+      return sendRouteError(res, 'POST /api/admin/migrate-timestamps', err);
     }
-    const summary = await migrateAllSubscriptionTimestampsAdmin();
-    return res.json({ success: true, ...summary });
   });
 
   app.post('/api/admin/import-questions-to-firestore', requireFirebaseAuth, requireOwnerAdmin, async (_req, res) => {
-    if (!useFirestore()) {
-      return res.json({
-        success: false,
-        persistenceMode: persistenceState.mode,
-        message: 'Firestore Admin IAM is not attached in this environment. Use import script with service account or Cloud Run.'
-      });
-    }
-    const summary = await importMissingDataToFirestoreAdmin(mirror);
-    return res.json({ success: true, ...summary });
-  });
-
-  // ---------------------------------------------------------
-  // SUBSCRIPTIONS & ADMIN STATS
-  // ---------------------------------------------------------
-  app.get('/api/admin/subscriptions', requireFirebaseAuth, requireOwnerAdmin, (_req, res) => {
-    const now = Date.now();
-    const mapped = mirror.subscriptions.map(s => {
-      const isExpired = new Date(s.expiresAt).getTime() <= now;
-      const daysRemaining = Math.max(0, Math.ceil((new Date(s.expiresAt).getTime() - now) / (1000 * 60 * 60 * 24)));
-      return {
-        ...s,
-        status: isExpired ? 'expired' : s.status,
-        daysRemaining
-      };
-    });
-    res.json({ subscriptions: mapped });
-  });
-
-  app.get('/api/subscriptions/active/:userId', requireFirebaseAuth, async (req: AuthenticatedRequest, res) => {
-    const { userId } = req.params;
-    if (userId !== req.authUser!.uid && !isOwnerUser(req.authUser)) {
-      return res.status(403).json({ error: 'FORBIDDEN', message: 'Cannot access another user subscription.' });
-    }
-    const subStatus = await checkUserHasActiveSubscription(String(userId), mirror);
-    if (!subStatus.active || !subStatus.activeSubscription) {
-      return res.json({
-        hasActiveSubscription: false,
-        status: 'free',
-        activeSubscription: null
-      });
-    }
-    const daysRemaining = Math.max(
-      0,
-      Math.ceil((new Date(subStatus.activeSubscription.expiresAt).getTime() - Date.now()) / (1000 * 60 * 60 * 24))
-    );
-    return res.json({
-      hasActiveSubscription: true,
-      status: 'pro',
-      activeSubscription: subStatus.activeSubscription,
-      daysRemaining
-    });
-  });
-
-  app.get('/api/admin/dashboard-stats', requireFirebaseAuth, requireOwnerAdmin, (_req, res) => {
-    const now = Date.now();
-    const studentUserIds = new Set<string>();
-    mirror.paymentRequests.forEach(p => { if (p.userId) studentUserIds.add(p.userId); });
-    mirror.subscriptions.forEach(s => { if (s.userId) studentUserIds.add(s.userId); });
-    mirror.examResults.forEach(r => { if (r.userId) studentUserIds.add(r.userId); });
-    const totalStudents = Math.max(studentUserIds.size, 1);
-
-    const activeSubscribers = mirror.subscriptions.filter(
-      s => s.status === 'active' && new Date(s.expiresAt).getTime() > now
-    ).length;
-
-    const pendingPayments = mirror.paymentRequests.filter(p => p.status === 'pending').length;
-    const approvedPayments = mirror.paymentRequests.filter(p => p.status === 'approved').length;
-    const rejectedPayments = mirror.paymentRequests.filter(p => p.status === 'rejected').length;
-
-    const expiredSubscriptions = mirror.subscriptions.filter(
-      s => s.status === 'expired' || new Date(s.expiresAt).getTime() <= now
-    ).length;
-
-    const totalVerifiedRevenue = mirror.paymentRequests
-      .filter(p => p.status === 'approved')
-      .reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
-
-    res.json({
-      totalStudents,
-      activeSubscribers,
-      pendingPayments,
-      approvedPayments,
-      rejectedPayments,
-      expiredSubscriptions,
-      totalVerifiedRevenue,
-      monthlyRevenueReport: []
-    });
-  });
-
-  app.get('/api/admin/audit-logs', requireFirebaseAuth, requireOwnerAdmin, (_req, res) => {
-    res.json({ auditLogs: mirror.auditLogs });
-  });
-
-  // ---------------------------------------------------------
-  // SERVER-SIDE EXAMINATION ENGINE (Priority 3 & 4 Hardened)
-  // ---------------------------------------------------------
-  app.post('/api/exams/start', requireFirebaseAuth, authenticateSession, async (req: AuthenticatedRequest, res) => {
-    const session = req.session;
-    const { examId, studentName } = req.body || {};
-    const targetUserId = req.authUser!.uid;
-    const isOwner = isOwnerUser(req.authUser);
-
-    if (!examId || typeof examId !== 'string') {
-      return res.status(400).json({ error: 'INVALID_EXAM_ID', message: 'Valid examId is required.' });
-    }
-
-    const exam = await getAuthoritativeExam(examId, mirror);
-    if (!exam) {
-      return res.status(404).json({ error: 'EXAM_NOT_FOUND', message: 'Exam not found.' });
-    }
-
-    if (exam.isActive === false && !isOwner) {
-      return res.status(403).json({
-        error: 'EXAM_INACTIVE',
-        message: 'এই পরীক্ষাটি এখনো অ্যাডমিন কর্তৃক চালু করা হয়নি।'
-      });
-    }
-
-    if (exam.type === 'custom_test' && !isOwner) {
-      return res.status(403).json({
-        error: 'FORBIDDEN',
-        message: 'অননুমোদিত: অ্যাডমিন ছাড়া কেউ কাস্টম টেস্ট নিতে পারবেন না।'
-      });
-    }
-
-    if (exam.isPaid && !isOwner) {
-      const subCheck = await checkUserHasActiveSubscription(targetUserId, mirror);
-      if (!subCheck.active) {
-        return res.status(403).json({
-          error: 'SUBSCRIPTION_REQUIRED',
-          message: 'এই ৬০ মিনিটের স্পেশাল মডেল টেস্টটি আনলক করতে সক্রিয় প্রো সাবস্ক্রিপশন প্রয়োজন।'
+    try {
+      if (!useFirestore()) {
+        return res.status(isProductionMode ? 503 : 200).json({
+          success: false,
+          persistenceMode: isProductionMode ? 'unavailable' : persistenceState.mode,
+          message: 'Firestore Admin IAM is not attached in this environment. Use import script with service account or Cloud Run.'
         });
       }
+      const summary = await importMissingDataToFirestoreAdmin(mirror);
+      return res.json({ success: true, ...summary });
+    } catch (err) {
+      return sendRouteError(res, 'POST /api/admin/import-questions-to-firestore', err);
     }
+  });
 
-    const allQuestions = await getAllQuestionsAuthoritative(mirror);
-    const examQuestions = getQuestionsForExam(exam, allQuestions);
-    const resolvedQuestionIds = examQuestions.map(q => q.id);
+  // ---------------------------------------------------------
+  // SUBSCRIPTIONS & ADMIN STATS (Authoritative Firestore Reads)
+  // ---------------------------------------------------------
+  app.get('/api/admin/subscriptions', requireFirebaseAuth, requireOwnerAdmin, async (_req, res) => {
+    try {
+      const now = Date.now();
+      let subList: UserSubscription[];
+      if (useFirestore()) {
+        const snap = await db.collection('subscriptions').get();
+        subList = snap.docs.map(d => {
+          const raw = d.data() as Record<string, unknown>;
+          return {
+            ...(raw as Omit<UserSubscription, 'id'>),
+            id: d.id,
+            activatedAt: timestampToIso(raw.activatedAt) || new Date().toISOString(),
+            expiresAt: timestampToIso(raw.expiresAt) || new Date(0).toISOString(),
+            createdAt: timestampToIso(raw.createdAt) || new Date().toISOString()
+          };
+        });
+      } else {
+        if (!allowMemoryFallback) {
+          return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+        }
+        subList = mirror.subscriptions;
+      }
 
-    const durationMinutes = exam.durationMinutes || 60;
-    const now = new Date();
-    const deadline = new Date(now.getTime() + durationMinutes * 60 * 1000);
-
-    const attempt: ExamAttempt = {
-      id: `attempt_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-      examId: exam.id,
-      userId: targetUserId,
-      sessionId: session?.sessionId,
-      studentName: String(studentName || req.authUser!.name || 'Student').slice(0, 100),
-      startTime: now.toISOString(),
-      deadlineTime: deadline.toISOString(),
-      status: 'in_progress',
-      answers: {},
-      flaggedQuestionIds: [],
-      currentQuestionIndex: 0,
-      lastSavedAt: now.toISOString()
-    };
-
-    if (useFirestore()) {
-      await adminDb
-        .collection('examAttempts')
-        .doc(attempt.id)
-        .set({ ...attempt, resolvedQuestionIds })
-        .catch(() => {});
+      const mapped = subList.map(s => {
+        const expMs = new Date(s.expiresAt).getTime();
+        const isExpired = isNaN(expMs) || expMs <= now;
+        const daysRemaining = isNaN(expMs) ? 0 : Math.max(0, Math.ceil((expMs - now) / (1000 * 60 * 60 * 24)));
+        return {
+          ...s,
+          status: isExpired && s.status === 'active' ? ('expired' as const) : s.status,
+          daysRemaining
+        };
+      });
+      mapped.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      return res.json({ subscriptions: mapped });
+    } catch (err) {
+      return sendRouteError(res, 'GET /api/admin/subscriptions', err);
     }
+  });
 
-    mirror.examAttempts[attempt.id] = attempt;
+  app.get('/api/subscriptions/active/:userId', requireFirebaseAuth, authenticateSession, async (req: AuthenticatedRequest, res) => {
+    try {
+      const { userId } = req.params;
+      if (userId !== req.authUser!.uid && !isOwnerUser(req.authUser)) {
+        return res.status(403).json({ error: 'FORBIDDEN', message: 'Cannot access another user subscription.' });
+      }
+      const subStatus = await checkUserHasActiveSubscription(
+        String(userId),
+        mirror,
+        db,
+        allowMemoryFallback,
+        useFirestore()
+      );
+      if (!subStatus.active || !subStatus.activeSubscription) {
+        return res.json({
+          hasActiveSubscription: false,
+          status: subStatus.active ? 'pro' : 'free',
+          activeSubscription: null
+        });
+      }
+      const daysRemaining = Math.max(
+        0,
+        Math.ceil((new Date(subStatus.activeSubscription.expiresAt).getTime() - Date.now()) / (1000 * 60 * 60 * 24))
+      );
+      return res.json({
+        hasActiveSubscription: true,
+        status: 'pro',
+        activeSubscription: subStatus.activeSubscription,
+        daysRemaining
+      });
+    } catch (err) {
+      return sendRouteError(res, 'GET /api/subscriptions/active/:userId', err);
+    }
+  });
 
-    // Sanitized questions returned (NO correctOptionIndex, NO explanationBn/En!)
-    return res.json({
-      success: true,
-      attempt,
-      exam: {
-        ...exam,
-        questionIds: resolvedQuestionIds
-      },
-      questions: examQuestions.map(sanitizeQuestionForClient),
-      durationMinutes,
-      deadlineTime: attempt.deadlineTime
-    });
+  app.get('/api/admin/dashboard-stats', requireFirebaseAuth, requireOwnerAdmin, async (_req, res) => {
+    try {
+      const now = Date.now();
+      let payments: PaymentRequest[];
+      let subs: UserSubscription[];
+      let results: ExamResult[];
+      const studentUserIds = new Set<string>();
+
+      if (useFirestore()) {
+        const [userSnap, paySnap, subSnap, resSnap] = await Promise.all([
+          db.collection('users').get(),
+          db.collection('paymentRequests').get(),
+          db.collection('subscriptions').get(),
+          db.collection('examResults').get()
+        ]);
+        userSnap.forEach(d => studentUserIds.add(d.id));
+        payments = paySnap.docs.map(d => ({ id: d.id, ...(d.data() as Omit<PaymentRequest, 'id'>) }));
+        subs = subSnap.docs.map(d => {
+          const raw = d.data() as Record<string, unknown>;
+          return {
+            ...(raw as Omit<UserSubscription, 'id'>),
+            id: d.id,
+            activatedAt: timestampToIso(raw.activatedAt) || new Date().toISOString(),
+            expiresAt: timestampToIso(raw.expiresAt) || new Date(0).toISOString(),
+            createdAt: timestampToIso(raw.createdAt) || new Date().toISOString()
+          };
+        });
+        results = resSnap.docs.map(d => ({ id: d.id, ...(d.data() as Omit<ExamResult, 'id'>) }));
+      } else {
+        if (!allowMemoryFallback) {
+          return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+        }
+        payments = mirror.paymentRequests;
+        subs = mirror.subscriptions;
+        results = mirror.examResults;
+        Object.keys(mirror.users).forEach(uid => studentUserIds.add(uid));
+      }
+
+      payments.forEach(p => { if (p.userId) studentUserIds.add(p.userId); });
+      subs.forEach(s => { if (s.userId) studentUserIds.add(s.userId); });
+      results.forEach(r => { if (r.userId) studentUserIds.add(r.userId); });
+
+      const totalStudents = studentUserIds.size;
+      const activeSubscribers = subs.filter(
+        s => s.status === 'active' && new Date(s.expiresAt).getTime() > now
+      ).length;
+      const pendingPayments = payments.filter(p => p.status === 'pending').length;
+      const approvedPayments = payments.filter(p => p.status === 'approved').length;
+      const rejectedPayments = payments.filter(p => p.status === 'rejected').length;
+      const expiredSubscriptions = subs.filter(
+        s => s.status === 'expired' || new Date(s.expiresAt).getTime() <= now
+      ).length;
+      const totalVerifiedRevenue = payments
+        .filter(p => p.status === 'approved')
+        .reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+
+      return res.json({
+        totalStudents,
+        activeSubscribers,
+        pendingPayments,
+        approvedPayments,
+        rejectedPayments,
+        expiredSubscriptions,
+        totalVerifiedRevenue,
+        monthlyRevenueReport: []
+      });
+    } catch (err) {
+      return sendRouteError(res, 'GET /api/admin/dashboard-stats', err);
+    }
+  });
+
+  app.get('/api/admin/audit-logs', requireFirebaseAuth, requireOwnerAdmin, async (_req, res) => {
+    try {
+      if (useFirestore()) {
+        const snap = await db.collection('auditLogs').get();
+        const logs = snap.docs
+          .map(d => ({ id: d.id, ...(d.data() as Omit<AuditLog, 'id'>) }))
+          .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+          .slice(0, 200);
+        return res.json({ auditLogs: logs });
+      }
+      if (!allowMemoryFallback) {
+        return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+      }
+      return res.json({ auditLogs: mirror.auditLogs });
+    } catch (err) {
+      return sendRouteError(res, 'GET /api/admin/audit-logs', err);
+    }
+  });
+
+  // ---------------------------------------------------------
+  // SERVER-SIDE EXAMINATION ENGINE (Atomic Transactions & Multi-Instance Safe)
+  // ---------------------------------------------------------
+  app.post('/api/exams/start', requireFirebaseAuth, examsStartRateLimiter, authenticateSession, async (req: AuthenticatedRequest, res) => {
+    try {
+      const session = req.session;
+      const { examId, studentName } = req.body || {};
+      const targetUserId = req.authUser!.uid;
+      const isOwner = isOwnerUser(req.authUser);
+
+      if (!examId || typeof examId !== 'string') {
+        return res.status(400).json({ error: 'INVALID_EXAM_ID', message: 'Valid examId is required.' });
+      }
+
+      const exam = await getAuthoritativeExam(
+        examId,
+        mirror,
+        db,
+        allowMemoryFallback,
+        useFirestore()
+      );
+      if (!exam) {
+        return res.status(404).json({ error: 'EXAM_NOT_FOUND', message: 'Exam not found.' });
+      }
+
+      if (exam.isActive === false && !isOwner) {
+        return res.status(403).json({
+          error: 'EXAM_INACTIVE',
+          message: 'এই পরীক্ষাটি এখনো অ্যাডমিন কর্তৃক চালু করা হয়নি।'
+        });
+      }
+
+      if (exam.type === 'custom_test' && !isOwner) {
+        return res.status(403).json({
+          error: 'FORBIDDEN',
+          message: 'অননুমোদিত: অ্যাডমিন ছাড়া কেউ কাস্টম টেস্ট নিতে পারবেন না।'
+        });
+      }
+
+      if (exam.isPaid && !isOwner) {
+        const subCheck = await checkUserHasActiveSubscription(
+          targetUserId,
+          mirror,
+          db,
+          allowMemoryFallback,
+          useFirestore()
+        );
+        if (!subCheck.active) {
+          return res.status(403).json({
+            error: 'SUBSCRIPTION_REQUIRED',
+            message: 'এই ৬০ মিনিটের স্পেশাল মডেল টেস্টটি আনলক করতে সক্রিয় প্রো সাবস্ক্রিপশন প্রয়োজন।'
+          });
+        }
+      }
+
+      const allQuestions = await getSanitizedQuestionsAuthoritative(
+        mirror,
+        db,
+        allowMemoryFallback,
+        useFirestore(),
+        { ttlMs: options?.questionBankCacheTtlMs }
+      );
+      const examQuestions = getQuestionsForExam(exam, allQuestions);
+      const resolvedQuestionIds = examQuestions.map(q => q.id);
+
+      const durationMinutes = exam.durationMinutes || 60;
+      const now = new Date();
+      const deadline = new Date(now.getTime() + durationMinutes * 60 * 1000);
+
+      const attempt: ExamAttempt = {
+        id: `attempt_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+        examId: exam.id,
+        userId: targetUserId,
+        sessionId: session?.sessionId,
+        studentName: String(studentName || req.authUser!.name || 'Student').slice(0, 100),
+        startTime: now.toISOString(),
+        deadlineTime: deadline.toISOString(),
+        status: 'in_progress',
+        answers: {},
+        flaggedQuestionIds: [],
+        currentQuestionIndex: 0,
+        lastSavedAt: now.toISOString()
+      };
+
+      const auditEntry: AuditLog = {
+        id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+        userId: targetUserId,
+        userName: attempt.studentName,
+        action: 'START_EXAM',
+        details: `Started authoritative exam "${exam.titleEn}" (${attempt.id})`,
+        timestamp: now.toISOString()
+      };
+
+      if (useFirestore()) {
+        const batch = db.batch();
+        batch.set(db.collection('examAttempts').doc(attempt.id), {
+          ...attempt,
+          sessionId: attempt.sessionId || null,
+          resolvedQuestionIds
+        });
+        batch.set(db.collection('auditLogs').doc(auditEntry.id), auditEntry);
+        await batch.commit();
+      } else {
+        if (!allowMemoryFallback) {
+          return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+        }
+        mirror.examAttempts[attempt.id] = attempt;
+        mirror.auditLogs.unshift(auditEntry);
+      }
+
+      return res.json({
+        success: true,
+        attempt,
+        exam: {
+          ...exam,
+          questionIds: resolvedQuestionIds
+        },
+        questions: examQuestions.map(sanitizeQuestionForClient),
+        durationMinutes,
+        deadlineTime: attempt.deadlineTime
+      });
+    } catch (err) {
+      return sendRouteError(res, 'POST /api/exams/start', err, 'START_EXAM_FAILED', 'Failed to start exam.');
+    }
   });
 
   app.post('/api/exams/save-answer', requireFirebaseAuth, authenticateSession, async (req: AuthenticatedRequest, res) => {
-    const { attemptId, answers, flaggedQuestionIds, currentQuestionIndex } = req.body || {};
-    if (!attemptId) {
-      return res.status(400).json({ error: 'INVALID_REQUEST' });
-    }
-    const attempt = mirror.examAttempts[String(attemptId)];
-    if (!attempt) {
-      return res.status(404).json({ error: 'ATTEMPT_NOT_FOUND' });
-    }
-    if (attempt.userId !== req.authUser!.uid) {
-      return res.status(403).json({ error: 'FORBIDDEN' });
-    }
-    if (attempt.status !== 'in_progress') {
-      return res.status(400).json({ error: 'ALREADY_SUBMITTED' });
-    }
-
-    if (answers && typeof answers === 'object') {
-      const cleaned: Record<string, number> = {};
-      for (const [k, v] of Object.entries(answers)) {
-        if (typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= 3) {
-          cleaned[k] = v;
-        }
+    try {
+      const { attemptId, answers, flaggedQuestionIds, currentQuestionIndex } = req.body || {};
+      if (!attemptId || typeof attemptId !== 'string') {
+        return res.status(400).json({ error: 'INVALID_REQUEST' });
       }
-      attempt.answers = cleaned;
-    }
-    if (Array.isArray(flaggedQuestionIds)) {
-      attempt.flaggedQuestionIds = flaggedQuestionIds.map(String);
-    }
-    if (typeof currentQuestionIndex === 'number') {
-      attempt.currentQuestionIndex = currentQuestionIndex;
-    }
-    attempt.lastSavedAt = new Date().toISOString();
 
-    if (useFirestore()) {
-      await adminDb
-        .collection('examAttempts')
-        .doc(attempt.id)
-        .update({
-          answers: attempt.answers,
-          flaggedQuestionIds: attempt.flaggedQuestionIds,
-          currentQuestionIndex: attempt.currentQuestionIndex,
-          lastSavedAt: attempt.lastSavedAt
-        })
-        .catch(() => {});
-    }
+      const cleanedAnswers: Record<string, number> | undefined =
+        answers && typeof answers === 'object'
+          ? Object.entries(answers).reduce<Record<string, number>>((acc, [k, v]) => {
+              if (typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= 3) {
+                acc[k] = v;
+              }
+              return acc;
+            }, {})
+          : undefined;
+      const cleanedFlagged = Array.isArray(flaggedQuestionIds) ? flaggedQuestionIds.map(String) : undefined;
+      const cleanedIndex = typeof currentQuestionIndex === 'number' ? currentQuestionIndex : undefined;
+      const lastSavedAt = new Date().toISOString();
 
-    return res.json({ success: true });
-  });
-
-  // Authoritative server-side scoring (+1 correct, -0.25 incorrect, 0 unanswered)
-  app.post('/api/exams/submit', requireFirebaseAuth, authenticateSession, async (req: AuthenticatedRequest, res) => {
-    const { attemptId, answers, isAutoTimeout } = req.body || {};
-    const uid = req.authUser!.uid;
-
-    if (!attemptId || typeof attemptId !== 'string') {
-      return res.status(400).json({ error: 'INVALID_ATTEMPT_ID', message: 'Valid attemptId is required.' });
-    }
-
-    let attempt: ExamAttempt | undefined = mirror.examAttempts[attemptId];
-    let resolvedQuestionIdsFromDoc: string[] | undefined;
-
-    if (!attempt && useFirestore()) {
-      try {
-        const snap = await adminDb.collection('examAttempts').doc(attemptId).get();
-        if (snap.exists) {
-          const raw = snap.data() as ExamAttempt & { resolvedQuestionIds?: string[] };
-          resolvedQuestionIdsFromDoc = raw.resolvedQuestionIds;
-          attempt = { ...raw, id: snap.id };
-          mirror.examAttempts[attemptId] = attempt;
-        }
-      } catch {
-        // ignore
-      }
-    }
-
-    if (!attempt) {
-      return res.status(404).json({ error: 'ATTEMPT_NOT_FOUND', message: 'Exam attempt not found.' });
-    }
-
-    // Strict token UID validation (ignores any client-submitted userId)
-    if (attempt.userId !== uid) {
-      return res.status(403).json({ error: 'FORBIDDEN', message: 'Cannot submit another user exam attempt.' });
-    }
-
-    // Prevent duplicate submissions for an already completed attempt
-    if (attempt.status !== 'in_progress') {
-      return res.status(400).json({ error: 'ALREADY_SUBMITTED', message: 'Attempt has already been submitted.' });
-    }
-
-    const exam = await getAuthoritativeExam(attempt.examId, mirror);
-    if (!exam) {
-      return res.status(404).json({ error: 'EXAM_NOT_FOUND', message: 'Exam not found.' });
-    }
-
-    // Re-resolve authoritative questions & answer keys from server storage
-    const allQuestions = await getAllQuestionsAuthoritative(mirror);
-    const examMetaWithIds =
-      resolvedQuestionIdsFromDoc && resolvedQuestionIdsFromDoc.length > 0
-        ? { ...exam, questionIds: resolvedQuestionIdsFromDoc }
-        : exam;
-    const examQuestions = getQuestionsForExam(examMetaWithIds, allQuestions) as ServerQuestion[];
-    const authQMap = await getAuthoritativeQuestionMap(
-      examQuestions.map(q => q.id),
-      mirror
-    );
-    const authoritativeQuestions: ServerQuestion[] = examQuestions.map(q => authQMap.get(q.id) || q);
-    const validQIdSet = new Set(authoritativeQuestions.map(q => q.id));
-
-    // Validate submitted answer map: only valid question IDs belonging to this exam and valid 0..3 option index
-    const rawAnswers: Record<string, unknown> =
-      answers && typeof answers === 'object' ? answers : attempt.answers || {};
-    const sanitizedAnswers: Record<string, number> = {};
-    for (const [qId, optVal] of Object.entries(rawAnswers)) {
-      if (validQIdSet.has(qId) && typeof optVal === 'number' && Number.isInteger(optVal) && optVal >= 0 && optVal <= 3) {
-        sanitizedAnswers[qId] = optVal;
-      }
-    }
-
-    const scoreResult = calculateExamScore(sanitizedAnswers, authoritativeQuestions, {
-      positiveMarkRatio: exam.positiveMarkRatio ?? 1.0,
-      negativeMarkRatio: exam.negativeMarkRatio ?? 0.25,
-      passThresholdPercentage: exam.passThresholdPercentage
-    });
-
-    const startTimeMs = new Date(attempt.startTime).getTime();
-    const deadlineMs = new Date(attempt.deadlineTime).getTime();
-    const submissionTimeMs = Math.min(Date.now(), isNaN(deadlineMs) ? Date.now() : deadlineMs + 15000);
-    const timeSpentSeconds = Math.max(1, Math.round((submissionTimeMs - startTimeMs) / 1000));
-
-    const subjectScores: ExamResult['subjectWiseScores'] = {};
-    for (const sub of mirror.subjects) {
-      const subQuestions = authoritativeQuestions.filter(q => q.subjectId === sub.id);
-      if (subQuestions.length > 0) {
-        let correct = 0;
-        let incorrect = 0;
-        let unanswered = 0;
-        for (const q of subQuestions) {
-          const ans = sanitizedAnswers[q.id];
-          if (ans === undefined || ans === null) unanswered++;
-          else if (ans === q.correctOptionIndex) correct++;
-          else incorrect++;
-        }
-        const score = Math.round((correct * 1.0 - incorrect * 0.25) * 100) / 100;
-        subjectScores[sub.id] = {
-          subjectNameBn: sub.nameBn,
-          subjectNameEn: sub.nameEn,
-          total: subQuestions.length,
-          correct,
-          incorrect,
-          unanswered,
-          score
-        };
-      }
-    }
-
-    const submittedAt = new Date().toISOString();
-    const nextAttemptStatus: ExamAttempt['status'] = isAutoTimeout ? 'timed_out' : 'submitted';
-
-    const newResult: ExamResult = {
-      id: `res_${attempt.id}`,
-      attemptId: attempt.id,
-      examId: exam.id,
-      examTitleBn: exam.titleBn,
-      examTitleEn: exam.titleEn,
-      examType: exam.type,
-      userId: uid,
-      studentName: attempt.studentName,
-      submittedAt,
-      timeSpentSeconds,
-      totalQuestions: scoreResult.totalQuestions,
-      correctAnswersCount: scoreResult.correctAnswersCount,
-      incorrectAnswersCount: scoreResult.incorrectAnswersCount,
-      unansweredCount: scoreResult.unansweredCount,
-      positiveMarks: scoreResult.positiveMarks,
-      negativeMarks: scoreResult.negativeMarks,
-      finalScore: scoreResult.finalScore,
-      percentage: scoreResult.percentage,
-      passed: scoreResult.passed,
-      passThresholdPercentage: exam.passThresholdPercentage,
-      subjectWiseScores: subjectScores,
-      answers: sanitizedAnswers,
-      questions: authoritativeQuestions // Full solution revealed ONLY after submission
-    };
-
-    const leaderboardEntry: LeaderboardEntry = {
-      id: `lead_${uid}_${exam.id}`,
-      userId: uid,
-      studentName: attempt.studentName,
-      examId: exam.id,
-      examTitleBn: exam.titleBn,
-      examTitleEn: exam.titleEn,
-      score: newResult.finalScore,
-      totalMarks: newResult.totalQuestions,
-      percentage: newResult.percentage,
-      correctAnswersCount: newResult.correctAnswersCount,
-      incorrectAnswersCount: newResult.incorrectAnswersCount,
-      unansweredCount: newResult.unansweredCount,
-      timeSpentSeconds,
-      completedAt: submittedAt
-    };
-
-    if (useFirestore()) {
-      try {
-        const batch = adminDb.batch();
-        const attemptRef = adminDb.collection('examAttempts').doc(attempt.id);
-        const resultRef = adminDb.collection('examResults').doc(newResult.id);
-        const leadRef = adminDb.collection('leaderboard').doc(leaderboardEntry.id);
-
-        batch.update(attemptRef, {
-          status: nextAttemptStatus,
-          submittedTime: submittedAt,
-          answers: sanitizedAnswers
+      if (useFirestore()) {
+        await db.runTransaction(async (tx) => {
+          const attemptRef = db.collection('examAttempts').doc(attemptId);
+          const snap = await tx.get(attemptRef);
+          if (!snap.exists) {
+            throw new HttpError(404, 'ATTEMPT_NOT_FOUND', 'Exam attempt not found.');
+          }
+          const attempt = { id: snap.id, ...(snap.data() as Omit<ExamAttempt, 'id'>) };
+          if (attempt.userId !== req.authUser!.uid) {
+            throw new HttpError(403, 'FORBIDDEN', 'Cannot modify another user exam attempt.');
+          }
+          if (attempt.status !== 'in_progress') {
+            throw new HttpError(400, 'ALREADY_SUBMITTED', 'Attempt has already been submitted.');
+          }
+          tx.update(attemptRef, {
+            ...(cleanedAnswers !== undefined ? { answers: cleanedAnswers } : {}),
+            ...(cleanedFlagged !== undefined ? { flaggedQuestionIds: cleanedFlagged } : {}),
+            ...(cleanedIndex !== undefined ? { currentQuestionIndex: cleanedIndex } : {}),
+            lastSavedAt
+          });
         });
-        const { questions: _q, ...firestoreResultPayload } = newResult;
-        batch.set(resultRef, { ...firestoreResultPayload, score: newResult.finalScore });
-        batch.set(leadRef, leaderboardEntry, { merge: true });
-        await batch.commit();
-      } catch (err) {
-        if (!isPermissionOrCredentialError(err)) {
-          return res.status(500).json({ error: 'SUBMIT_PERSIST_FAILED', message: 'Failed to persist exam result.' });
-        }
+        return res.json({ success: true });
       }
+
+      if (!allowMemoryFallback) {
+        return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+      }
+
+      const attempt = mirror.examAttempts[attemptId];
+      if (!attempt) {
+        return res.status(404).json({ error: 'ATTEMPT_NOT_FOUND' });
+      }
+      if (attempt.userId !== req.authUser!.uid) {
+        return res.status(403).json({ error: 'FORBIDDEN' });
+      }
+      if (attempt.status !== 'in_progress') {
+        return res.status(400).json({ error: 'ALREADY_SUBMITTED' });
+      }
+
+      if (cleanedAnswers !== undefined) attempt.answers = cleanedAnswers;
+      if (cleanedFlagged !== undefined) attempt.flaggedQuestionIds = cleanedFlagged;
+      if (cleanedIndex !== undefined) attempt.currentQuestionIndex = cleanedIndex;
+      attempt.lastSavedAt = lastSavedAt;
+
+      return res.json({ success: true });
+    } catch (err) {
+      return sendRouteError(res, 'POST /api/exams/save-answer', err, 'SAVE_ANSWER_FAILED', 'Failed to save exam progress.');
     }
-
-    attempt.status = nextAttemptStatus;
-    attempt.submittedTime = submittedAt;
-    attempt.answers = sanitizedAnswers;
-    mirror.examResults.unshift(newResult);
-
-    mirror.leaderboard = [
-      ...mirror.leaderboard.filter(item => !(item.userId === uid && item.examId === exam.id)),
-      leaderboardEntry
-    ].sort((a, b) => b.score - a.score || a.timeSpentSeconds - b.timeSpentSeconds);
-
-    mirror.auditLogs.unshift({
-      id: `log_${Date.now()}`,
-      userId: uid,
-      userName: attempt.studentName,
-      action: isAutoTimeout ? 'EXAM_TIMED_OUT' : 'SUBMIT_EXAM',
-      details: `Server graded "${exam.titleEn}": ${newResult.finalScore}/${newResult.totalQuestions} (${newResult.percentage}%)`,
-      timestamp: submittedAt
-    });
-
-    return res.json({
-      success: true,
-      result: newResult,
-      leaderboardEntry
-    });
   });
 
-  app.get('/api/exams/results/:userId?', requireFirebaseAuth, async (req: AuthenticatedRequest, res) => {
-    const requestedUid = req.params.userId ? String(req.params.userId) : req.authUser!.uid;
-    const isOwner = isOwnerUser(req.authUser);
-    if (requestedUid !== req.authUser!.uid && !isOwner) {
-      return res.status(403).json({ error: 'FORBIDDEN', message: 'Cannot read another user exam results.' });
-    }
+  // Authoritative server-side scoring with Atomic Firestore Transaction
+  app.post('/api/exams/submit', requireFirebaseAuth, examsSubmitRateLimiter, authenticateSession, async (req: AuthenticatedRequest, res) => {
+    try {
+      const { attemptId, answers, isAutoTimeout } = req.body || {};
+      const uid = req.authUser!.uid;
 
-    let list = mirror.examResults.filter(r => r.userId === requestedUid);
-    if (useFirestore()) {
-      try {
-        const snap = await adminDb.collection('examResults').where('userId', '==', requestedUid).get();
-        if (!snap.empty) {
-          list = snap.docs.map(d => ({ id: d.id, ...(d.data() as Omit<ExamResult, 'id'>) }));
-        }
-      } catch {
-        // fallback to mirror
+      if (!attemptId || typeof attemptId !== 'string') {
+        return res.status(400).json({ error: 'INVALID_ATTEMPT_ID', message: 'Valid attemptId is required.' });
       }
+
+      const buildEvaluation = (
+        attempt: ExamAttempt,
+        exam: Exam,
+        authoritativeQuestions: ServerQuestion[]
+      ) => {
+        const validQIdSet = new Set(authoritativeQuestions.map(q => q.id));
+        const rawAnswers: Record<string, unknown> =
+          answers && typeof answers === 'object' ? answers : attempt.answers || {};
+        const sanitizedAnswers: Record<string, number> = {};
+        for (const [qId, optVal] of Object.entries(rawAnswers)) {
+          if (validQIdSet.has(qId) && typeof optVal === 'number' && Number.isInteger(optVal) && optVal >= 0 && optVal <= 3) {
+            sanitizedAnswers[qId] = optVal;
+          }
+        }
+
+        const scoreResult = calculateExamScore(sanitizedAnswers, authoritativeQuestions, {
+          positiveMarkRatio: exam.positiveMarkRatio ?? 1.0,
+          negativeMarkRatio: exam.negativeMarkRatio ?? 0.25,
+          passThresholdPercentage: exam.passThresholdPercentage
+        });
+
+        const startTimeMs = new Date(attempt.startTime).getTime();
+        const deadlineMs = new Date(attempt.deadlineTime).getTime();
+        const submissionTimeMs = Math.min(Date.now(), isNaN(deadlineMs) ? Date.now() : deadlineMs + 15000);
+        const timeSpentSeconds = Math.max(1, Math.round((submissionTimeMs - startTimeMs) / 1000));
+
+        const subjectScores: ExamResult['subjectWiseScores'] = {};
+        for (const sub of mirror.subjects) {
+          const subQuestions = authoritativeQuestions.filter(q => q.subjectId === sub.id);
+          if (subQuestions.length > 0) {
+            let correct = 0;
+            let incorrect = 0;
+            let unanswered = 0;
+            for (const q of subQuestions) {
+              const ans = sanitizedAnswers[q.id];
+              if (ans === undefined || ans === null) unanswered++;
+              else if (ans === q.correctOptionIndex) correct++;
+              else incorrect++;
+            }
+            const score = Math.round((correct * (exam.positiveMarkRatio ?? 1.0) - incorrect * (exam.negativeMarkRatio ?? 0.25)) * 100) / 100;
+            subjectScores[sub.id] = {
+              subjectNameBn: sub.nameBn,
+              subjectNameEn: sub.nameEn,
+              total: subQuestions.length,
+              correct,
+              incorrect,
+              unanswered,
+              score
+            };
+          }
+        }
+
+        const submittedAt = new Date().toISOString();
+        const nextAttemptStatus: ExamAttempt['status'] = isAutoTimeout ? 'timed_out' : 'submitted';
+
+        const newResult: ExamResult = {
+          id: `res_${attempt.id}`,
+          attemptId: attempt.id,
+          examId: exam.id,
+          examTitleBn: exam.titleBn,
+          examTitleEn: exam.titleEn,
+          examType: exam.type,
+          userId: uid,
+          studentName: attempt.studentName,
+          submittedAt,
+          timeSpentSeconds,
+          totalQuestions: scoreResult.totalQuestions,
+          correctAnswersCount: scoreResult.correctAnswersCount,
+          incorrectAnswersCount: scoreResult.incorrectAnswersCount,
+          unansweredCount: scoreResult.unansweredCount,
+          positiveMarks: scoreResult.positiveMarks,
+          negativeMarks: scoreResult.negativeMarks,
+          finalScore: scoreResult.finalScore,
+          percentage: scoreResult.percentage,
+          passed: scoreResult.passed,
+          passThresholdPercentage: exam.passThresholdPercentage,
+          subjectWiseScores: subjectScores,
+          answers: sanitizedAnswers,
+          questions: authoritativeQuestions
+        };
+
+        const leaderboardEntry: LeaderboardEntry = {
+          id: `lead_${uid}_${exam.id}`,
+          userId: uid,
+          studentName: attempt.studentName,
+          examId: exam.id,
+          examTitleBn: exam.titleBn,
+          examTitleEn: exam.titleEn,
+          score: newResult.finalScore,
+          totalMarks: newResult.totalQuestions,
+          percentage: newResult.percentage,
+          correctAnswersCount: newResult.correctAnswersCount,
+          incorrectAnswersCount: newResult.incorrectAnswersCount,
+          unansweredCount: newResult.unansweredCount,
+          timeSpentSeconds,
+          completedAt: submittedAt
+        };
+
+        return { sanitizedAnswers, submittedAt, nextAttemptStatus, newResult, leaderboardEntry };
+      };
+
+      if (useFirestore()) {
+        const txOutcome = await db.runTransaction(async (tx) => {
+          const attemptRef = db.collection('examAttempts').doc(attemptId);
+          const attemptSnap = await tx.get(attemptRef);
+
+          if (!attemptSnap.exists) {
+            throw new HttpError(404, 'ATTEMPT_NOT_FOUND', 'Exam attempt not found.');
+          }
+
+          const rawAttempt = attemptSnap.data() as ExamAttempt & { resolvedQuestionIds?: string[] };
+          const attempt: ExamAttempt = { ...rawAttempt, id: attemptSnap.id };
+
+          if (attempt.userId !== uid) {
+            throw new HttpError(403, 'FORBIDDEN', 'Cannot submit another user exam attempt.');
+          }
+          if (attempt.status !== 'in_progress') {
+            throw new HttpError(400, 'ALREADY_SUBMITTED', 'Attempt has already been submitted.');
+          }
+
+          const examRef = db.collection('exams').doc(attempt.examId);
+          const examSnap = await tx.get(examRef);
+          if (!examSnap.exists) {
+            throw new HttpError(404, 'EXAM_NOT_FOUND', 'Exam not found.');
+          }
+          const examData = examSnap.data() as Omit<Exam, 'id'>;
+          const exam: Exam = {
+            id: examSnap.id,
+            ...examData,
+            isActive: examData.isActive !== undefined ? examData.isActive : (!examData.isPaid || examSnap.id === 'exam_model_test_01')
+          };
+
+          const resolvedIds =
+            Array.isArray(rawAttempt.resolvedQuestionIds) && rawAttempt.resolvedQuestionIds.length > 0
+              ? rawAttempt.resolvedQuestionIds
+              : exam.questionIds || [];
+
+          let authoritativeQuestions: ServerQuestion[] = [];
+          if (resolvedIds.length > 0 && resolvedIds.length <= 200) {
+            // Read questions and questionKeys atomically inside transaction
+            const [qSnaps, kSnaps] = await Promise.all([
+              Promise.all(resolvedIds.map(qId => tx.get(db.collection('questions').doc(qId)))),
+              Promise.all(resolvedIds.map(qId => tx.get(db.collection('questionKeys').doc(qId))))
+            ]);
+            for (let i = 0; i < resolvedIds.length; i++) {
+              const qS = qSnaps[i];
+              const kS = kSnaps[i];
+              if (!qS.exists) continue;
+              const qBase = qS.data() as Partial<ServerQuestion>;
+              const kData = kS.exists ? (kS.data() as Partial<ServerQuestion>) : undefined;
+              authoritativeQuestions.push({
+                ...(qBase as ServerQuestion),
+                id: qS.id,
+                correctOptionIndex: kData?.correctOptionIndex ?? qBase.correctOptionIndex ?? 0,
+                explanationBn: kData?.explanationBn ?? qBase.explanationBn ?? '',
+                explanationEn: kData?.explanationEn ?? qBase.explanationEn ?? ''
+              });
+            }
+          } else {
+            const allQuestions = await getAllQuestionsAuthoritative(
+              mirror,
+              db,
+              allowMemoryFallback,
+              true,
+              { ttlMs: options?.questionBankCacheTtlMs }
+            );
+            const examMetaWithIds = resolvedIds.length > 0 ? { ...exam, questionIds: resolvedIds } : exam;
+            const examQuestions = getQuestionsForExam(examMetaWithIds, allQuestions) as ServerQuestion[];
+            const qMap = await getAuthoritativeQuestionMap(
+              examQuestions.map(q => q.id),
+              mirror,
+              db,
+              allowMemoryFallback,
+              true
+            );
+            authoritativeQuestions = examQuestions.map(q => qMap.get(q.id) || q);
+          }
+
+          if (authoritativeQuestions.length === 0) {
+            throw new HttpError(500, 'QUESTIONS_UNAVAILABLE', 'Authoritative exam questions could not be loaded.');
+          }
+
+          const { sanitizedAnswers, submittedAt, nextAttemptStatus, newResult, leaderboardEntry } =
+            buildEvaluation(attempt, exam, authoritativeQuestions);
+
+          const resultRef = db.collection('examResults').doc(newResult.id);
+          const leadRef = db.collection('leaderboard').doc(leaderboardEntry.id);
+          const auditRef = db.collection('auditLogs').doc(`log_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`);
+
+          const { questions: _q, ...firestoreResultPayload } = newResult;
+
+          tx.update(attemptRef, {
+            status: nextAttemptStatus,
+            submittedTime: submittedAt,
+            answers: sanitizedAnswers
+          });
+          tx.set(resultRef, { ...firestoreResultPayload, score: newResult.finalScore });
+          tx.set(leadRef, leaderboardEntry, { merge: true });
+          tx.set(auditRef, {
+            id: auditRef.id,
+            userId: uid,
+            userName: attempt.studentName,
+            action: isAutoTimeout ? 'EXAM_TIMED_OUT' : 'SUBMIT_EXAM',
+            details: `Server graded "${exam.titleEn}": ${newResult.finalScore}/${newResult.totalQuestions} (${newResult.percentage}%)`,
+            timestamp: submittedAt
+          });
+
+          return { newResult, leaderboardEntry };
+        });
+
+        return res.json({
+          success: true,
+          result: txOutcome.newResult,
+          leaderboardEntry: txOutcome.leaderboardEntry
+        });
+      }
+
+      if (!allowMemoryFallback) {
+        return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+      }
+
+      // Development-only memory fallback
+      const attempt = mirror.examAttempts[attemptId];
+      if (!attempt) {
+        return res.status(404).json({ error: 'ATTEMPT_NOT_FOUND', message: 'Exam attempt not found.' });
+      }
+      if (attempt.userId !== uid) {
+        return res.status(403).json({ error: 'FORBIDDEN', message: 'Cannot submit another user exam attempt.' });
+      }
+      if (attempt.status !== 'in_progress') {
+        return res.status(400).json({ error: 'ALREADY_SUBMITTED', message: 'Attempt has already been submitted.' });
+      }
+      const exam = mirror.exams.find(e => e.id === attempt.examId);
+      if (!exam) {
+        return res.status(404).json({ error: 'EXAM_NOT_FOUND', message: 'Exam not found.' });
+      }
+      const examQuestions = getQuestionsForExam(exam, mirror.questions) as ServerQuestion[];
+      const { sanitizedAnswers, submittedAt, nextAttemptStatus, newResult, leaderboardEntry } =
+        buildEvaluation(attempt, exam, examQuestions);
+
+      attempt.status = nextAttemptStatus;
+      attempt.submittedTime = submittedAt;
+      attempt.answers = sanitizedAnswers;
+      mirror.examResults.unshift(newResult);
+      mirror.leaderboard = [
+        ...mirror.leaderboard.filter(item => !(item.userId === uid && item.examId === exam.id)),
+        leaderboardEntry
+      ].sort((a, b) => b.score - a.score || a.timeSpentSeconds - b.timeSpentSeconds);
+      mirror.auditLogs.unshift({
+        id: `log_${Date.now()}`,
+        userId: uid,
+        userName: attempt.studentName,
+        action: isAutoTimeout ? 'EXAM_TIMED_OUT' : 'SUBMIT_EXAM',
+        details: `Server graded "${exam.titleEn}": ${newResult.finalScore}/${newResult.totalQuestions} (${newResult.percentage}%)`,
+        timestamp: submittedAt
+      });
+
+      return res.json({
+        success: true,
+        result: newResult,
+        leaderboardEntry
+      });
+    } catch (err) {
+      return sendRouteError(
+        res,
+        'POST /api/exams/submit',
+        err,
+        'SUBMIT_PERSIST_FAILED',
+        'Failed to persist exam result.'
+      );
     }
-    return res.json({ results: list });
+  });
+
+  app.get('/api/exams/results/:userId?', requireFirebaseAuth, authenticateSession, async (req: AuthenticatedRequest, res) => {
+    try {
+      const requestedUid = req.params.userId ? String(req.params.userId) : req.authUser!.uid;
+      const isOwner = isOwnerUser(req.authUser);
+      if (requestedUid !== req.authUser!.uid && !isOwner) {
+        return res.status(403).json({ error: 'FORBIDDEN', message: 'Cannot read another user exam results.' });
+      }
+
+      if (useFirestore()) {
+        const snap = await db.collection('examResults').where('userId', '==', requestedUid).get();
+        const list = snap.docs
+          .map(d => ({ id: d.id, ...(d.data() as Omit<ExamResult, 'id'>) }))
+          .sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
+        return res.json({ results: list });
+      }
+
+      if (!allowMemoryFallback) {
+        return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+      }
+      const list = mirror.examResults.filter(r => r.userId === requestedUid);
+      return res.json({ results: list });
+    } catch (err) {
+      return sendRouteError(res, 'GET /api/exams/results', err);
+    }
+  });
+
+  app.use('/api', (_req, res) => {
+    return res.status(404).json({
+      error: 'NOT_FOUND',
+      message: 'API endpoint not found.'
+    });
   });
 
   return { app, mirror };
@@ -1740,7 +3088,7 @@ async function startServer() {
   await probeFirestoreAdminConnectivity();
   const { app, mirror } = createSanadPrepApp();
 
-  const distDir = path.resolve(__dirname, 'dist');
+  const distDir = resolveWorkspacePath('dist');
   const distIndex = path.resolve(distDir, 'index.html');
   const isProduction = process.env.NODE_ENV === 'production';
 
@@ -1753,6 +3101,7 @@ async function startServer() {
       res.sendFile(distIndex);
     });
   } else {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
@@ -1767,7 +3116,7 @@ async function startServer() {
         return next();
       }
       try {
-        const indexPath = path.resolve(__dirname, 'index.html');
+        const indexPath = resolveWorkspacePath('index.html');
         let template = fs.readFileSync(indexPath, 'utf-8');
         template = await vite.transformIndexHtml(req.originalUrl, template);
         res.status(200).set({ 'Content-Type': 'text/html' }).end(template);
@@ -1779,7 +3128,7 @@ async function startServer() {
 
   const portArgIndex = process.argv.indexOf('--port');
   const cliPort = portArgIndex !== -1 ? Number(process.argv[portArgIndex + 1]) : null;
-  const PORT = cliPort || (isProduction && process.env.PORT ? Number(process.env.PORT) : 3000);
+  const PORT = cliPort || (isProduction ? Number(process.env.PORT || 8080) : 3000);
 
   const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(

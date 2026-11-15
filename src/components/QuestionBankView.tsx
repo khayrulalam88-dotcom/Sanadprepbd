@@ -57,6 +57,7 @@ export const QuestionBankView: React.FC = () => {
   // Custom Test Modal State
   const [showCustomModal, setShowCustomModal] = useState<boolean>(false);
   const [modalPreSelectedIds, setModalPreSelectedIds] = useState<string[]>([]);
+  const [selectionError, setSelectionError] = useState<string>('');
 
   // Generator Tab State
   const [genSubjectIds, setGenSubjectIds] = useState<string[]>([]);
@@ -140,9 +141,10 @@ export const QuestionBankView: React.FC = () => {
   // Open modal with currently selected questions
   const handleLaunchTestWithSelected = () => {
     if (selectedQuestionIds.size === 0) {
-      alert(t('অনুগ্রহ করে অন্তত ১টি প্রশ্ন নির্বাচন করুন', 'Please select at least 1 question.'));
+      setSelectionError(t('অনুগ্রহ করে অন্তত ১টি প্রশ্ন নির্বাচন করুন', 'Please select at least 1 question.'));
       return;
     }
+    setSelectionError('');
     setModalPreSelectedIds(Array.from(selectedQuestionIds));
     setShowCustomModal(true);
   };
@@ -258,6 +260,19 @@ export const QuestionBankView: React.FC = () => {
           </div>
         </div>
       </div>
+
+      {selectionError && (
+        <div className="p-3.5 rounded-2xl bg-rose-50 border border-rose-200 text-rose-800 text-xs sm:text-sm font-semibold flex items-center justify-between gap-3">
+          <span>{selectionError}</span>
+          <button
+            type="button"
+            onClick={() => setSelectionError('')}
+            className="text-rose-700 hover:text-rose-900 font-bold cursor-pointer"
+          >
+            ✕
+          </button>
+        </div>
+      )}
 
       {/* Navigation Tabs */}
       <div className="flex border-b border-slate-200 gap-2 sm:gap-6 text-xs sm:text-sm font-bold overflow-x-auto pb-px">

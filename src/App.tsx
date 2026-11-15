@@ -14,7 +14,6 @@ import { ResultsScreen } from './components/ResultsScreen';
 import { SubjectsView } from './components/SubjectsView';
 import { HistoryView } from './components/HistoryView';
 import { QuestionBankView } from './components/QuestionBankView';
-import { PreviousQuestionsView } from './components/PreviousQuestionsView';
 import { CustomTestModal } from './components/CustomTestModal';
 import { SubscriptionModal } from './components/SubscriptionModal';
 import { FirebaseGuideModal } from './components/FirebaseGuideModal';
@@ -74,7 +73,6 @@ const MainContent: React.FC = () => {
         {activeScreen === 'result' && <ResultsScreen />}
         {activeScreen === 'subjects' && <SubjectsView />}
         {activeScreen === 'question_bank' && <QuestionBankView />}
-        {activeScreen === 'previous_questions' && <PreviousQuestionsView />}
         {activeScreen === 'history' && <HistoryView />}
         {activeScreen === 'admin' && (
           <Suspense fallback={<div className="py-20 text-center text-sm text-slate-500">Loading Admin Console...</div>}>

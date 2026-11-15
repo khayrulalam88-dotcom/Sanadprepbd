@@ -13,7 +13,7 @@ import {
   writeBatch,
   Timestamp
 } from 'firebase/firestore';
-import { db, auth, OWNER_ADMIN_UID, isVerifiedOwnerAccount } from './firebase.ts';
+import { db, auth, isVerifiedOwnerAccount } from './firebase.ts';
 import type {
   Question,
   Exam,
@@ -22,8 +22,7 @@ import type {
   ExamResult,
   UserProfile,
   Subject,
-  LeaderboardEntry,
-  PreviousQuestion
+  LeaderboardEntry
 } from '../types/index.ts';
 
 export enum OperationType {
@@ -134,7 +133,10 @@ export async function fetchQuestionsFromFirestore(): Promise<Question[]> {
   try {
     const [qSnapshot, keySnapshot] = await Promise.all([
       getDocs(collection(db, path)),
-      getDocs(collection(db, 'questionKeys')).catch(() => null)
+      getDocs(collection(db, 'questionKeys')).catch(err => {
+        console.warn('Could not read questionKeys collection:', err);
+        return null;
+      })
     ]);
 
     const keyMap = new Map<string, Record<string, unknown>>();
@@ -559,20 +561,6 @@ export function isVerifiedOwnerAdmin(): boolean {
   return isVerifiedOwnerAccount(auth?.currentUser);
 }
 
-export async function checkIsAdminInFirestore(uid: string): Promise<boolean> {
-  if (!db || !uid || !auth?.currentUser) return false;
-  if (auth.currentUser.uid !== uid) return false;
-  if (uid === OWNER_ADMIN_UID && isVerifiedOwnerAccount(auth.currentUser)) {
-    return true;
-  }
-  try {
-    const adminDoc = await getDoc(doc(db, 'admins', uid));
-    return adminDoc.exists();
-  } catch {
-    return false;
-  }
-}
-
 export async function saveUserProfileToFirestore(user: UserProfile): Promise<void> {
   if (!db) return;
   const path = `users/${user.uid}`;
@@ -658,29 +646,25 @@ export async function migrateSubscriptionTimestampsInFirestore(): Promise<{ upda
 export async function seedFirestoreIfEmpty(
   seedQuestions: Question[],
   seedExams: Exam[],
-  seedSubjects: Subject[],
-  seedPreviousQuestions: PreviousQuestion[] = []
-): Promise<{ seeded: boolean; questionCount: number; examCount: number; previousCount: number }> {
+  seedSubjects: Subject[]
+): Promise<{ seeded: boolean; questionCount: number; examCount: number }> {
   if (!db || !isVerifiedOwnerAdmin()) {
-    return { seeded: false, questionCount: 0, examCount: 0, previousCount: 0 };
+    return { seeded: false, questionCount: 0, examCount: 0 };
   }
 
   try {
-    const [existingQSnap, existingExamSnap, existingSubjSnap, existingPrevSnap] = await Promise.all([
+    const [existingQSnap, existingExamSnap, existingSubjSnap] = await Promise.all([
       getDocs(collection(db, 'questions')),
       getDocs(collection(db, 'exams')),
-      getDocs(collection(db, 'subjects')),
-      getDocs(collection(db, 'previous_questions'))
+      getDocs(collection(db, 'subjects'))
     ]);
 
     const existingQIds = new Set(existingQSnap.docs.map(d => d.id));
     const existingExamIds = new Set(existingExamSnap.docs.map(d => d.id));
     const existingSubjIds = new Set(existingSubjSnap.docs.map(d => d.id));
-    const existingPrevIds = new Set(existingPrevSnap.docs.map(d => d.id));
 
     let addedQuestions = 0;
     let addedExams = 0;
-    let addedPrevious = 0;
 
     // 1. Only add missing subjects
     const missingSubjects = seedSubjects.filter(s => !existingSubjIds.has(s.id));
@@ -759,42 +743,14 @@ export async function seedFirestoreIfEmpty(
       addedExams += chunk.length;
     }
 
-    // 4. Only add missing previous questions (sanitized + keys)
-    const missingPrev = seedPreviousQuestions.filter(pq => !existingPrevIds.has(pq.id));
-    for (let i = 0; i < missingPrev.length; i += 200) {
-      const chunk = missingPrev.slice(i, i + 200);
-      const batch = writeBatch(db);
-      for (const pq of chunk) {
-        batch.set(doc(db, 'previous_questions', pq.id), {
-          year: Number(pq.year),
-          subject: pq.subject || '',
-          question: pq.question || '',
-          options: pq.options || [],
-          legalSection: pq.legalSection || '',
-          source: pq.source || `Bangladesh Bar Council MCQ Exam ${pq.year}`,
-          createdAt: pq.createdAt || new Date().toISOString()
-        });
-        if (pq.correctAnswer) {
-          batch.set(doc(db, 'previousQuestionKeys', pq.id), {
-            correctAnswer: pq.correctAnswer,
-            explanation: pq.explanation || '',
-            updatedAt: new Date().toISOString()
-          });
-        }
-      }
-      await batch.commit();
-      addedPrevious += chunk.length;
-    }
-
     return {
-      seeded: addedQuestions > 0 || addedExams > 0 || addedPrevious > 0,
+      seeded: addedQuestions > 0 || addedExams > 0,
       questionCount: addedQuestions,
-      examCount: addedExams,
-      previousCount: addedPrevious
+      examCount: addedExams
     };
   } catch (err) {
     console.warn('Seeding to Firestore skipped or unpermitted:', err);
-    return { seeded: false, questionCount: 0, examCount: 0, previousCount: 0 };
+    return { seeded: false, questionCount: 0, examCount: 0 };
   }
 }
 
@@ -831,129 +787,4 @@ export async function fetchLeaderboardFromFirestore(examId?: string): Promise<Le
     console.warn('Fetch leaderboard from Firestore error:', err);
     return [];
   }
-}
-
-// -------------------------------------------------------------
-// PREVIOUS YEAR QUESTIONS CRUD & BATCH IMPORT (Owner Admin Only)
-// -------------------------------------------------------------
-export async function fetchPreviousQuestionsFromFirestore(): Promise<PreviousQuestion[]> {
-  if (!db || !isVerifiedOwnerAdmin()) return [];
-  const path = 'previous_questions';
-  try {
-    const [qSnapshot, keySnapshot] = await Promise.all([
-      getDocs(collection(db, path)),
-      getDocs(collection(db, 'previousQuestionKeys')).catch(() => null)
-    ]);
-    const keyMap = new Map<string, { correctAnswer?: string; explanation?: string }>();
-    if (keySnapshot) {
-      keySnapshot.forEach(d => keyMap.set(d.id, d.data() as { correctAnswer?: string; explanation?: string }));
-    }
-
-    const items: PreviousQuestion[] = [];
-    qSnapshot.forEach((docSnap) => {
-      const data = docSnap.data() as Omit<PreviousQuestion, 'id'>;
-      const key = keyMap.get(docSnap.id);
-      items.push({
-        id: docSnap.id,
-        ...data,
-        ...(key ? {
-          correctAnswer: key.correctAnswer ?? data.correctAnswer,
-          explanation: key.explanation ?? data.explanation
-        } : {})
-      });
-    });
-    items.sort((a, b) => b.year - a.year);
-    return items;
-  } catch (err) {
-    console.warn('Could not fetch previous questions from Firestore:', err);
-    return [];
-  }
-}
-
-export async function savePreviousQuestionToFirestore(question: PreviousQuestion): Promise<void> {
-  if (!db) return;
-  const path = `previous_questions/${question.id}`;
-  try {
-    const batch = writeBatch(db);
-    batch.set(doc(db, 'previous_questions', question.id), {
-      year: Number(question.year),
-      subject: question.subject || '',
-      question: question.question || '',
-      options: question.options || [],
-      legalSection: question.legalSection || '',
-      source: question.source || `Bangladesh Bar Council MCQ Exam ${question.year}`,
-      createdAt: question.createdAt || new Date().toISOString()
-    });
-    if (question.correctAnswer !== undefined || question.explanation !== undefined) {
-      batch.set(doc(db, 'previousQuestionKeys', question.id), {
-        correctAnswer: question.correctAnswer || '',
-        explanation: question.explanation || '',
-        updatedAt: new Date().toISOString()
-      });
-    }
-    await batch.commit();
-  } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, path);
-  }
-}
-
-export async function deletePreviousQuestionFromFirestore(questionId: string): Promise<void> {
-  if (!db) return;
-  const path = `previous_questions/${questionId}`;
-  try {
-    const batch = writeBatch(db);
-    batch.delete(doc(db, 'previous_questions', questionId));
-    batch.delete(doc(db, 'previousQuestionKeys', questionId));
-    await batch.commit();
-  } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, path);
-  }
-}
-
-export async function batchImportPreviousQuestionsToFirestore(
-  questions: PreviousQuestion[]
-): Promise<{ successCount: number; failureCount: number; errors: string[] }> {
-  if (!db) {
-    return { successCount: 0, failureCount: questions.length, errors: ['Firestore database is not connected'] };
-  }
-
-  let successCount = 0;
-  let failureCount = 0;
-  const errors: string[] = [];
-
-  const CHUNK_SIZE = 200; // 2 writes per question = max 400 writes per batch
-  for (let i = 0; i < questions.length; i += CHUNK_SIZE) {
-    const chunk = questions.slice(i, i + CHUNK_SIZE);
-    const batch = writeBatch(db);
-
-    for (const q of chunk) {
-      const qId = q.id || `pq_${q.year}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-      batch.set(doc(db, 'previous_questions', qId), {
-        year: Number(q.year),
-        subject: q.subject || '',
-        question: q.question || '',
-        options: Array.isArray(q.options) ? q.options : [],
-        legalSection: q.legalSection || '',
-        source: q.source || `Bangladesh Bar Council MCQ Exam ${q.year}`,
-        createdAt: q.createdAt || new Date().toISOString()
-      }, { merge: true });
-
-      batch.set(doc(db, 'previousQuestionKeys', qId), {
-        correctAnswer: q.correctAnswer || '',
-        explanation: q.explanation || '',
-        updatedAt: new Date().toISOString()
-      }, { merge: true });
-    }
-
-    try {
-      await batch.commit();
-      successCount += chunk.length;
-    } catch (err: any) {
-      console.error('Batch commit failed for chunk:', err);
-      failureCount += chunk.length;
-      errors.push(err?.message || 'Failed to commit batch to Firestore');
-    }
-  }
-
-  return { successCount, failureCount, errors };
 }

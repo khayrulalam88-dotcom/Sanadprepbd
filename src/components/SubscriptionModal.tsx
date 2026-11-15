@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useApp } from '../context/AppContext';
 import { 
   X, 
@@ -47,6 +47,7 @@ export const SubscriptionModal: React.FC = () => {
   const [copiedMethod, setCopiedMethod] = useState<'bKash' | 'Nagad' | null>(null);
   const [submitted, setSubmitted] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string>('');
+  const submitLockRef = useRef<boolean>(false);
 
   // Keep activePkg synced with selectedPackageForPayment when opened
   useEffect(() => {
@@ -82,7 +83,7 @@ export const SubscriptionModal: React.FC = () => {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (isSubmitting) return;
+    if (submitLockRef.current || isSubmitting) return;
     setErrorMsg('');
 
     if (!studentPhone.trim()) {
@@ -95,6 +96,7 @@ export const SubscriptionModal: React.FC = () => {
       return;
     }
 
+    submitLockRef.current = true;
     setIsSubmitting(true);
     try {
       const res = await createPaymentRequest({
@@ -112,6 +114,7 @@ export const SubscriptionModal: React.FC = () => {
         setErrorMsg(res.error || t('পেমেন্ট রিকোয়েস্ট পাঠাতে ব্যর্থ হয়েছে।', 'Failed to submit payment request.'));
       }
     } finally {
+      submitLockRef.current = false;
       setIsSubmitting(false);
     }
   };

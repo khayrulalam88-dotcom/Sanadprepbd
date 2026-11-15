@@ -404,7 +404,7 @@ export const TopPerformersLeaderboard: React.FC<Props> = ({
                 <div className="p-8 text-center text-slate-500 space-y-2">
                   <Trophy className="w-8 h-8 text-slate-300 mx-auto" />
                   <p className="font-semibold text-sm">
-                    {t('কোনো ফলাফল পাওয়া যায়নি', 'No leaderboard results found')}
+                    {t('এখনো কোনো পরীক্ষার ফলাফল প্রকাশিত হয়নি।', 'No exam results have been published yet.')}
                   </p>
                   <p className="text-xs text-slate-400">
                     {t('মডেল টেস্টে অংশ নিয়ে সবার প্রথমে আপনার মেধা অবস্থান নির্ধারণ করুন।', 'Participate in a mock test to establish your merit ranking.')}

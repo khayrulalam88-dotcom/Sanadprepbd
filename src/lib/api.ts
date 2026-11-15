@@ -1,4 +1,5 @@
 import { auth } from './firebase';
+import { formatBackendApiError } from './securityHelpers';
 import type {
   Exam,
   ExamAttempt,
@@ -7,7 +8,6 @@ import type {
   LeaderboardEntry,
   PaymentRequest,
   PaymentSettings,
-  PreviousQuestion,
   Question,
   StudentSession,
   Subject,
@@ -90,26 +90,38 @@ async function apiRequest<T>(
 
     const contentType = response.headers.get('content-type') || '';
     if (!contentType.includes('application/json')) {
+      const nonJsonCode = response.status >= 500 ? `HTTP_${response.status}` : 'NON_JSON_RESPONSE';
       return {
         ok: false,
         status: response.status,
-        code: 'NON_JSON_RESPONSE',
-        message: 'Backend API returned an unexpected non-JSON response.'
+        code: nonJsonCode,
+        message: formatBackendApiError({
+          status: response.status,
+          code: nonJsonCode,
+          isJson: false
+        })
       };
     }
 
     const payload = (await response.json()) as Record<string, unknown>;
     if (!response.ok) {
+      const errCode = typeof payload.error === 'string' ? payload.error : `HTTP_${response.status}`;
+      const rawMessage =
+        typeof payload.message === 'string'
+          ? payload.message
+          : typeof payload.error === 'string'
+          ? payload.error
+          : undefined;
       return {
         ok: false,
         status: response.status,
-        code: typeof payload.error === 'string' ? payload.error : `HTTP_${response.status}`,
-        message:
-          typeof payload.message === 'string'
-            ? payload.message
-            : typeof payload.error === 'string'
-            ? payload.error
-            : 'Request failed'
+        code: errCode,
+        message: formatBackendApiError({
+          status: response.status,
+          code: errCode,
+          serverMessage: rawMessage,
+          isJson: true
+        })
       };
     }
 
@@ -123,7 +135,11 @@ async function apiRequest<T>(
       ok: false,
       status: 0,
       code: 'NETWORK_ERROR',
-      message: err instanceof Error ? err.message : 'Network error connecting to backend'
+      message: formatBackendApiError({
+        status: 0,
+        code: 'NETWORK_ERROR',
+        serverMessage: err instanceof Error ? err.message : undefined
+      })
     };
   }
 }
@@ -136,14 +152,17 @@ export async function apiFetchPublicCatalog() {
     apiRequest<{ examDateConfig: ExamDateConfig }>('/api/exam-config'),
     apiRequest<{ paymentSettings: PaymentSettings; supportSettings: SupportContactSettings }>('/api/payment-settings'),
     apiRequest<{ subjects: Subject[] }>('/api/subjects'),
-    apiRequest<{ leaderboard: LeaderboardEntry[] }>('/api/leaderboard'),
-    apiRequest<{ previousQuestions: PreviousQuestion[] }>('/api/previous-questions')
+    apiRequest<{ leaderboard: LeaderboardEntry[] }>('/api/leaderboard')
   ]);
 }
 
 export async function apiFetchLeaderboard(examId?: string) {
   const qs = examId && examId !== 'all' ? `?examId=${encodeURIComponent(examId)}` : '';
   return apiRequest<{ leaderboard: LeaderboardEntry[] }>(`/api/leaderboard${qs}`);
+}
+
+export async function apiFetchExams() {
+  return apiRequest<{ exams: Exam[] }>('/api/exams');
 }
 
 // Auth & Session
@@ -160,13 +179,59 @@ export async function apiCreateSession(userName?: string, deviceInfo?: string) {
   });
 }
 
+export async function apiCheckSessionStatus() {
+  return apiRequest<{
+    active: boolean;
+    session: StudentSession | null;
+    activeSubscription: UserSubscription | null;
+  }>('/api/auth/session/status', {
+    method: 'GET',
+    requireAuth: true
+  });
+}
+
+export async function apiLogoutSession(overrideAuth?: { token: string; sessionId: string }) {
+  if (overrideAuth) {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/auth/logout`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${overrideAuth.token}`,
+          'X-Session-Id': overrideAuth.sessionId
+        }
+      });
+      return { ok: response.ok, status: response.status };
+    } catch {
+      return { ok: false, status: 0 };
+    }
+  }
+  return apiRequest<{ success: boolean }>('/api/auth/logout', {
+    method: 'POST',
+    requireAuth: true
+  });
+}
+
 // Questions & Practice (Sanitized for Students; Full Keys for Owner Admin)
-export async function apiFetchSanitizedQuestions(params?: { subjectId?: string; examId?: string }) {
+export async function apiFetchSanitizedQuestions(params?: {
+  subjectId?: string;
+  examId?: string;
+  search?: string;
+  limit?: number;
+  offset?: number;
+}) {
   const search = new URLSearchParams();
   if (params?.subjectId) search.set('subjectId', params.subjectId);
   if (params?.examId) search.set('examId', params.examId);
+  if (params?.search) search.set('search', params.search);
+  if (params?.limit !== undefined) search.set('limit', String(params.limit));
+  if (params?.offset !== undefined) search.set('offset', String(params.offset));
   const qs = search.toString() ? `?${search.toString()}` : '';
-  return apiRequest<{ questions: Question[] }>(`/api/questions${qs}`, { requireAuth: true });
+  return apiRequest<{
+    questions: Question[];
+    total?: number;
+    limit?: number | null;
+    offset?: number;
+  }>(`/api/questions${qs}`, { requireAuth: true });
 }
 
 export async function apiCheckPracticeAnswer(questionId: string, selectedOption: number) {
@@ -182,42 +247,6 @@ export async function apiCheckPracticeAnswer(questionId: string, selectedOption:
     method: 'POST',
     body: { questionId, selectedOption },
     requireAuth: true
-  });
-}
-
-export async function apiCheckPreviousQuestion(questionId: string, selectedAnswer?: string) {
-  return apiRequest<{
-    success: boolean;
-    questionId: string;
-    isCorrect: boolean;
-    correctAnswer: string;
-    explanation: string;
-    legalSection: string;
-    source: string;
-  }>('/api/previous-questions/check', {
-    method: 'POST',
-    body: { questionId, selectedAnswer }
-  });
-}
-
-export async function apiGradePreviousQuestions(questionIds: string[], answers: Record<string, string>) {
-  return apiRequest<{
-    success: boolean;
-    evaluation: {
-      totalQuestions: number;
-      correctCount: number;
-      incorrectCount: number;
-      unansweredCount: number;
-      positiveMarks: number;
-      negativeMarks: number;
-      finalScore: number;
-      percentage: number;
-      isPassed: boolean;
-      incorrectList: { question: PreviousQuestion; selectedAnswer?: string }[];
-    };
-  }>('/api/previous-questions/grade', {
-    method: 'POST',
-    body: { questionIds, answers }
   });
 }
 
@@ -334,18 +363,6 @@ export async function apiAdminDeleteQuestion(id: string) {
   });
 }
 
-export async function apiFetchAdminPreviousQuestions() {
-  return apiRequest<{ previousQuestions: PreviousQuestion[] }>('/api/admin/previous-questions', { requireAuth: true });
-}
-
-export async function apiAdminSavePreviousQuestion(pq: PreviousQuestion) {
-  return apiRequest<{ success: boolean; previousQuestion: PreviousQuestion }>('/api/admin/previous-questions', {
-    method: 'POST',
-    body: pq,
-    requireAuth: true
-  });
-}
-
 export async function apiAdminSaveExam(exam: Exam) {
   return apiRequest<{ success: boolean; exam: Exam }>('/api/admin/exams/save', {
     method: 'POST',
@@ -372,11 +389,14 @@ export async function apiAdminUpdateUser(params: {
   expiresAt?: string;
   isSessionRevoked?: boolean;
 }) {
-  return apiRequest<{ success: boolean; user: UserProfile }>('/api/admin/users/update', {
-    method: 'POST',
-    body: params,
-    requireAuth: true
-  });
+  return apiRequest<{ success: boolean; user: UserProfile; subscription?: UserSubscription | null }>(
+    '/api/admin/users/update',
+    {
+      method: 'POST',
+      body: params,
+      requireAuth: true
+    }
+  );
 }
 
 export async function apiAdminUpdatePackage(pkg: Partial<SubscriptionPackage> & { id: string }) {

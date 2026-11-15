@@ -50,9 +50,12 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({ isOpen, onClos
     total: 0,
     percent: 0
   });
+  const [importError, setImportError] = useState<string>('');
   const [importReport, setImportReport] = useState<{
     completed: boolean;
     importedCount: number;
+    failedCount: number;
+    firstError?: string;
     skippedDuplicates: number;
     skippedErrors: number;
   } | null>(null);
@@ -87,6 +90,7 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({ isOpen, onClos
     setFileName(file.name);
     setFileSize((file.size / 1024).toFixed(1) + ' KB');
     setImportReport(null);
+    setImportError('');
 
     const reader = new FileReader();
     reader.onload = (event) => {
@@ -119,6 +123,7 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({ isOpen, onClos
     setFileSize('');
     setValidationResult(null);
     setImportReport(null);
+    setImportError('');
     setIsImporting(false);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
@@ -127,25 +132,29 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({ isOpen, onClos
 
   // Execute bulk import in batches with progress updates
   const handleExecuteImport = async () => {
-    if (!validationResult) return;
+    if (!validationResult || isImporting) return;
+    setImportError('');
 
-    // Filter rows to import
+    // Filter rows to import (invalid rows are strictly excluded)
     const rowsToImport = validationResult.parsedQuestions.filter(q => {
-      if (!q.isValid && skipErrors) return false;
+      if (!q.isValid) return false;
       if (q.isDuplicate && skipDuplicates) return false;
       return true;
     });
 
     if (rowsToImport.length === 0) {
-      alert(t('ইমপোর্ট করার উপযোগী কোনো বৈধ প্রশ্ন পাওয়া যায়নি।', 'No valid questions found to import based on your settings.'));
+      setImportError(t('ইমপোর্ট করার উপযোগী কোনো বৈধ প্রশ্ন পাওয়া যায়নি।', 'No valid questions found to import based on your settings.'));
       return;
     }
 
     setIsImporting(true);
     const total = rowsToImport.length;
     let imported = 0;
+    let failedCount = 0;
+    let processed = 0;
+    let firstError: string | undefined;
 
-    // Process in batches of 5 to allow UI repaint and smooth DB write
+    // Process in batches of 5 to allow UI repaint and authoritative backend persistence
     const batchSize = 5;
     for (let i = 0; i < total; i += batchSize) {
       const chunk = rowsToImport.slice(i, i + batchSize);
@@ -167,32 +176,47 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({ isOpen, onClos
           isDemoSample: false
         };
 
-        addQuestion(newQuestion);
-        imported++;
+        const res = await addQuestion(newQuestion);
+        processed++;
+        if (res.success) {
+          imported++;
+        } else {
+          failedCount++;
+          if (!firstError) {
+            firstError = res.error || t('ডাটাবেজে প্রশ্ন সংরক্ষণ করতে ব্যর্থ হয়েছে।', 'Failed to save question to backend.');
+          }
+        }
       }
 
       setImportProgress({
-        current: Math.min(imported, total),
+        current: Math.min(processed, total),
         total,
-        percent: Math.round((Math.min(imported, total) / total) * 100)
+        percent: Math.round((Math.min(processed, total) / total) * 100)
       });
 
       // Small pause to yield to event loop for smooth progress bar rendering
-      await new Promise(r => setTimeout(r, 60));
+      await new Promise(r => setTimeout(r, 40));
     }
 
     setIsImporting(false);
     const skippedDups = validationResult.parsedQuestions.filter(q => q.isDuplicate).length;
     const skippedErrs = validationResult.parsedQuestions.filter(q => !q.isValid).length;
 
+    if (imported === 0 && failedCount > 0) {
+      setImportError(firstError || t('প্রশ্ন ইমপোর্ট ব্যর্থ হয়েছে। অনুগ্রহ করে অ্যাডমিন লগইন এবং ব্যাকএন্ড সংযোগ যাচাই করুন।', 'Import failed. Please verify admin authentication and backend availability.'));
+      return;
+    }
+
     setImportReport({
       completed: true,
       importedCount: imported,
+      failedCount,
+      firstError,
       skippedDuplicates: skipDuplicates ? skippedDups : 0,
       skippedErrors: skipErrors ? skippedErrs : 0
     });
 
-    if (onImportComplete) {
+    if (onImportComplete && imported > 0) {
       onImportComplete(imported);
     }
   };
@@ -206,7 +230,7 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({ isOpen, onClos
   }) || [];
 
   const eligibleCount = validationResult?.parsedQuestions.filter(q => {
-    if (!q.isValid && skipErrors) return false;
+    if (!q.isValid) return false;
     if (q.isDuplicate && skipDuplicates) return false;
     return true;
   }).length || 0;
@@ -241,24 +265,39 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({ isOpen, onClos
 
         {/* Modal Body */}
         <div className="p-6 overflow-y-auto flex-1 space-y-6">
+          {importError && (
+            <div className="p-4 rounded-2xl bg-rose-50 border border-rose-200 text-rose-800 text-xs sm:text-sm font-semibold flex items-start gap-2.5">
+              <AlertCircle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
+              <span>{importError}</span>
+            </div>
+          )}
           
           {/* Completion Report Screen */}
           {importReport?.completed ? (
             <div className="p-8 text-center space-y-6 max-w-md mx-auto">
-              <div className="w-16 h-16 rounded-full bg-emerald-100 text-emerald-700 mx-auto flex items-center justify-center border-4 border-emerald-200">
-                <Check className="w-8 h-8 stroke-[3]" />
+              <div className={`w-16 h-16 rounded-full mx-auto flex items-center justify-center border-4 ${
+                importReport.failedCount > 0
+                  ? 'bg-amber-100 text-amber-700 border-amber-200'
+                  : 'bg-emerald-100 text-emerald-700 border-emerald-200'
+              }`}>
+                {importReport.failedCount > 0 ? <AlertTriangle className="w-8 h-8" /> : <Check className="w-8 h-8 stroke-[3]" />}
               </div>
 
               <div className="space-y-2">
                 <h4 className="text-xl font-bold text-slate-900">
-                  {t('প্রশ্নসমূহ সফলভাবে ইমপোর্ট সম্পন্ন হয়েছে!', 'Questions Imported Successfully!')}
+                  {importReport.failedCount > 0
+                    ? t('আংশিক প্রশ্ন ইমপোর্ট সম্পন্ন হয়েছে', 'Import Completed with Errors')
+                    : t('প্রশ্নসমূহ সফলভাবে ইমপোর্ট সম্পন্ন হয়েছে!', 'Questions Imported Successfully!')}
                 </h4>
                 <p className="text-xs sm:text-sm text-slate-600">
                   {t(
-                    `মোট ${importReport.importedCount} টি প্রশ্ন ডাটাবেজে সংরক্ষণ করা হয়েছে এবং প্রশ্ন সম্ভারে যুক্ত করা হয়েছে।`,
-                    `${importReport.importedCount} questions have been permanently saved to the database and are now live in the Question Bank & Mock Tests.`
+                    `মোট ${importReport.importedCount} টি প্রশ্ন ডাটাবেজে সংরক্ষণ করা হয়েছে${importReport.failedCount > 0 ? ` এবং ${importReport.failedCount} টি ব্যর্থ হয়েছে` : ''}।`,
+                    `${importReport.importedCount} questions have been saved${importReport.failedCount > 0 ? ` and ${importReport.failedCount} failed` : ''}.`
                   )}
                 </p>
+                {importReport.firstError && (
+                  <p className="text-xs text-rose-700 font-semibold">{importReport.firstError}</p>
+                )}
               </div>
 
               <div className="grid grid-cols-3 gap-2 bg-slate-50 p-4 rounded-2xl border border-slate-200 text-xs text-center">
@@ -271,8 +310,8 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({ isOpen, onClos
                   <strong className="text-amber-600 text-base">{importReport.skippedDuplicates}</strong>
                 </div>
                 <div>
-                  <span className="text-slate-400 block text-[10px]">{t('ত্রুটিপূর্ণ বাদ', 'Invalid')}</span>
-                  <strong className="text-rose-600 text-base">{importReport.skippedErrors}</strong>
+                  <span className="text-slate-400 block text-[10px]">{t('ত্রুটি / ব্যর্থ', 'Failed/Invalid')}</span>
+                  <strong className="text-rose-600 text-base">{importReport.skippedErrors + importReport.failedCount}</strong>
                 </div>
               </div>
 
@@ -499,14 +538,15 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({ isOpen, onClos
                     <span>{t('ডুপ্লিকেট প্রশ্ন বাদ দিন (Skip duplicates)', 'Skip duplicates')}</span>
                   </label>
 
-                  <label className="flex items-center gap-2 cursor-pointer font-semibold text-slate-700">
+                  <label className="flex items-center gap-2 cursor-not-allowed font-semibold text-slate-500" title="Invalid rows cannot be imported">
                     <input 
                       type="checkbox"
-                      checked={skipErrors}
-                      onChange={(e) => setSkipErrors(e.target.checked)}
+                      checked={true}
+                      disabled
+                      onChange={() => setSkipErrors(true)}
                       className="rounded text-[#102A43] focus:ring-[#102A43]"
                     />
-                    <span>{t('ভুল সারি বাদ দিন (Skip invalid)', 'Skip invalid')}</span>
+                    <span>{t('ভুল সারি বাদ দিন (Skip invalid)', 'Always skip invalid rows')}</span>
                   </label>
                 </div>
               </div>

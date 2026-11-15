@@ -75,6 +75,8 @@ export const AdminCreateExamModal: React.FC<AdminCreateExamModalProps> = ({
     new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 16)
   );
   const [createdSuccessMsg, setCreatedSuccessMsg] = useState<string | null>(null);
+  const [createError, setCreateError] = useState<string | null>(null);
+  const [isCreating, setIsCreating] = useState<boolean>(false);
 
   if (!isOpen) return null;
 
@@ -150,11 +152,14 @@ export const AdminCreateExamModal: React.FC<AdminCreateExamModalProps> = ({
     return shuffled.slice(0, Math.min(questionCount, shuffled.length)).map(q => q.id);
   };
 
-  const handleCreateExam = (andStartNow: boolean = false) => {
+  const handleCreateExam = async (andStartNow: boolean = false) => {
+    if (isCreating) return;
+    setCreateError(null);
+    setCreatedSuccessMsg(null);
     const finalQuestionIds = resolveQuestionIds();
 
     if (finalQuestionIds.length === 0) {
-      alert(t('অনুগ্রহ করে অন্তত ১টি প্রশ্ন নির্বাচন করুন বা সিলেবাসের বিষয় নির্বাচন করুন।', 'Please select at least 1 question.'));
+      setCreateError(t('অনুগ্রহ করে অন্তত ১টি প্রশ্ন নির্বাচন করুন বা সিলেবাসের বিষয় নির্বাচন করুন।', 'Please select at least 1 question.'));
       return;
     }
 
@@ -180,22 +185,31 @@ export const AdminCreateExamModal: React.FC<AdminCreateExamModalProps> = ({
       positiveMarkRatio: 1.0
     };
 
-    addExam(newExam);
-
-    setCreatedSuccessMsg(
-      t(
-        `"${titleBn}" সফলভাবে তৈরি হয়েছে! পরীক্ষাটি ${launchStatus === 'live_now' ? 'লাইভ চালু রয়েছে' : 'শিডিউল করা হয়েছে'}।`,
-        `"${titleEn}" has been successfully published!`
-      )
-    );
-
-    setTimeout(() => {
-      onClose();
-      if (andStartNow) {
-        // Find latest exam or start by id
-        alert(t('পরীক্ষা স্ক্রিনে নিয়ে যাওয়া হচ্ছে...', 'Redirecting to exam room...'));
+    setIsCreating(true);
+    try {
+      const res = await addExam(newExam);
+      if (!res.success) {
+        setCreateError(res.error || t('মডেল টেস্ট সংরক্ষণ করতে ব্যর্থ হয়েছে।', 'Failed to create model test.'));
+        return;
       }
-    }, 1200);
+
+      setCreatedSuccessMsg(
+        t(
+          `"${titleBn}" সফলভাবে তৈরি হয়েছে! পরীক্ষাটি ${launchStatus === 'live_now' ? 'লাইভ চালু রয়েছে' : 'শিডিউল করা হয়েছে'}।`,
+          `"${titleEn}" has been successfully published!`
+        )
+      );
+
+      const createdExamId = res.exam?.id;
+      setTimeout(() => {
+        onClose();
+        if (andStartNow && createdExamId) {
+          void startExam(createdExamId);
+        }
+      }, 1000);
+    } finally {
+      setIsCreating(false);
+    }
   };
 
   return (
@@ -237,6 +251,13 @@ export const AdminCreateExamModal: React.FC<AdminCreateExamModalProps> = ({
         {/* Scrollable Form Body */}
         <div className="p-5 sm:p-6 overflow-y-auto space-y-6 flex-1 text-slate-800 text-xs sm:text-sm">
           
+          {createError && (
+            <div className="p-4 rounded-2xl bg-rose-50 border-2 border-rose-300 text-rose-900 font-bold flex items-center gap-2.5 animate-in fade-in">
+              <AlertCircle className="w-5 h-5 text-rose-600 shrink-0" />
+              <span>{createError}</span>
+            </div>
+          )}
+
           {createdSuccessMsg && (
             <div className="p-4 rounded-2xl bg-emerald-50 border-2 border-emerald-500 text-emerald-900 font-bold flex items-center gap-2.5 animate-in fade-in">
               <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
@@ -664,11 +685,16 @@ export const AdminCreateExamModal: React.FC<AdminCreateExamModalProps> = ({
           <div className="flex items-center gap-2.5">
             <button
               type="button"
+              disabled={isCreating}
               onClick={() => handleCreateExam(false)}
-              className="flex-1 sm:flex-none px-6 py-2.5 rounded-xl bg-[#102A43] hover:bg-[#243B53] text-[#D4AF37] border border-[#D4AF37] font-black text-xs sm:text-sm transition flex items-center justify-center gap-2 shadow-sm cursor-pointer"
+              className="flex-1 sm:flex-none px-6 py-2.5 rounded-xl bg-[#102A43] hover:bg-[#243B53] disabled:opacity-60 text-[#D4AF37] border border-[#D4AF37] font-black text-xs sm:text-sm transition flex items-center justify-center gap-2 shadow-sm cursor-pointer"
             >
               <Save className="w-4 h-4 text-[#D4AF37]" />
-              <span>{t('মডেল টেস্ট তৈরি ও পরীক্ষা চালু করুন', 'Publish & Host Exam')}</span>
+              <span>
+                {isCreating
+                  ? t('সংরক্ষণ হচ্ছে...', 'Publishing...')
+                  : t('মডেল টেস্ট তৈরি ও পরীক্ষা চালু করুন', 'Publish & Host Exam')}
+              </span>
             </button>
           </div>
         </div>
