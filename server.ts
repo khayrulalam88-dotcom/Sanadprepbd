@@ -32,6 +32,7 @@ import {
   adminDb,
   persistenceState,
   probeFirestoreAdminConnectivity,
+  ensureProductionFirestoreReady,
   createMemoryMirror,
   consumeRateLimit,
   resolveWorkspacePath,
@@ -232,12 +233,20 @@ export function createSanadPrepApp(options?: {
       };
     });
 
-  function requireProductionDatabase(req: Request, res: Response, next: NextFunction) {
-    if (isProductionMode && !useFirestore() && req.path !== '/health' && req.path !== '/api/health') {
-      return res.status(503).json({
-        error: 'FIRESTORE_UNAVAILABLE',
-        message: 'Authoritative database unavailable in production.'
-      });
+  async function requireProductionDatabase(req: Request, res: Response, next: NextFunction) {
+    if (req.path === '/health' || req.path === '/api/health') {
+      return next();
+    }
+    if (isProductionMode && !useFirestore()) {
+      if (!options?.firestoreDb && !options?.disableFirestoreWrites && dbValidation.valid) {
+        await ensureProductionFirestoreReady(db);
+      }
+      if (!useFirestore()) {
+        return res.status(503).json({
+          error: 'FIRESTORE_UNAVAILABLE',
+          message: 'Authoritative database unavailable in production.'
+        });
+      }
     }
     return next();
   }
@@ -433,9 +442,23 @@ export function createSanadPrepApp(options?: {
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', 1);
-  app.use((_req, res, next) => {
+  app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('X-Frame-Options', 'DENY');
+    const hostHeader = String(req.headers['x-forwarded-host'] || req.headers.host || '')
+      .split(',')[0]
+      .trim()
+      .toLowerCase();
+    const isAiStudioHost = /^ais-(dev|pre)-[a-z0-9-]+\.[a-z0-9.-]+\.run\.app(?::\d+)?$/.test(hostHeader);
+    const isApiOrHealth = req.path === '/health' || req.path.startsWith('/api');
+
+    if (isApiOrHealth || (isProductionMode && !isAiStudioHost)) {
+      res.setHeader('X-Frame-Options', 'DENY');
+    } else {
+      res.setHeader(
+        'Content-Security-Policy',
+        "frame-ancestors 'self' https://aistudio.google.com https://*.google.com https://*.googleusercontent.com"
+      );
+    }
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
     res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
     res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
@@ -481,7 +504,10 @@ export function createSanadPrepApp(options?: {
   // ---------------------------------------------------------
   // HEALTH & PUBLIC CONFIGURATION ENDPOINTS
   // ---------------------------------------------------------
-  app.get(['/health', '/api/health'], (_req, res) => {
+  app.get(['/health', '/api/health'], async (_req, res) => {
+    if (isProductionMode && !useFirestore() && !options?.firestoreDb && !options?.disableFirestoreWrites && dbValidation.valid) {
+      await ensureProductionFirestoreReady(db);
+    }
     const mode = useFirestore() ? 'firestore' : isProductionMode ? 'unavailable' : 'memory-fallback';
     const healthy = !isProductionMode || (mode === 'firestore' && dbValidation.valid);
     return res.status(healthy ? 200 : 503).json({
@@ -3129,6 +3155,12 @@ async function startServer() {
   const portArgIndex = process.argv.indexOf('--port');
   const cliPort = portArgIndex !== -1 ? Number(process.argv[portArgIndex + 1]) : null;
   const PORT = cliPort || (isProduction ? Number(process.env.PORT || 8080) : 3000);
+
+  if (isProduction && parseAllowedOrigins(process.env.ALLOWED_ORIGIN).size === 0) {
+    console.warn(
+      '[SanadPrep Server] ALLOWED_ORIGIN is empty in production; browser requests from Cloudflare Workers/custom domains will be rejected by CORS until ALLOWED_ORIGIN is configured.'
+    );
+  }
 
   const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(

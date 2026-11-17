@@ -2218,6 +2218,24 @@ describe('Sanad Prep BD – Master Remediation Security & Input Validation Suite
       assert.equal(healthRes.headers.get('referrer-policy'), 'strict-origin-when-cross-origin');
       assert.ok(healthRes.headers.get('strict-transport-security'));
 
+      const { app: devApp } = createSanadPrepApp({
+        mirror: createMemoryMirror(),
+        isProduction: false,
+        disableFirestoreWrites: true
+      });
+      devApp.get('/', (_req, res) => res.status(200).type('html').send('<html></html>'));
+      const devSrv = devApp.listen(0, '127.0.0.1');
+      await new Promise<void>(r => devSrv.once('listening', r));
+      try {
+        const devUrl = `http://127.0.0.1:${(devSrv.address() as { port: number }).port}`;
+        const devPageRes = await fetch(`${devUrl}/`);
+        assert.equal(devPageRes.status, 200);
+        assert.equal(devPageRes.headers.get('x-frame-options'), null);
+        assert.ok(devPageRes.headers.get('content-security-policy')?.includes('https://aistudio.google.com'));
+      } finally {
+        await new Promise<void>(r => devSrv.close(() => r()));
+      }
+
       // Verify student GET routes require an active X-Session-Id
       for (const pathGet of [
         '/api/questions',
@@ -2277,6 +2295,13 @@ describe('Sanad Prep BD – Master Remediation Security & Input Validation Suite
       assert.ok(gitignore.includes('.backup_*/'));
       assert.ok(gitignore.includes('dist-server/'));
       assert.ok(gitignore.includes('*service-account*.json'));
+
+      const dockerfile = fs.readFileSync(path.join(rootDir, 'Dockerfile'), 'utf8');
+      assert.ok(dockerfile.includes('bun.lock'));
+      assert.ok(dockerfile.includes('bun install --frozen-lockfile'));
+      assert.ok(dockerfile.includes('firebase-applet-config.json'));
+      assert.ok(dockerfile.includes('questionBankFull.json'));
+      assert.ok(!dockerfile.includes('npm ci'));
     } finally {
       await new Promise<void>(r => srv.close(() => r()));
     }

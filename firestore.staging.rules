@@ -1,0 +1,226 @@
+rules_version = '2';
+// ============================================================================
+// SANAD PREP BD — STAGING FIRESTORE SECURITY RULES
+// Target Project: sanad-prep-bd-staging
+// Target Database: (default)
+//
+// IMPORTANT:
+// 1. Replace `REPLACE_WITH_STAGING_OWNER_UID` below with the new staging
+//    Owner Admin UID obtained from Firebase Authentication in `sanad-prep-bd-staging`.
+// 2. Confirm the staging Owner UID is DIFFERENT from Production UID:
+//      Production UID (DO NOT USE HERE): PjBRV7LAQ8cIwOdM3z474A16dWg2
+// 3. Deploy ONLY to the staging project (`sanad-prep-bd-staging`), NEVER to Production.
+// ============================================================================
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default Deny All Catch-All
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ---------------------------------------------------------
+    // HELPER FUNCTIONS (Zero-Trust Attribute-Based Security)
+    // ---------------------------------------------------------
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Sole Verified Staging Owner Account:
+    // Distinct staging UID + verified email claim (`khayrulalam88@gmail.com`)
+    function isOwnerAccount() {
+      return isAuthenticated() &&
+             request.auth.uid == 'REPLACE_WITH_STAGING_OWNER_UID' &&
+             request.auth.uid != 'PjBRV7LAQ8cIwOdM3z474A16dWg2' &&
+             request.auth.token.email == 'khayrulalam88@gmail.com' &&
+             request.auth.token.email_verified == true;
+    }
+
+    // Verified Paid Access Gate:
+    // User must have active pro status AND valid non-null Firestore Timestamp subscriptionExpiresAt > request.time.
+    function hasActiveSubscription() {
+      return isAuthenticated() && (
+        isOwnerAccount() ||
+        (
+          exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.subscriptionStatus == 'pro' &&
+          'subscriptionExpiresAt' in get(/databases/$(database)/documents/users/$(request.auth.uid)).data &&
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.subscriptionExpiresAt is timestamp &&
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.subscriptionExpiresAt > request.time
+        )
+      );
+    }
+
+    // ---------------------------------------------------------
+    // 1. LEGACY ADMIN COLLECTION LOCKDOWN (/admins/{adminId})
+    // ---------------------------------------------------------
+    // /admins collection cannot grant privileges and is locked down.
+    match /admins/{adminId} {
+      allow read, write: if false;
+    }
+
+    // ---------------------------------------------------------
+    // 2. USER PROFILES (/users/{userId})
+    // ---------------------------------------------------------
+    // Students must have verified email, valid bounded schema, and cannot elevate role/subscription fields.
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isOwnerAccount();
+      allow create: if isAuthenticated() && request.auth.uid == userId && (
+        isOwnerAccount() || (
+          request.auth.token.email_verified == true &&
+          request.resource.data.keys().hasAll(['uid', 'name', 'role', 'subscriptionStatus', 'createdAt']) &&
+          request.resource.data.keys().hasOnly([
+            'uid', 'name', 'email', 'phone', 'role', 'subscriptionStatus',
+            'subscriptionExpiresAt', 'activePackageId', 'activePackageNameBn',
+            'activePackageNameEn', 'createdAt'
+          ]) &&
+          request.resource.data.uid == userId &&
+          request.resource.data.name is string &&
+          request.resource.data.name.size() > 0 &&
+          request.resource.data.name.size() <= 100 &&
+          (!('email' in request.resource.data) || (request.resource.data.email is string && request.resource.data.email.size() <= 150)) &&
+          (!('phone' in request.resource.data) || (request.resource.data.phone is string && request.resource.data.phone.size() <= 20)) &&
+          request.resource.data.role == 'student' &&
+          request.resource.data.subscriptionStatus == 'free' &&
+          (!('subscriptionExpiresAt' in request.resource.data) || request.resource.data.subscriptionExpiresAt == null)
+        )
+      );
+      allow update: if isOwnerAccount() || (
+        isOwner(userId) &&
+        request.auth.token.email_verified == true &&
+        request.resource.data.name is string &&
+        request.resource.data.name.size() > 0 &&
+        request.resource.data.name.size() <= 100 &&
+        (!('phone' in request.resource.data) || (request.resource.data.phone is string && request.resource.data.phone.size() <= 20)) &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+          'uid',
+          'email',
+          'createdAt',
+          'role',
+          'subscriptionStatus',
+          'subscriptionExpiresAt',
+          'activePackageId',
+          'activePackageNameBn',
+          'activePackageNameEn'
+        ])
+      );
+      allow delete: if isOwnerAccount();
+    }
+
+    // ---------------------------------------------------------
+    // 3. PAYMENT REQUESTS (/paymentRequests/{paymentId})
+    // ---------------------------------------------------------
+    // Backend Admin SDK ONLY for writes (single-source-of-truth pricing & TrxID enforcement).
+    match /paymentRequests/{paymentId} {
+      allow read: if (isAuthenticated() && resource.data.userId == request.auth.uid) || isOwnerAccount();
+      allow create, update, delete: if false;
+    }
+
+    // ---------------------------------------------------------
+    // 4. SUBSCRIPTIONS (/subscriptions/{subscriptionId})
+    // ---------------------------------------------------------
+    // Created and managed ONLY by the verified staging owner UID / trusted backend.
+    match /subscriptions/{subscriptionId} {
+      allow read: if (isAuthenticated() && resource.data.userId == request.auth.uid) || isOwnerAccount();
+      allow create, update, delete: if isOwnerAccount();
+    }
+
+    // ---------------------------------------------------------
+    // 5. EXAMINATIONS (/exams/{examId})
+    // ---------------------------------------------------------
+    // Free exams readable by all; Paid exams require active Pro subscription or Owner Admin.
+    match /exams/{examId} {
+      allow get: if resource == null ||
+                    !('isPaid' in resource.data) ||
+                    resource.data.isPaid == false ||
+                    hasActiveSubscription();
+      allow list: if !('isPaid' in resource.data) ||
+                     resource.data.isPaid == false ||
+                     hasActiveSubscription();
+      allow write: if isOwnerAccount();
+    }
+
+    // ---------------------------------------------------------
+    // 6. QUESTION BANK, ANSWER KEYS & SYLLABUS
+    // ---------------------------------------------------------
+    match /subjects/{subjectId} {
+      allow read: if true;
+      allow write: if isOwnerAccount();
+    }
+
+    // Public Firestore reads disabled on raw question docs so legacy embedded keys cannot leak;
+    // sanitized questions are served via the trusted backend /api/questions endpoint.
+    match /questions/{questionId} {
+      allow read, write: if isOwnerAccount();
+    }
+
+    // Restricted answer keys & explanations (Backend / Staging Owner Admin only)
+    match /questionKeys/{questionId} {
+      allow read, write: if isOwnerAccount();
+    }
+
+    // Decommissioned collections locked from client access
+    match /previous_questions/{questionId} {
+      allow read, write: if false;
+    }
+
+    match /previousQuestionKeys/{questionId} {
+      allow read, write: if false;
+    }
+
+    // ---------------------------------------------------------
+    // 7. EXAM ATTEMPTS & RESULTS (Trusted Backend / Owner Only Writes)
+    // ---------------------------------------------------------
+    match /examAttempts/{attemptId} {
+      allow read: if isOwner(resource.data.userId) || isOwnerAccount();
+      allow create, update, delete: if isOwnerAccount();
+    }
+
+    match /examResults/{resultId} {
+      allow read: if isOwner(resource.data.userId) || isOwnerAccount();
+      allow create, update, delete: if isOwnerAccount();
+    }
+
+    // ---------------------------------------------------------
+    // 8. LEADERBOARD (Public merit list; Server-Authoritative Writes)
+    // ---------------------------------------------------------
+    match /leaderboard/{entryId} {
+      allow read: if true;
+      allow create, update, delete: if isOwnerAccount();
+    }
+
+    // ---------------------------------------------------------
+    // 9. SESSIONS, RATE LIMITS, PACKAGES, CONFIG & AUDIT LOGS
+    // ---------------------------------------------------------
+    match /sessions/{sessionId} {
+      allow read, write: if false;
+    }
+
+    match /userSessions/{userId} {
+      allow read, write: if false;
+    }
+
+    match /rateLimits/{bucketId} {
+      allow read, write: if false;
+    }
+
+    match /packages/{packageId} {
+      allow read: if true;
+      allow write: if isOwnerAccount();
+    }
+
+    match /config/{configId} {
+      allow read: if true;
+      allow write: if isOwnerAccount();
+    }
+
+    match /auditLogs/{logId} {
+      allow read: if isOwnerAccount();
+      allow create, update, delete: if false;
+    }
+  }
+}

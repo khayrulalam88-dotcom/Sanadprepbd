@@ -251,12 +251,13 @@ export async function probeFirestoreAdminConnectivity(db: Firestore = adminDb): 
     return persistenceState;
   }
 
+  const probeTimeoutMs = isProd ? 6000 : 2000;
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const timeoutPromise = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => {
-        reject(new Error('PERMISSION_DENIED_TIMEOUT: Firestore Admin probe timed out after 2000ms'));
-      }, 2000);
+        reject(new Error(`PERMISSION_DENIED_TIMEOUT: Firestore Admin probe timed out after ${probeTimeoutMs}ms`));
+      }, probeTimeoutMs);
       if (typeof timer.unref === 'function') timer.unref();
     });
 
@@ -286,6 +287,37 @@ export async function probeFirestoreAdminConnectivity(db: Firestore = adminDb): 
     if (timer) clearTimeout(timer);
   }
   return persistenceState;
+}
+
+let inFlightProdProbe: Promise<PersistenceState> | null = null;
+let lastProdProbeAttemptMs = 0;
+
+export async function ensureProductionFirestoreReady(
+  db: Firestore = adminDb,
+  minRetryIntervalMs = 15_000
+): Promise<PersistenceState> {
+  if (process.env.NODE_ENV !== 'production') {
+    return persistenceState;
+  }
+  if (persistenceState.mode === 'firestore') {
+    return persistenceState;
+  }
+  if (!assertExpectedNamedDatabase(db).valid) {
+    persistenceState.mode = 'unavailable';
+    return persistenceState;
+  }
+  const now = Date.now();
+  if (inFlightProdProbe) {
+    return inFlightProdProbe;
+  }
+  if (now - lastProdProbeAttemptMs < minRetryIntervalMs) {
+    return persistenceState;
+  }
+  lastProdProbeAttemptMs = now;
+  inFlightProdProbe = probeFirestoreAdminConnectivity(db).finally(() => {
+    inFlightProdProbe = null;
+  });
+  return inFlightProdProbe;
 }
 
 // Initial authoritative question bank store loaded ONLY on backend

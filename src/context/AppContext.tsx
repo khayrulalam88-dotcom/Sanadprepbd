@@ -49,13 +49,16 @@ import {
   fetchSubscriptionsFromFirestore,
   fetchExamResultsFromFirestore,
   fetchLeaderboardFromFirestore,
-  fetchUserProfileFromFirestore,
+  fetchUserProfileStatusFromFirestore,
   saveUserProfileToFirestore,
   updateUserRoleOrSubscriptionInFirestore
 } from '../lib/firestoreService';
+import { ensureUserProfileInitialized } from '../lib/profileHelpers';
+import { ExamAnswerBatcher } from '../lib/examAnswerBatcher';
 import {
   setApiSessionId,
   apiFetchPublicCatalog,
+  apiFetchSubjectQuestionCounts,
   apiFetchExams,
   apiFetchLeaderboard,
   apiCreateSession,
@@ -76,11 +79,14 @@ import {
   apiAdminDeleteQuestion,
   apiAdminSaveExam,
   apiAdminFetchSubscriptions,
+  apiAdminFetchDashboardStats,
+  apiAdminFetchAuditLogs,
   apiAdminUpdateUser,
   apiAdminUpdatePackage,
   apiAdminUpdateExamConfig,
   apiAdminUpdatePaymentSettings,
-  apiAdminUpdateSupportSettings
+  apiAdminUpdateSupportSettings,
+  type AdminDashboardStatsResponse
 } from '../lib/api';
 import {
   submitPaymentViaAuthoritativeBackend,
@@ -99,6 +105,16 @@ interface AppContextType {
   // Data
   subjects: Subject[];
   questions: Question[];
+  subjectQuestionCounts: Record<string, number>;
+  totalQuestionCount: number;
+  loadMoreSubjectQuestions: (subjectId: string) => Promise<void>;
+  getSubjectLoadState: (subjectId: string) => {
+    loadedCount: number;
+    total: number;
+    hasMore: boolean;
+    loading: boolean;
+  };
+  adminDashboardStats: AdminDashboardStatsResponse | null;
   exams: Exam[];
   examResults: ExamResult[];
   paymentRequests: PaymentRequest[];
@@ -122,7 +138,7 @@ interface AppContextType {
     userId: string;
     subscriptionId?: string;
     name: string;
-    email: string;
+    email?: string;
     phone: string;
     role: UserRole;
     subscriptionStatus: 'free' | 'pro' | 'expired';
@@ -462,6 +478,43 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const activeSyncRef = useRef<{ uid: string; promise: Promise<void> } | null>(null);
   const questionsLoadedModeRef = useRef<'none' | 'sanitized' | 'admin'>('none');
   const questionsFetchInFlightRef = useRef<{ mode: 'sanitized' | 'admin'; promise: Promise<void> } | null>(null);
+  const [subjectQuestionCounts, setSubjectQuestionCounts] = useState<Record<string, number>>({});
+  const [totalQuestionCount, setTotalQuestionCount] = useState<number>(0);
+  const [subjectPagination, setSubjectPagination] = useState<
+    Record<string, { loadedCount: number; total: number; hasMore: boolean; loading: boolean }>
+  >({});
+  const subjectLoadedMetaRef = useRef<
+    Record<string, { nextOffset: number; total: number; hasMore: boolean; initialized: boolean }>
+  >({});
+  const subjectFetchInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
+  const [adminDashboardStats, setAdminDashboardStats] = useState<AdminDashboardStatsResponse | null>(null);
+  const activeAttemptRef = useRef<ExamAttempt | null>(activeAttempt);
+  const handleSessionRevokedRef = useRef<(reason: string) => void>(() => {});
+  const examBatcherRef = useRef<ExamAnswerBatcher | null>(null);
+
+  if (!examBatcherRef.current) {
+    examBatcherRef.current = new ExamAnswerBatcher({
+      saveFn: async (snapshot) => apiSaveExamAnswer(snapshot),
+      debounceMs: 2500,
+      maxWaitMs: 10000,
+      maxRetries: 3,
+      retryBaseDelayMs: 1000,
+      onLockedError: ({ code, message }) => {
+        if (code === 'SESSION_REVOKED') {
+          handleSessionRevokedRef.current(
+            message || 'একই অ্যাকাউন্ট অন্য ডিভাইস থেকে লগইন করা হয়েছে। নিরাপত্তা বিধির কারণে এই সেশনটি বন্ধ করা হয়েছে।'
+          );
+        } else if (code === 'ALREADY_SUBMITTED') {
+          setExamLaunchError(
+            message || 'এই পরীক্ষাটি ইতিমধ্যে জমা দেওয়া হয়েছে। আর উত্তর পরিবর্তন করা যাবে না।'
+          );
+        }
+      },
+      onTransientError: (err) => {
+        console.warn('Exam answer batched auto-save notice:', err);
+      }
+    });
+  }
 
   // Student's Answered Questions Ledger for Subject Practice Completion Progress
   const [answeredQuestions, setAnsweredQuestions] = useState<Record<string, AnsweredQuestionRecord>>(() => {
@@ -485,6 +538,17 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       return null;
     }
   };
+
+  const updateQuestionCountsFromPool = useCallback((pool: Question[]) => {
+    const counts: Record<string, number> = {};
+    for (const q of pool) {
+      if (q.subjectId) {
+        counts[q.subjectId] = (counts[q.subjectId] || 0) + 1;
+      }
+    }
+    setSubjectQuestionCounts(prev => ({ ...prev, ...counts }));
+    setTotalQuestionCount(pool.length);
+  }, []);
 
   const ensureQuestionsLoaded = useCallback(async () => {
     const fbUser = auth?.currentUser;
@@ -512,11 +576,13 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           const adminQRes = await apiFetchAdminQuestions();
           if (adminQRes.ok && adminQRes.data?.questions?.length) {
             setQuestions(adminQRes.data.questions);
+            updateQuestionCountsFromPool(adminQRes.data.questions);
             questionsLoadedModeRef.current = 'admin';
           } else if (!isProdEnv) {
             const fsQ = await fetchQuestionsFromFirestore();
             if (fsQ.length > 0) {
               setQuestions(fsQ);
+              updateQuestionCountsFromPool(fsQ);
               questionsLoadedModeRef.current = 'admin';
             }
           }
@@ -524,6 +590,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           const qRes = await apiFetchSanitizedQuestions();
           if (qRes.ok && qRes.data?.questions?.length) {
             setQuestions(qRes.data.questions);
+            updateQuestionCountsFromPool(qRes.data.questions);
             questionsLoadedModeRef.current = 'sanitized';
           }
         }
@@ -539,7 +606,160 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     });
     questionsFetchInFlightRef.current = { mode: desiredMode, promise };
     return promise;
-  }, []);
+  }, [updateQuestionCountsFromPool]);
+
+  const ensureSubjectQuestionsLoaded = useCallback(
+    async (subjectId: string, opts?: { loadNextPage?: boolean }) => {
+      const cleanSubjectId = subjectId.trim();
+      if (!cleanSubjectId) return;
+
+      const fbUser = auth?.currentUser;
+      if (!fbUser || !fbUser.emailVerified) return;
+      if (questionsLoadedModeRef.current === 'admin') return;
+
+      const loadNext = Boolean(opts?.loadNextPage);
+      const currentMeta = subjectLoadedMetaRef.current[cleanSubjectId];
+
+      if (!loadNext && currentMeta?.initialized) {
+        return;
+      }
+      if (loadNext && currentMeta && !currentMeta.hasMore) {
+        return;
+      }
+
+      const existingPromise = subjectFetchInFlightRef.current.get(cleanSubjectId);
+      if (existingPromise) {
+        await existingPromise;
+        if (!loadNext) return;
+      }
+
+      const offset = loadNext && currentMeta ? currentMeta.nextOffset : 0;
+      const pageSize = 100;
+
+      const runSubjectFetch = async () => {
+        setSubjectPagination(prev => ({
+          ...prev,
+          [cleanSubjectId]: {
+            loadedCount: prev[cleanSubjectId]?.loadedCount ?? offset,
+            total: prev[cleanSubjectId]?.total ?? (subjectQuestionCounts[cleanSubjectId] || 0),
+            hasMore: prev[cleanSubjectId]?.hasMore ?? true,
+            loading: true
+          }
+        }));
+
+        try {
+          const qRes = await apiFetchSanitizedQuestions({
+            subjectId: cleanSubjectId,
+            limit: pageSize,
+            offset
+          });
+
+          if (qRes.ok && qRes.data) {
+            const fetched = qRes.data.questions || [];
+            const total =
+              typeof qRes.data.total === 'number'
+                ? qRes.data.total
+                : Math.max(offset + fetched.length, subjectQuestionCounts[cleanSubjectId] || 0);
+            const nextOffset = offset + fetched.length;
+            const hasMore =
+              typeof qRes.data.hasMore === 'boolean'
+                ? qRes.data.hasMore
+                : nextOffset < total && fetched.length > 0;
+
+            if (fetched.length > 0) {
+              const isOwner = isVerifiedOwnerAccount(auth?.currentUser);
+              setQuestions(prev => {
+                const map = new Map<string, Question>();
+                prev.forEach(q => map.set(q.id, q));
+                fetched.forEach(sq => {
+                  const existing = map.get(sq.id);
+                  map.set(sq.id, existing && isOwner ? { ...sq, ...existing } : sq);
+                });
+                return Array.from(map.values());
+              });
+            }
+
+            subjectLoadedMetaRef.current[cleanSubjectId] = {
+              nextOffset,
+              total,
+              hasMore,
+              initialized: true
+            };
+
+            setSubjectQuestionCounts(prev => {
+              const nextCounts = { ...prev, [cleanSubjectId]: total };
+              const summed = Object.values(nextCounts).reduce((acc, n) => acc + n, 0);
+              setTotalQuestionCount(prevTotal => Math.max(prevTotal, summed));
+              return nextCounts;
+            });
+
+            setSubjectPagination(prev => ({
+              ...prev,
+              [cleanSubjectId]: {
+                loadedCount: nextOffset,
+                total,
+                hasMore,
+                loading: false
+              }
+            }));
+          } else {
+            setSubjectPagination(prev => ({
+              ...prev,
+              [cleanSubjectId]: {
+                loadedCount: prev[cleanSubjectId]?.loadedCount ?? offset,
+                total: prev[cleanSubjectId]?.total ?? (subjectQuestionCounts[cleanSubjectId] || 0),
+                hasMore: false,
+                loading: false
+              }
+            }));
+          }
+        } catch (err) {
+          console.warn('Subject question page load notice:', err);
+          setSubjectPagination(prev => ({
+            ...prev,
+            [cleanSubjectId]: {
+              loadedCount: prev[cleanSubjectId]?.loadedCount ?? offset,
+              total: prev[cleanSubjectId]?.total ?? (subjectQuestionCounts[cleanSubjectId] || 0),
+              hasMore: prev[cleanSubjectId]?.hasMore ?? false,
+              loading: false
+            }
+          }));
+        }
+      };
+
+      const promise = runSubjectFetch().finally(() => {
+        if (subjectFetchInFlightRef.current.get(cleanSubjectId) === promise) {
+          subjectFetchInFlightRef.current.delete(cleanSubjectId);
+        }
+      });
+      subjectFetchInFlightRef.current.set(cleanSubjectId, promise);
+      return promise;
+    },
+    [subjectQuestionCounts]
+  );
+
+  const loadMoreSubjectQuestions = useCallback(
+    async (subjectId: string) => {
+      await ensureSubjectQuestionsLoaded(subjectId, { loadNextPage: true });
+    },
+    [ensureSubjectQuestionsLoaded]
+  );
+
+  const getSubjectLoadState = useCallback(
+    (subjectId: string) => {
+      const pag = subjectPagination[subjectId];
+      if (pag) return pag;
+      const loaded = questions.filter(q => q.subjectId === subjectId).length;
+      const total = Math.max(loaded, subjectQuestionCounts[subjectId] || 0);
+      return {
+        loadedCount: loaded,
+        total,
+        hasMore: total > loaded && questionsLoadedModeRef.current !== 'admin',
+        loading: false
+      };
+    },
+    [subjectPagination, questions, subjectQuestionCounts]
+  );
 
   const syncAuthenticatedUserData = useCallback(
     async (
@@ -636,13 +856,22 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           setSessionRevokedReason('');
 
           // 2. Fetch payments, subscriptions (owner ledger or student active subscription from session),
-          //    exam results, and exams via authoritative backend APIs (avoiding redundant Firestore dual-reads).
-          //    The 3,000-question bank is lazy-loaded only when the user opens a question-bank/practice view.
-          const [apiPaymentsRes, apiSubsRes, apiResultsRes, apiExamsRes] = await Promise.all([
+          //    exam results, exams, and Owner-only dashboard stats/audit logs via authoritative backend APIs.
+          //    The 3,000-question bank is lazy-loaded only when needed.
+          const [
+            apiPaymentsRes,
+            apiSubsRes,
+            apiResultsRes,
+            apiExamsRes,
+            apiAdminStatsRes,
+            apiAdminAuditRes
+          ] = await Promise.all([
             apiFetchPaymentRequests(),
             isOwner ? apiAdminFetchSubscriptions() : Promise.resolve(null),
             apiFetchExamResults(uid),
-            apiFetchExams()
+            apiFetchExams(),
+            isOwner ? apiAdminFetchDashboardStats() : Promise.resolve(null),
+            isOwner ? apiAdminFetchAuditLogs() : Promise.resolve(null)
           ]);
 
           const mergedPayments = apiPaymentsRes.ok
@@ -667,6 +896,27 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
             (a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime()
           );
           setExamResults(mergedResults);
+
+          if (isOwner) {
+            if (apiAdminStatsRes?.ok && apiAdminStatsRes.data) {
+              setAdminDashboardStats(apiAdminStatsRes.data);
+            }
+            if (apiAdminAuditRes?.ok && apiAdminAuditRes.data?.auditLogs?.length) {
+              const serverLogs = apiAdminAuditRes.data.auditLogs;
+              setAuditLogs(prev => {
+                const map = new Map<string, AuditLog>();
+                serverLogs.forEach(item => map.set(item.id, item));
+                prev.forEach(item => {
+                  if (!map.has(item.id)) map.set(item.id, item);
+                });
+                return Array.from(map.values())
+                  .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+                  .slice(0, 200);
+              });
+            }
+          } else {
+            setAdminDashboardStats(null);
+          }
 
           const hasActiveSub = mergedSubs.some(
             s => s.userId === uid && s.status === 'active' && new Date(s.expiresAt).getTime() > Date.now()
@@ -730,31 +980,32 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       const isOwner = isVerifiedOwnerAccount(fbUser);
       const isAdmin = isOwner;
       const resolvedName = fbUser.displayName || candidateName || (isOwner ? 'মো: খাইরুল আলম' : 'শিক্ষার্থী');
-      const effectiveRole: UserRole = isAdmin ? 'admin' : 'student';
 
-      let existingProfile: UserProfile | null = null;
-      if (fbUser.emailVerified) {
-        existingProfile = await fetchUserProfileFromFirestore(uid);
-        if (!existingProfile) {
-          const newProfile: UserProfile = {
-            uid,
-            name: resolvedName,
-            email: resolvedEmail,
-            phone: fbUser.phoneNumber || '',
-            role: effectiveRole,
-            subscriptionStatus: 'free',
-            createdAt: new Date().toISOString()
+      let existingProfile: UserProfile;
+      if (fbUser.emailVerified || isOwner) {
+        const initRes = await ensureUserProfileInitialized({
+          authUser: fbUser,
+          candidateName: resolvedName,
+          fetchProfileStatus: fetchUserProfileStatusFromFirestore,
+          createProfile: async (docData) => {
+            await saveUserProfileToFirestore(docData);
+          },
+          updateOwnerRole: (targetUid) => updateUserRoleOrSubscriptionInFirestore(targetUid, { role: 'admin' })
+        });
+
+        if (!initRes.ok) {
+          await signOut(auth).catch(() => undefined);
+          setApiSessionId(null);
+          clearStoredActiveSession();
+          return {
+            success: false,
+            error:
+              language === 'bn'
+                ? 'অ্যাকাউন্ট প্রোফাইল তৈরি বা যাচাই করতে ব্যর্থ হয়েছে। অনুগ্রহ করে আবার চেষ্টা করুন।'
+                : `Failed to initialize user profile: ${initRes.error}`
           };
-          await saveUserProfileToFirestore(newProfile);
-          existingProfile = newProfile;
-        } else {
-          existingProfile = { ...existingProfile, role: effectiveRole };
-          if (isOwner && existingProfile.role !== 'admin') {
-            await updateUserRoleOrSubscriptionInFirestore(uid, { role: 'admin' }).catch(err =>
-              console.warn('Owner role sync notice:', err)
-            );
-          }
         }
+        existingProfile = initRes.profile;
       } else {
         existingProfile = {
           uid,
@@ -771,6 +1022,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       setIsVerifiedAdmin(isAdmin);
       setCurrentUser(existingProfile);
       setIsLoggedIn(true);
+      setExamLaunchError(null);
 
       if (!fbUser.emailVerified) {
         setApiSessionId(null);
@@ -830,6 +1082,29 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         const isOwner = isVerifiedOwnerAccount(fbUser);
         setIsVerifiedAdmin(isOwner);
         await fbUser.getIdToken(true);
+
+        const initRes = await ensureUserProfileInitialized({
+          authUser: fbUser,
+          candidateName: currentUser.name || fbUser.displayName || undefined,
+          fetchProfileStatus: fetchUserProfileStatusFromFirestore,
+          createProfile: async (docData) => {
+            await saveUserProfileToFirestore(docData);
+          },
+          updateOwnerRole: (targetUid) => updateUserRoleOrSubscriptionInFirestore(targetUid, { role: 'admin' })
+        });
+
+        if (!initRes.ok) {
+          return {
+            verified: true,
+            error:
+              language === 'bn'
+                ? 'ইমেইল ভেরিফাই হয়েছে, কিন্তু প্রোফাইল সংরক্ষণ করা যায়নি। পুনরায় চেষ্টা করুন।'
+                : `Email verified, but profile initialization failed: ${initRes.error}`
+          };
+        }
+
+        setCurrentUser(initRes.profile);
+        setExamLaunchError(null);
         await syncAuthenticatedUserData(fbUser, isOwner, { forceNewSession: true });
         setActiveScreen(isOwner ? 'admin' : 'dashboard');
       }
@@ -859,41 +1134,37 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       }
       const result = await signInWithPopup(auth, googleProvider);
       const fbUser = result.user;
-      const uid = fbUser.uid;
-      const email = fbUser.email || '';
-      const name = fbUser.displayName || 'ব্যবহারকারী';
-      const phone = fbUser.phoneNumber || '';
-
       const isOwner = isVerifiedOwnerAccount(fbUser);
       const isAdmin = isOwner;
-      const effectiveRole: UserRole = isAdmin ? 'admin' : 'student';
 
-      let existingProfile = await fetchUserProfileFromFirestore(uid);
-      if (!existingProfile) {
-        const newProfile: UserProfile = {
-          uid,
-          name,
-          email,
-          phone,
-          role: effectiveRole,
-          subscriptionStatus: 'free',
-          createdAt: new Date().toISOString()
+      const initRes = await ensureUserProfileInitialized({
+        authUser: fbUser,
+        candidateName: fbUser.displayName || 'ব্যবহারকারী',
+        fetchProfileStatus: fetchUserProfileStatusFromFirestore,
+        createProfile: async (docData) => {
+          await saveUserProfileToFirestore(docData);
+        },
+        updateOwnerRole: (targetUid) => updateUserRoleOrSubscriptionInFirestore(targetUid, { role: 'admin' })
+      });
+
+      if (!initRes.ok) {
+        await signOut(auth).catch(() => undefined);
+        setApiSessionId(null);
+        clearStoredActiveSession();
+        return {
+          success: false,
+          error:
+            language === 'bn'
+              ? 'গুগল সাইন-ইনের পর প্রোফাইল সংরক্ষণ করা যায়নি। অনুগ্রহ করে আবার চেষ্টা করুন।'
+              : `Google profile initialization failed: ${initRes.error}`
         };
-        await saveUserProfileToFirestore(newProfile);
-        existingProfile = newProfile;
-      } else {
-        existingProfile = { ...existingProfile, role: effectiveRole };
-        if (isOwner && existingProfile.role !== 'admin') {
-          await updateUserRoleOrSubscriptionInFirestore(uid, { role: 'admin' }).catch(err =>
-            console.warn('Owner role sync notice:', err)
-          );
-        }
       }
 
       setIsEmailVerified(Boolean(fbUser.emailVerified));
       setIsVerifiedAdmin(isAdmin);
-      setCurrentUser(existingProfile);
+      setCurrentUser(initRes.profile);
       setIsLoggedIn(true);
+      setExamLaunchError(null);
 
       await syncAuthenticatedUserData(fbUser, isAdmin, { forceNewSession: true });
 
@@ -922,6 +1193,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       }
     }
 
+    examBatcherRef.current?.reset();
+    activeAttemptRef.current = null;
     setApiSessionId(null);
     clearStoredActiveSession();
     setIsSessionRevoked(false);
@@ -932,6 +1205,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setCurrentUser(createGuestUserProfile());
     questionsLoadedModeRef.current = 'none';
     questionsFetchInFlightRef.current = null;
+    subjectLoadedMetaRef.current = {};
+    subjectFetchInFlightRef.current.clear();
+    setSubjectPagination({});
+    setAdminDashboardStats(null);
     setQuestions(INITIAL_QUESTIONS);
     setSubscriptions([]);
     setPaymentRequests([]);
@@ -976,12 +1253,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         const verified = Boolean(fbUser.emailVerified);
         const isOwner = isVerifiedOwnerAccount(fbUser);
         const isAdmin = isOwner;
-        const effectiveRole: UserRole = isAdmin ? 'admin' : 'student';
 
         setIsEmailVerified(verified);
         setIsVerifiedAdmin(isAdmin);
 
-        if (!verified) {
+        if (!verified && !isOwner) {
           setCurrentUser({
             uid,
             name,
@@ -998,35 +1274,47 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           return;
         }
 
-        const profile = await fetchUserProfileFromFirestore(uid);
+        const initRes = await ensureUserProfileInitialized({
+          authUser: fbUser,
+          candidateName: name,
+          fetchProfileStatus: fetchUserProfileStatusFromFirestore,
+          createProfile: async (docData) => {
+            await saveUserProfileToFirestore(docData);
+          },
+          updateOwnerRole: (targetUid) => updateUserRoleOrSubscriptionInFirestore(targetUid, { role: 'admin' })
+        });
 
-        if (profile) {
-          const verifiedProfile = { ...profile, role: effectiveRole };
-          if (isOwner && profile.role !== 'admin') {
-            updateUserRoleOrSubscriptionInFirestore(uid, { role: 'admin' }).catch(err =>
-              console.warn('Owner role sync notice:', err)
-            );
-          }
-          setCurrentUser(verifiedProfile);
-        } else {
-          const newProfile: UserProfile = {
+        if (!initRes.ok) {
+          console.error('Auth restore profile initialization error:', initRes.error);
+          setExamLaunchError(
+            language === 'bn'
+              ? 'প্রোফাইল তথ্য লোড বা তৈরি করা যায়নি। অনুগ্রহ করে পেজ রিলোড করে পুনরায় চেষ্টা করুন।'
+              : 'Failed to load or initialize your user profile. Please refresh and try again.'
+          );
+          setCurrentUser({
             uid,
             name,
             email,
             phone,
-            role: effectiveRole,
+            role: 'student',
             subscriptionStatus: 'free',
             createdAt: new Date().toISOString()
-          };
-          saveUserProfileToFirestore(newProfile).catch(err =>
-            console.warn('User profile bootstrap notice:', err)
-          );
-          setCurrentUser(newProfile);
+          });
+          setIsVerifiedAdmin(false);
+          setIsLoggedIn(false);
+          setApiSessionId(null);
+          clearStoredActiveSession();
+          setCurrentSession(null);
+          return;
         }
 
+        setCurrentUser(initRes.profile);
+        setExamLaunchError(null);
         setIsLoggedIn(true);
         await syncAuthenticatedUserData(fbUser, isAdmin, { forceNewSession: false });
       } else {
+        examBatcherRef.current?.reset();
+        activeAttemptRef.current = null;
         setApiSessionId(null);
         clearStoredActiveSession();
         setIsSessionRevoked(false);
@@ -1037,6 +1325,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         setCurrentUser(createGuestUserProfile());
         questionsLoadedModeRef.current = 'none';
         questionsFetchInFlightRef.current = null;
+        subjectLoadedMetaRef.current = {};
+        subjectFetchInFlightRef.current.clear();
+        setSubjectPagination({});
+        setAdminDashboardStats(null);
         setQuestions(INITIAL_QUESTIONS);
         setSubscriptions([]);
         setPaymentRequests([]);
@@ -1054,19 +1346,17 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     });
 
     return () => unsubscribe();
-  }, [syncAuthenticatedUserData]);
+  }, [language, syncAuthenticatedUserData]);
 
-  // Lazy-load the question bank only when an authenticated, verified session enters a question-consuming screen or search modal
+  // Lazy-load full question bank only for Owner Admin views, or paginated subject slice for Practice
   useEffect(() => {
     if (!isLoggedIn || !isEmailVerified || isSessionRevoked || !currentSession) return;
-    if (
-      activeScreen === 'practice' ||
-      activeScreen === 'question_bank' ||
-      activeScreen === 'subjects' ||
-      activeScreen === 'admin' ||
-      showSearchModal
-    ) {
-      void ensureQuestionsLoaded();
+    if (activeScreen === 'admin' || activeScreen === 'question_bank') {
+      if (isVerifiedOwnerAccount(auth?.currentUser)) {
+        void ensureQuestionsLoaded();
+      }
+    } else if (activeScreen === 'practice' && selectedSubjectForPractice) {
+      void ensureSubjectQuestionsLoaded(selectedSubjectForPractice.id);
     }
   }, [
     isLoggedIn,
@@ -1074,23 +1364,28 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     isSessionRevoked,
     currentSession,
     activeScreen,
-    showSearchModal,
-    ensureQuestionsLoaded
+    selectedSubjectForPractice,
+    ensureQuestionsLoaded,
+    ensureSubjectQuestionsLoaded
   ]);
 
-  // Synchronize public catalog with Backend API & Firestore on Mount
+  // Synchronize public catalog & subject question counts with Backend API & Firestore on Mount
   useEffect(() => {
     let isMounted = true;
     async function loadDatabaseData() {
       try {
         const [
-          examsRes,
-          packagesRes,
-          configRes,
-          paySettingsRes,
-          _subjectsRes,
-          leaderboardRes
-        ] = await apiFetchPublicCatalog();
+          [examsRes, packagesRes, configRes, paySettingsRes, _subjectsRes, leaderboardRes],
+          subjectCountsRes
+        ] = await Promise.all([
+          apiFetchPublicCatalog(),
+          apiFetchSubjectQuestionCounts()
+        ]);
+
+        if (isMounted && subjectCountsRes.ok && subjectCountsRes.data) {
+          setSubjectQuestionCounts(subjectCountsRes.data.counts || {});
+          setTotalQuestionCount(Number(subjectCountsRes.data.total || 0));
+        }
 
         if (isMounted && examsRes.ok && examsRes.data?.exams?.length) {
           setExams(examsRes.data.exams);
@@ -1304,13 +1599,15 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const handleAdminUnauthorized = () => setShowLoginModal(true);
-  const handleAdminSessionRevoked = (reason: string) => {
+  const handleAdminSessionRevoked = useCallback((reason: string) => {
+    examBatcherRef.current?.reset();
     setApiSessionId(null);
     clearStoredActiveSession();
     setCurrentSession(null);
     setIsSessionRevoked(true);
     setSessionRevokedReason(reason);
-  };
+  }, []);
+  handleSessionRevokedRef.current = handleAdminSessionRevoked;
 
   // Update Package (Verified Owner Admin only — Authoritative Backend API)
   const updatePackage = async (
@@ -1605,6 +1902,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       return [serverExam, ...prev];
     });
 
+    examBatcherRef.current?.reset();
+    activeAttemptRef.current = attempt;
     setActiveAttempt(attempt);
     setActiveScreen('exam');
 
@@ -1700,69 +1999,104 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     return { success: true, examId: persistedExam.id };
   };
 
+  useEffect(() => {
+    activeAttemptRef.current = activeAttempt;
+  }, [activeAttempt]);
+
+  // Flush pending exam answers safely when tab loses visibility or hides
+  useEffect(() => {
+    if (!activeAttempt || activeAttempt.status !== 'in_progress') return;
+    const attemptId = activeAttempt.id;
+    const handleFlush = () => {
+      if (document.visibilityState === 'hidden') {
+        void examBatcherRef.current?.flush(attemptId);
+      }
+    };
+    const handlePageHide = () => {
+      void examBatcherRef.current?.flush(attemptId);
+    };
+    document.addEventListener('visibilitychange', handleFlush);
+    window.addEventListener('pagehide', handlePageHide);
+    return () => {
+      document.removeEventListener('visibilitychange', handleFlush);
+      window.removeEventListener('pagehide', handlePageHide);
+    };
+  }, [activeAttempt?.id, activeAttempt?.status]);
+
   const saveActiveAnswer = (questionId: string, optionIndex: number) => {
-    if (isSessionRevoked) return;
-    setActiveAttempt(prev => {
-      if (!prev || prev.status !== 'in_progress') return prev;
-      const nextAnswers = { ...prev.answers, [questionId]: optionIndex };
-      apiSaveExamAnswer({
-        attemptId: prev.id,
-        answers: nextAnswers,
-        flaggedQuestionIds: prev.flaggedQuestionIds,
-        currentQuestionIndex: prev.currentQuestionIndex
-      }).catch(err => console.warn('Exam answer auto-save notice:', err));
-      return {
-        ...prev,
-        answers: nextAnswers,
-        lastSavedAt: new Date().toISOString()
-      };
+    if (isSessionRevoked || isSubmittingExam) return;
+    const prev = activeAttemptRef.current;
+    if (!prev || prev.status !== 'in_progress') return;
+
+    const nextAnswers = { ...prev.answers, [questionId]: optionIndex };
+    const nextAttempt: ExamAttempt = {
+      ...prev,
+      answers: nextAnswers,
+      lastSavedAt: new Date().toISOString()
+    };
+    activeAttemptRef.current = nextAttempt;
+    setActiveAttempt(nextAttempt);
+
+    examBatcherRef.current?.enqueue({
+      attemptId: nextAttempt.id,
+      answers: nextAttempt.answers,
+      flaggedQuestionIds: nextAttempt.flaggedQuestionIds,
+      currentQuestionIndex: nextAttempt.currentQuestionIndex
     });
   };
 
   const clearActiveAnswer = (questionId: string) => {
-    if (isSessionRevoked) return;
-    setActiveAttempt(prev => {
-      if (!prev || prev.status !== 'in_progress') return prev;
-      const updatedAnswers = { ...prev.answers };
-      delete updatedAnswers[questionId];
-      apiSaveExamAnswer({
-        attemptId: prev.id,
-        answers: updatedAnswers,
-        flaggedQuestionIds: prev.flaggedQuestionIds,
-        currentQuestionIndex: prev.currentQuestionIndex
-      }).catch(err => console.warn('Exam answer clear auto-save notice:', err));
-      return {
-        ...prev,
-        answers: updatedAnswers,
-        lastSavedAt: new Date().toISOString()
-      };
+    if (isSessionRevoked || isSubmittingExam) return;
+    const prev = activeAttemptRef.current;
+    if (!prev || prev.status !== 'in_progress') return;
+
+    const updatedAnswers = { ...prev.answers };
+    delete updatedAnswers[questionId];
+    const nextAttempt: ExamAttempt = {
+      ...prev,
+      answers: updatedAnswers,
+      lastSavedAt: new Date().toISOString()
+    };
+    activeAttemptRef.current = nextAttempt;
+    setActiveAttempt(nextAttempt);
+
+    examBatcherRef.current?.enqueue({
+      attemptId: nextAttempt.id,
+      answers: nextAttempt.answers,
+      flaggedQuestionIds: nextAttempt.flaggedQuestionIds,
+      currentQuestionIndex: nextAttempt.currentQuestionIndex
     });
   };
 
   const toggleFlagQuestion = (questionId: string) => {
-    setActiveAttempt(prev => {
-      if (!prev || prev.status !== 'in_progress') return prev;
-      const exists = prev.flaggedQuestionIds.includes(questionId);
-      const flagged = exists
-        ? prev.flaggedQuestionIds.filter(id => id !== questionId)
-        : [...prev.flaggedQuestionIds, questionId];
-      apiSaveExamAnswer({
-        attemptId: prev.id,
-        answers: prev.answers,
-        flaggedQuestionIds: flagged,
-        currentQuestionIndex: prev.currentQuestionIndex
-      }).catch(err => console.warn('Exam flag auto-save notice:', err));
-      return {
-        ...prev,
-        flaggedQuestionIds: flagged,
-        lastSavedAt: new Date().toISOString()
-      };
+    if (isSessionRevoked || isSubmittingExam) return;
+    const prev = activeAttemptRef.current;
+    if (!prev || prev.status !== 'in_progress') return;
+
+    const exists = prev.flaggedQuestionIds.includes(questionId);
+    const flagged = exists
+      ? prev.flaggedQuestionIds.filter(id => id !== questionId)
+      : [...prev.flaggedQuestionIds, questionId];
+    const nextAttempt: ExamAttempt = {
+      ...prev,
+      flaggedQuestionIds: flagged,
+      lastSavedAt: new Date().toISOString()
+    };
+    activeAttemptRef.current = nextAttempt;
+    setActiveAttempt(nextAttempt);
+
+    examBatcherRef.current?.enqueue({
+      attemptId: nextAttempt.id,
+      answers: nextAttempt.answers,
+      flaggedQuestionIds: nextAttempt.flaggedQuestionIds,
+      currentQuestionIndex: nextAttempt.currentQuestionIndex
     });
   };
 
   // Authoritative server-side exam submission & scoring (NO client-side score calculation)
   const submitExamAttempt = async (isAutoTimeout = false): Promise<ExamResult | null> => {
-    if (!activeAttempt || activeAttempt.status !== 'in_progress' || isSubmittingExam) {
+    const targetAttempt = activeAttemptRef.current || activeAttempt;
+    if (!targetAttempt || targetAttempt.status !== 'in_progress' || isSubmittingExam) {
       return null;
     }
 
@@ -1773,9 +2107,14 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
     setIsSubmittingExam(true);
     try {
-      const res = await apiSubmitExam(activeAttempt.id, activeAttempt.answers, isAutoTimeout);
+      await examBatcherRef.current?.flush(targetAttempt.id);
+      const latestAttempt = activeAttemptRef.current || targetAttempt;
+
+      const res = await apiSubmitExam(latestAttempt.id, latestAttempt.answers, isAutoTimeout);
       if (!res.ok || !res.data?.success || !res.data.result) {
-        if (res.code === 'SESSION_REVOKED') {
+        if (res.code === 'ALREADY_SUBMITTED') {
+          examBatcherRef.current?.markSubmitted(latestAttempt.id);
+        } else if (res.code === 'SESSION_REVOKED') {
           handleAdminSessionRevoked(
             res.message || 'একই অ্যাকাউন্ট অন্য ডিভাইস থেকে লগইন করা হয়েছে। উত্তর জমা নেওয়া সম্ভব নয়।'
           );
@@ -1787,6 +2126,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
       const { result: serverResult, leaderboardEntry } = res.data;
 
+      examBatcherRef.current?.markSubmitted(latestAttempt.id);
+      activeAttemptRef.current = null;
       setActiveAttempt(null);
       setExamResults(prev => [serverResult, ...prev.filter(r => r.id !== serverResult.id)]);
 
@@ -1865,7 +2206,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     if (sub) {
       setSelectedSubjectForPractice(sub);
       setActiveScreen('practice');
-      void ensureQuestionsLoaded();
+      void ensureSubjectQuestionsLoaded(sub.id);
       return { success: true };
     }
     return { success: false, reason: 'Subject not found' };
@@ -1912,14 +2253,16 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   const getSubjectProgress = useCallback((subjectId: string): SubjectPracticeProgress => {
     const subQuestions = questions.filter(q => q.subjectId === subjectId);
-    const totalQuestions = subQuestions.length > 0 ? subQuestions.length : 1;
+    const totalCountForSubject = Math.max(subQuestions.length, subjectQuestionCounts[subjectId] || 0);
+    const denominator = totalCountForSubject > 0 ? totalCountForSubject : 1;
+    const subQuestionIdSet = new Set(subQuestions.map(q => q.id));
+
     let answeredCount = 0;
     let correctCount = 0;
     let incorrectCount = 0;
 
-    for (const q of subQuestions) {
-      const record = answeredQuestions[q.id];
-      if (record) {
+    for (const [qId, record] of Object.entries(answeredQuestions) as [string, AnsweredQuestionRecord][]) {
+      if (record && (record.subjectId === subjectId || subQuestionIdSet.has(qId))) {
         answeredCount++;
         if (record.isCorrect) {
           correctCount++;
@@ -1929,19 +2272,19 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       }
     }
 
-    const percentage = Math.min(100, Math.round((answeredCount / totalQuestions) * 100));
+    const percentage = Math.min(100, Math.round((answeredCount / denominator) * 100));
     const accuracy = answeredCount > 0 ? Math.round((correctCount / answeredCount) * 100) : 0;
 
     return {
       subjectId,
-      totalQuestions: subQuestions.length,
+      totalQuestions: totalCountForSubject,
       answeredCount,
       correctCount,
       incorrectCount,
       percentage,
       accuracy
     };
-  }, [questions, answeredQuestions]);
+  }, [questions, answeredQuestions, subjectQuestionCounts]);
 
   const addQuestion = async (
     newQ: Omit<Question, 'id' | 'createdAt' | 'updatedAt'>
@@ -1965,7 +2308,13 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       return { success: false, error: res.error || 'প্রশ্ন সংরক্ষণ করা যায়নি।' };
     }
 
-    setQuestions(prev => [res.data!.question, ...prev]);
+    const savedQ = res.data.question;
+    setQuestions(prev => [savedQ, ...prev]);
+    setSubjectQuestionCounts(prev => ({
+      ...prev,
+      [savedQ.subjectId]: (prev[savedQ.subjectId] || 0) + 1
+    }));
+    setTotalQuestionCount(prev => (prev > 0 ? prev + 1 : prev));
     return { success: true };
   };
 
@@ -1988,6 +2337,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const deleteQuestion = async (id: string): Promise<{ success: boolean; error?: string }> => {
+    const targetQ = questions.find(q => q.id === id);
     const res = await executeAuthoritativeAdminApi({
       isVerifiedOwner: isVerifiedOwnerAccount(auth?.currentUser),
       operation: () => apiAdminDeleteQuestion(id),
@@ -2000,6 +2350,13 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
 
     setQuestions(prev => prev.filter(q => q.id !== id));
+    if (targetQ?.subjectId) {
+      setSubjectQuestionCounts(prev => ({
+        ...prev,
+        [targetQ.subjectId]: Math.max(0, (prev[targetQ.subjectId] || 0) - 1)
+      }));
+    }
+    setTotalQuestionCount(prev => Math.max(0, prev - 1));
     return { success: true };
   };
 
@@ -2287,7 +2644,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     userId: string;
     subscriptionId?: string;
     name: string;
-    email: string;
+    email?: string;
     phone: string;
     role: UserRole;
     subscriptionStatus: 'free' | 'pro' | 'expired';
@@ -2314,12 +2671,13 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
     const updatedUser = res.data.user;
     const persistedSub = res.data.subscription;
+    const updatedSubsList = res.data.updatedSubscriptions;
 
     if (params.userId === currentUser.uid) {
       setCurrentUser(prev => ({
         ...prev,
         name: updatedUser?.name ?? params.name,
-        email: updatedUser?.email ?? params.email,
+        email: updatedUser?.email || params.email || prev.email,
         phone: updatedUser?.phone ?? params.phone,
         role: updatedUser?.role ?? safeRole,
         subscriptionStatus: updatedUser?.subscriptionStatus ?? params.subscriptionStatus,
@@ -2339,13 +2697,27 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       }
     }
 
-    if (persistedSub) {
+    if (Array.isArray(updatedSubsList) && updatedSubsList.length > 0) {
+      const byId = new Map(updatedSubsList.map(item => [item.id, item]));
       setSubscriptions(prev => {
-        const exists = prev.some(s => s.id === persistedSub.id || s.userId === params.userId);
+        const mapped = prev.map(existing => byId.get(existing.id) || existing);
+        const existingIds = new Set(mapped.map(s => s.id));
+        const additions = updatedSubsList.filter(item => !existingIds.has(item.id));
+        return additions.length > 0 ? [...additions, ...mapped] : mapped;
+      });
+    } else if (persistedSub) {
+      const targetInactiveStatus: 'expired' | 'cancelled' =
+        params.subscriptionStatus === 'expired' ? 'expired' : 'cancelled';
+      setSubscriptions(prev => {
+        const exists = prev.some(s => s.id === persistedSub.id);
         if (exists) {
-          return prev.map(s =>
-            s.id === persistedSub.id || s.userId === params.userId ? persistedSub : s
-          );
+          return prev.map(s => {
+            if (s.id === persistedSub.id) return persistedSub;
+            if (params.subscriptionStatus !== 'pro' && s.userId === params.userId && s.status === 'active') {
+              return { ...s, status: targetInactiveStatus };
+            }
+            return s;
+          });
         }
         return [persistedSub, ...prev];
       });
@@ -2370,7 +2742,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       setCurrentSession(prev => prev ? {
         ...prev,
         userName: params.name,
-        userEmail: params.email,
+        userEmail: updatedUser?.email || params.email || prev.userEmail,
         status: params.isSessionRevoked ? 'revoked' : 'active'
       } : null);
     }
@@ -2401,6 +2773,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         updateUserProfile,
         subjects,
         questions,
+        subjectQuestionCounts,
+        totalQuestionCount,
+        loadMoreSubjectQuestions,
+        getSubjectLoadState,
+        adminDashboardStats,
         exams,
         examResults,
         paymentRequests,

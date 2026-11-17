@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useApp } from '../context/AppContext';
 import { auth, isVerifiedOwnerAccount } from '../lib/firebase';
 import { 
@@ -32,6 +32,8 @@ export const PracticeScreen: React.FC = () => {
     answeredQuestions,
     checkPracticeAnswer,
     getSubjectProgress,
+    loadMoreSubjectQuestions,
+    getSubjectLoadState,
     activeSubscription,
     calculateDaysRemaining,
     currentUser,
@@ -77,6 +79,37 @@ export const PracticeScreen: React.FC = () => {
 
   const currentSubject = selectedSubjectForPractice || (currentQ ? subjects.find(s => s.id === currentQ.subjectId) || null : null);
   const currentSubjectProgress = currentSubject ? getSubjectProgress(currentSubject.id) : null;
+  const subjectLoadState = currentSubject
+    ? getSubjectLoadState(currentSubject.id)
+    : { loadedCount: practiceQuestions.length, total: practiceQuestions.length, hasMore: false, loading: false };
+  const displayTotal = Math.max(practiceQuestions.length, subjectLoadState.total);
+
+  // Gate: Paid subscription requirement for Subject Practice
+  const isVerifiedAdmin = isVerifiedOwnerAccount(auth?.currentUser) && currentUser.role === 'admin';
+
+  useEffect(() => {
+    setCurrentIndex(0);
+  }, [selectedSubjectForPractice?.id]);
+
+  useEffect(() => {
+    if (!currentSubject || (!isSubscriptionActive && !isVerifiedAdmin)) return;
+    if (
+      subjectLoadState.hasMore &&
+      !subjectLoadState.loading &&
+      (practiceQuestions.length === 0 || currentIndex >= practiceQuestions.length - 10)
+    ) {
+      void loadMoreSubjectQuestions(currentSubject.id);
+    }
+  }, [
+    currentSubject,
+    isSubscriptionActive,
+    isVerifiedAdmin,
+    subjectLoadState.hasMore,
+    subjectLoadState.loading,
+    practiceQuestions.length,
+    currentIndex,
+    loadMoreSubjectQuestions
+  ]);
 
   const handleSelectOption = async (idx: number) => {
     if (!currentQ || isAnswered || checkingId === currentQ.id) return;
@@ -114,6 +147,8 @@ export const PracticeScreen: React.FC = () => {
   const handleNext = () => {
     if (currentIndex < practiceQuestions.length - 1) {
       setCurrentIndex(prev => prev + 1);
+    } else if (currentSubject && subjectLoadState.hasMore && !subjectLoadState.loading) {
+      void loadMoreSubjectQuestions(currentSubject.id);
     }
   };
 
@@ -126,8 +161,6 @@ export const PracticeScreen: React.FC = () => {
   const optionPrefixesBn = ['ক', 'খ', 'গ', 'ঘ'];
   const optionPrefixesEn = ['A', 'B', 'C', 'D'];
 
-  // Gate: Paid subscription requirement for Subject Practice
-  const isVerifiedAdmin = isVerifiedOwnerAccount(auth?.currentUser) && currentUser.role === 'admin';
   if (!isSubscriptionActive && !isVerifiedAdmin) {
     return (
       <div className="max-w-2xl mx-auto py-12 px-4">
@@ -329,7 +362,7 @@ export const PracticeScreen: React.FC = () => {
                     'Your previous pass has expired. Please renew your subscription to access all statutory questions and live mock tests.'
                   )
                 : t(
-                    `আপনি ১০টি ফ্রি ডেমো প্রশ্ন সম্পন্ন করেছেন। এই বিষয়ের বাকি ${practiceQuestions.length - 10}টি পেইড প্রশ্ন, বিস্তারিত আইনি ব্যাখ্যা ও গেজেট রেফারেন্স আনলক করতে মাসিক সাবস্ক্রিপশন বা এককালীন প্যাকেজ বেছে নিন।`,
+                    `আপনি ১০টি ফ্রি ডেমো প্রশ্ন সম্পন্ন করেছেন। এই বিষয়ের বাকি ${Math.max(0, displayTotal - 10)}টি পেইড প্রশ্ন, বিস্তারিত আইনি ব্যাখ্যা ও গেজেট রেফারেন্স আনলক করতে মাসিক সাবস্ক্রিপশন বা এককালীন প্যাকেজ বেছে নিন।`,
                     `You have completed 10 free demo questions. Select a monthly or one-time pass to unlock all remaining questions and statutory references.`
                   )}
             </p>
@@ -381,7 +414,7 @@ export const PracticeScreen: React.FC = () => {
                 {currentIndex + 1}
               </span>
               <span className="text-xs text-slate-500 font-semibold">
-                {currentIndex + 1} / {practiceQuestions.length}
+                {currentIndex + 1} / {displayTotal}
               </span>
               {currentQ.isDemoSample && (
                 <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-900">
@@ -497,15 +530,15 @@ export const PracticeScreen: React.FC = () => {
             </button>
 
             <span className="text-xs text-slate-400 font-medium">
-              {currentIndex + 1} / {practiceQuestions.length}
+              {currentIndex + 1} / {displayTotal}
             </span>
 
             <button
               onClick={handleNext}
-              disabled={currentIndex === practiceQuestions.length - 1}
+              disabled={currentIndex >= practiceQuestions.length - 1 && !subjectLoadState.hasMore}
               className="flex items-center gap-1.5 px-5 py-2 rounded-xl text-sm font-bold bg-[#102A43] text-[#D4AF37] border border-[#D4AF37] hover:bg-[#243B53] transition disabled:opacity-40 cursor-pointer"
             >
-              <span>{t('পরবর্তী', 'Next')}</span>
+              <span>{subjectLoadState.loading && currentIndex >= practiceQuestions.length - 1 ? t('লোড হচ্ছে...', 'Loading...') : t('পরবর্তী', 'Next')}</span>
               <ChevronRight className="w-4 h-4" />
             </button>
           </div>

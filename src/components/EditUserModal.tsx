@@ -1,6 +1,11 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useApp } from '../context/AppContext';
 import { OWNER_ADMIN_UID } from '../lib/firebase';
+import {
+  buildEditUserSubmitPayload,
+  formatDateToLocalDateTimeInput,
+  parseLocalDateTimeInputToMs
+} from '../lib/dateHelpers';
 import { 
   X, 
   UserCog, 
@@ -56,40 +61,50 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
   const [role, setRole] = useState<UserRole>(user.role || 'student');
   const [subscriptionStatus, setSubscriptionStatus] = useState<'free' | 'pro' | 'expired'>(user.subscriptionStatus || 'pro');
   const [packageId, setPackageId] = useState<string>(user.packageId || packages[0]?.id || 'pkg_pro_mock');
-  
-  // Format datetime-local string (YYYY-MM-DDTHH:mm)
-  const initialDateStr = user.expiresAt 
-    ? new Date(user.expiresAt).toISOString().slice(0, 16)
-    : new Date(Date.now() + 90 * 24 * 3600 * 1000).toISOString().slice(0, 16);
 
+  const initialDateStr = formatDateToLocalDateTimeInput(user.expiresAt);
   const [expiryDateInput, setExpiryDateInput] = useState<string>(initialDateStr);
   const [isSessionRevoked, setIsSessionRevoked] = useState<boolean>(user.isSessionRevoked || false);
   const [saving, setSaving] = useState<boolean>(false);
   const [successMsg, setSuccessMsg] = useState<string>('');
   const [errorMsg, setErrorMsg] = useState<string>('');
 
+  useEffect(() => {
+    setName(user.name || '');
+    setEmail(user.email || '');
+    setPhone(user.phone || '');
+    setRole(user.role || 'student');
+    setSubscriptionStatus(user.subscriptionStatus || 'pro');
+    setPackageId(user.packageId || packages[0]?.id || 'pkg_pro_mock');
+    setExpiryDateInput(formatDateToLocalDateTimeInput(user.expiresAt));
+    setIsSessionRevoked(user.isSessionRevoked || false);
+    setSuccessMsg('');
+    setErrorMsg('');
+  }, [user, packages]);
+
   if (!isOpen) return null;
 
-  // Calculate remaining days from current input date
+  // Calculate remaining days from current input date (parsed in local timezone)
   const getDaysRemaining = () => {
     try {
-      const targetTime = new Date(expiryDateInput).getTime();
+      const targetTime = parseLocalDateTimeInputToMs(expiryDateInput);
+      if (isNaN(targetTime)) return 0;
       const diff = targetTime - Date.now();
       return Math.max(0, Math.ceil(diff / (1000 * 60 * 60 * 24)));
-    } catch (e) {
+    } catch {
       return 0;
     }
   };
 
   const remainingDays = getDaysRemaining();
 
-  // Quick extend helper
+  // Quick extend helper using local calendar formatting
   const handleQuickExtend = (daysToAdd: number) => {
     try {
-      const currentTarget = new Date(expiryDateInput).getTime();
-      const baseTime = currentTarget > Date.now() ? currentTarget : Date.now();
+      const currentTarget = parseLocalDateTimeInputToMs(expiryDateInput);
+      const baseTime = !isNaN(currentTarget) && currentTarget > Date.now() ? currentTarget : Date.now();
       const newTarget = new Date(baseTime + daysToAdd * 24 * 3600 * 1000);
-      setExpiryDateInput(newTarget.toISOString().slice(0, 16));
+      setExpiryDateInput(formatDateToLocalDateTimeInput(newTarget));
       setSubscriptionStatus('pro');
     } catch (e) {
       console.warn('Error extending date:', e);
@@ -111,26 +126,40 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
       return;
     }
 
-    setSaving(true);
-
+    let payload: ReturnType<typeof buildEditUserSubmitPayload>;
     try {
       const selectedPkg = packages.find(p => p.id === packageId);
-      const isoExpiry = new Date(expiryDateInput).toISOString();
-
-      const result = await adminUpdateUser({
+      payload = buildEditUserSubmitPayload({
         userId: user.userId,
         subscriptionId: user.subscriptionId,
-        name: name.trim(),
-        email: email.trim(),
-        phone: phone.trim(),
+        name,
+        email,
+        initialEmail: user.email,
+        phone,
         role,
         subscriptionStatus,
         packageId,
         packageNameBn: selectedPkg?.nameBn || 'প্রো মডেল টেস্ট পাস',
         packageNameEn: selectedPkg?.nameEn || 'Pro Model Test Pass',
-        expiresAt: isoExpiry,
+        expiryDateInput,
+        initialDateInput: initialDateStr,
+        originalExpiresAtIso: user.expiresAt,
         isSessionRevoked
       });
+    } catch (validationErr: unknown) {
+      const errCode = validationErr instanceof Error ? validationErr.message : '';
+      if (errCode === 'INVALID_EMAIL_FORMAT') {
+        setErrorMsg(t('অনুগ্রহ করে সঠিক ইমেইল ঠিকানা প্রদান করুন', 'Please provide a valid email address'));
+        return;
+      }
+      setErrorMsg(t('মেয়াদোত্তীর্ণ তারিখ ও সময় সঠিক নয়', 'Invalid expiration date and time'));
+      return;
+    }
+
+    setSaving(true);
+
+    try {
+      const result = await adminUpdateUser(payload);
 
       if (result.success) {
         setSuccessMsg(t('ইউজার ও সাবস্ক্রিপশন সফলভাবে আপডেট করা হয়েছে!', 'User and subscription updated successfully!'));

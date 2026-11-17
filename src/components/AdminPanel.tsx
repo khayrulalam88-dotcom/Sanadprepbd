@@ -45,6 +45,7 @@ import { BulkImportModal } from './BulkImportModal';
 import { EditUserModal, EditableUserData } from './EditUserModal';
 import { AdminCreateExamModal } from './AdminCreateExamModal';
 import { auth, OWNER_ADMIN_UID, OWNER_ADMIN_EMAIL, isVerifiedOwnerAccount } from '../lib/firebase';
+import { buildManualQuestionInput } from '../lib/adminQuestionHelpers';
 
 export const AdminPanel: React.FC = () => {
   const { 
@@ -81,7 +82,8 @@ export const AdminPanel: React.FC = () => {
     simulateConcurrentLogin,
     recoverSession,
     auditLogs,
-    examResults
+    examResults,
+    adminDashboardStats
   } = useApp();
 
   const [activeTab, setActiveTab] = useState<'overview' | 'packages' | 'subscribers' | 'payments' | 'questions' | 'exams' | 'sessions' | 'audit'>('overview');
@@ -92,8 +94,10 @@ export const AdminPanel: React.FC = () => {
     subscriptions.forEach(s => s.userId && studentIds.add(s.userId));
     paymentRequests.forEach(p => p.userId && studentIds.add(p.userId));
     examResults.forEach(r => r.userId && studentIds.add(r.userId));
-    return studentIds.size;
-  }, [subscriptions, paymentRequests, examResults]);
+    return adminDashboardStats
+      ? Math.max(adminDashboardStats.totalStudents, studentIds.size)
+      : studentIds.size;
+  }, [adminDashboardStats, subscriptions, paymentRequests, examResults]);
 
   const activeSubscribers = React.useMemo(() => {
     const now = Date.now();
@@ -198,6 +202,7 @@ export const AdminPanel: React.FC = () => {
   const [newLegalReference, setNewLegalReference] = useState<string>('');
   const [newDifficulty, setNewDifficulty] = useState<QuestionDifficulty>('medium');
   const [newStatus, setNewStatus] = useState<QuestionStatus>('published');
+  const [newIsDemoSample, setNewIsDemoSample] = useState<boolean>(false);
 
   // Question search & filter
   const [questionSearch, setQuestionSearch] = useState<string>('');
@@ -375,7 +380,7 @@ export const AdminPanel: React.FC = () => {
 
     setIsSavingQuestion(true);
     try {
-      const res = await addQuestion({
+      const questionPayload = buildManualQuestionInput({
         subjectId: newSubjectId,
         questionBn: newQuestionBn,
         questionEn: newQuestionEn || newQuestionBn,
@@ -387,8 +392,9 @@ export const AdminPanel: React.FC = () => {
         legalReference: newLegalReference,
         difficulty: newDifficulty,
         status: newStatus,
-        isDemoSample: true
+        isDemoSample: newIsDemoSample
       });
+      const res = await addQuestion(questionPayload);
 
       if (!res.success) {
         setQuestionModalError(res.error || t('প্রশ্ন সংরক্ষণ ব্যর্থ হয়েছে।', 'Failed to save question.'));
@@ -403,6 +409,7 @@ export const AdminPanel: React.FC = () => {
       setNewExplanationBn('');
       setNewExplanationEn('');
       setNewLegalReference('');
+      setNewIsDemoSample(false);
       setShowAddQuestionModal(false);
       setAdminActionSuccess(t('নতুন প্রশ্ন সফলভাবে ডাটাবেজে সংরক্ষিত হয়েছে।', 'Question saved to backend.'));
     } finally {
@@ -1433,7 +1440,7 @@ export const AdminPanel: React.FC = () => {
                             userId: sub.userId,
                             subscriptionId: sub.id,
                             name: sub.studentName,
-                            email: sub.userId === currentUser.uid ? currentUser.email : '',
+                            email: sub.studentEmail || (sub.userId === currentUser.uid ? currentUser.email : ''),
                             phone: sub.studentPhone || '',
                             role: sub.userId === OWNER_ADMIN_UID ? 'admin' : 'student',
                             subscriptionStatus: !isExpired ? 'pro' : 'expired',
@@ -2598,6 +2605,26 @@ export const AdminPanel: React.FC = () => {
                 />
               </div>
 
+              <label className="flex items-start gap-2.5 p-3 rounded-xl bg-slate-50 border border-slate-200 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={newIsDemoSample}
+                  onChange={(e) => setNewIsDemoSample(e.target.checked)}
+                  className="mt-0.5 rounded border-slate-300 text-[#102A43] focus:ring-[#102A43]"
+                />
+                <span className="text-xs text-slate-700">
+                  <strong className="block text-[#102A43]">
+                    {t('ফ্রি ডেমো স্যাম্পল হিসেবে যুক্ত করুন (ঐচ্ছিক)', 'Include in Free Demo Sample Pool (Optional)')}
+                  </strong>
+                  <span className="text-[11px] text-slate-500">
+                    {t(
+                      'ডিফল্টভাবে নতুন প্রশ্ন পেইড প্রশ্নব্যাংকে (Pro) যুক্ত হয়। কেবল ফ্রি ট্রায়ালের জন্য নির্বাচিত প্রশ্নে টিক দিন।',
+                      'By default, newly created questions belong to the paid question bank (isDemoSample: false).'
+                    )}
+                  </span>
+                </span>
+              </label>
+
               <div className="flex items-center justify-end gap-3 pt-4 border-t border-slate-100">
                 <button
                   type="button"
@@ -2628,6 +2655,7 @@ export const AdminPanel: React.FC = () => {
       {/* Edit Active User Modal */}
       {showEditUserModal && selectedUserToEdit && (
         <EditUserModal
+          key={`${selectedUserToEdit.userId}_${selectedUserToEdit.subscriptionId || 'profile'}`}
           user={selectedUserToEdit}
           isOpen={showEditUserModal}
           onClose={() => {

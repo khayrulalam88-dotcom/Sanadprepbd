@@ -1,6 +1,7 @@
 import { auth } from './firebase';
 import { formatBackendApiError } from './securityHelpers';
 import type {
+  AuditLog,
   Exam,
   ExamAttempt,
   ExamDateConfig,
@@ -23,7 +24,26 @@ const rawBase =
     ? String(import.meta.env.VITE_API_BASE_URL).trim()
     : '';
 
-export const API_BASE_URL = rawBase.replace(/\/+$/, '');
+export function normalizeApiBaseUrl(raw: string): string {
+  if (!raw) return '';
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+      return parsed.origin + parsed.pathname.replace(/\/+$/, '');
+    }
+  } catch {
+    // Invalid URL format
+  }
+  return '';
+}
+
+export const API_BASE_URL = normalizeApiBaseUrl(rawBase);
+
+export function resolveApiRequestUrl(path: string, configuredBaseUrl: string = API_BASE_URL): string {
+  const normalizedBase = normalizeApiBaseUrl(configuredBaseUrl.trim());
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+  return `${normalizedBase}${normalizedPath}`;
+}
 
 export interface ApiResponse<T> {
   ok: boolean;
@@ -82,7 +102,7 @@ async function apiRequest<T>(
   }
 
   try {
-    const response = await fetch(`${API_BASE_URL}${path}`, {
+    const response = await fetch(resolveApiRequestUrl(path), {
       method,
       headers,
       body: body !== undefined ? JSON.stringify(body) : undefined
@@ -91,6 +111,11 @@ async function apiRequest<T>(
     const contentType = response.headers.get('content-type') || '';
     if (!contentType.includes('application/json')) {
       const nonJsonCode = response.status >= 500 ? `HTTP_${response.status}` : 'NON_JSON_RESPONSE';
+      if (contentType.includes('text/html')) {
+        console.error(
+          `[SanadPrep Frontend] ${path} returned HTML instead of JSON. Check same-origin Worker /api/* routing or VITE_API_BASE_URL.`
+        );
+      }
       return {
         ok: false,
         status: response.status,
@@ -159,6 +184,10 @@ export async function apiFetchPublicCatalog() {
 export async function apiFetchLeaderboard(examId?: string) {
   const qs = examId && examId !== 'all' ? `?examId=${encodeURIComponent(examId)}` : '';
   return apiRequest<{ leaderboard: LeaderboardEntry[] }>(`/api/leaderboard${qs}`);
+}
+
+export async function apiFetchSubjectQuestionCounts() {
+  return apiRequest<{ counts: Record<string, number>; total: number }>('/api/subjects/counts');
 }
 
 export async function apiFetchExams() {
@@ -231,6 +260,7 @@ export async function apiFetchSanitizedQuestions(params?: {
     total?: number;
     limit?: number | null;
     offset?: number;
+    hasMore?: boolean;
   }>(`/api/questions${qs}`, { requireAuth: true });
 }
 
@@ -379,7 +409,7 @@ export async function apiAdminUpdateUser(params: {
   userId: string;
   subscriptionId?: string;
   name: string;
-  email: string;
+  email?: string;
   phone: string;
   role: UserRole;
   subscriptionStatus: 'free' | 'pro' | 'expired';
@@ -389,14 +419,16 @@ export async function apiAdminUpdateUser(params: {
   expiresAt?: string;
   isSessionRevoked?: boolean;
 }) {
-  return apiRequest<{ success: boolean; user: UserProfile; subscription?: UserSubscription | null }>(
-    '/api/admin/users/update',
-    {
-      method: 'POST',
-      body: params,
-      requireAuth: true
-    }
-  );
+  return apiRequest<{
+    success: boolean;
+    user: UserProfile;
+    subscription?: UserSubscription | null;
+    updatedSubscriptions?: UserSubscription[];
+  }>('/api/admin/users/update', {
+    method: 'POST',
+    body: params,
+    requireAuth: true
+  });
 }
 
 export async function apiAdminUpdatePackage(pkg: Partial<SubscriptionPackage> & { id: string }) {
@@ -434,6 +466,29 @@ export async function apiAdminUpdateSupportSettings(settings: Partial<SupportCon
   return apiRequest<{ success: boolean; supportSettings: SupportContactSettings }>('/api/admin/support-settings', {
     method: 'POST',
     body: settings,
+    requireAuth: true
+  });
+}
+
+export interface AdminDashboardStatsResponse {
+  totalStudents: number;
+  activeSubscribers: number;
+  pendingPayments: number;
+  approvedPayments: number;
+  rejectedPayments: number;
+  expiredSubscriptions: number;
+  totalVerifiedRevenue: number;
+  totalExamsCompleted: number;
+}
+
+export async function apiAdminFetchDashboardStats() {
+  return apiRequest<AdminDashboardStatsResponse>('/api/admin/dashboard-stats', {
+    requireAuth: true
+  });
+}
+
+export async function apiAdminFetchAuditLogs() {
+  return apiRequest<{ auditLogs: AuditLog[] }>('/api/admin/audit-logs', {
     requireAuth: true
   });
 }

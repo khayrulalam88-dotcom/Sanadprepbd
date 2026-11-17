@@ -15,29 +15,120 @@ export interface FirebaseConfig {
   oAuthClientId?: string;
 }
 
-// Support environment variables with seamless fallback to firebase-applet-config.json
-const env = typeof import.meta !== 'undefined' && import.meta.env ? import.meta.env : {} as Record<string, string | undefined>;
-const envProjectId = env.VITE_FIREBASE_PROJECT_ID?.trim();
-const envDatabaseId = env.VITE_FIREBASE_DATABASE_ID?.trim();
-const resolvedProjectId = envProjectId || firebaseConfigJson.projectId;
-const resolvedDatabaseId =
-  envDatabaseId &&
-  envDatabaseId !== '(default)' &&
-  envDatabaseId !== resolvedProjectId &&
-  envDatabaseId !== firebaseConfigJson.projectId
-    ? envDatabaseId
-    : firebaseConfigJson.firestoreDatabaseId;
+export const PRODUCTION_FIREBASE_PROJECT_ID = 'galvanic-aviary-tzp2g';
+export const PRODUCTION_FIREBASE_DATABASE_ID =
+  'ai-studio-barcouncilmcqpre-9a5aecc8-3819-4aeb-b7e2-c6066b637cab';
+export const OWNER_ADMIN_UID = 'PjBRV7LAQ8cIwOdM3z474A16dWg2';
+export const OWNER_ADMIN_EMAIL = 'khayrulalam88@gmail.com';
 
-export const firebaseConfig: FirebaseConfig = {
-  projectId: resolvedProjectId,
-  appId: env.VITE_FIREBASE_APP_ID || firebaseConfigJson.appId,
-  apiKey: env.VITE_FIREBASE_API_KEY || firebaseConfigJson.apiKey,
-  authDomain: env.VITE_FIREBASE_AUTH_DOMAIN || firebaseConfigJson.authDomain,
-  firestoreDatabaseId: resolvedDatabaseId,
-  storageBucket: env.VITE_FIREBASE_STORAGE_BUCKET || firebaseConfigJson.storageBucket,
-  messagingSenderId: env.VITE_FIREBASE_MESSAGING_SENDER_ID || firebaseConfigJson.messagingSenderId,
-  measurementId: env.VITE_FIREBASE_MEASUREMENT_ID || firebaseConfigJson.measurementId || '',
-  oAuthClientId: env.VITE_FIREBASE_OAUTH_CLIENT_ID || firebaseConfigJson.oAuthClientId || '',
+// Support environment variables with strict production/staging isolation
+const env =
+  typeof import.meta !== 'undefined' && import.meta.env
+    ? (import.meta.env as Record<string, string | undefined>)
+    : ({} as Record<string, string | undefined>);
+
+export function isFrontendStagingEnvironment(
+  rawEnv: Record<string, string | undefined> = env
+): boolean {
+  const mode = (rawEnv.VITE_ENVIRONMENT || '').trim().toLowerCase();
+  return mode === 'staging';
+}
+
+export function resolveFrontendFirebaseConfig(
+  rawEnv: Record<string, string | undefined> = env,
+  fallbackConfig: typeof firebaseConfigJson = firebaseConfigJson
+): FirebaseConfig {
+  const isStaging = isFrontendStagingEnvironment(rawEnv);
+  const envProjectId = rawEnv.VITE_FIREBASE_PROJECT_ID?.trim() || '';
+  const envDatabaseId = rawEnv.VITE_FIREBASE_DATABASE_ID?.trim() || '';
+
+  if (!isStaging) {
+    if (envProjectId && envProjectId !== PRODUCTION_FIREBASE_PROJECT_ID) {
+      throw new Error(
+        `Configured VITE_FIREBASE_PROJECT_ID "${envProjectId}" is rejected in production mode.`
+      );
+    }
+
+    if (
+      envDatabaseId &&
+      envDatabaseId !== PRODUCTION_FIREBASE_DATABASE_ID &&
+      envDatabaseId !== PRODUCTION_FIREBASE_PROJECT_ID &&
+      envDatabaseId !== fallbackConfig.projectId
+    ) {
+      throw new Error(
+        `Configured VITE_FIREBASE_DATABASE_ID "${envDatabaseId}" does not match production database "${PRODUCTION_FIREBASE_DATABASE_ID}".`
+      );
+    }
+
+    return {
+      projectId: PRODUCTION_FIREBASE_PROJECT_ID,
+      appId: rawEnv.VITE_FIREBASE_APP_ID || fallbackConfig.appId,
+      apiKey: rawEnv.VITE_FIREBASE_API_KEY || fallbackConfig.apiKey,
+      authDomain: rawEnv.VITE_FIREBASE_AUTH_DOMAIN || fallbackConfig.authDomain,
+      firestoreDatabaseId: PRODUCTION_FIREBASE_DATABASE_ID,
+      storageBucket: rawEnv.VITE_FIREBASE_STORAGE_BUCKET || fallbackConfig.storageBucket,
+      messagingSenderId:
+        rawEnv.VITE_FIREBASE_MESSAGING_SENDER_ID || fallbackConfig.messagingSenderId,
+      measurementId: rawEnv.VITE_FIREBASE_MEASUREMENT_ID || fallbackConfig.measurementId || '',
+      oAuthClientId: rawEnv.VITE_FIREBASE_OAUTH_CLIENT_ID || fallbackConfig.oAuthClientId || ''
+    };
+  }
+
+  // Staging mode: NEVER fall back to production projectId or production named Firestore databaseId
+  if (!envProjectId) {
+    throw new Error('Staging build requires explicit VITE_FIREBASE_PROJECT_ID.');
+  }
+  if (envProjectId === PRODUCTION_FIREBASE_PROJECT_ID) {
+    throw new Error('Staging build cannot target production Firebase project.');
+  }
+  if (envDatabaseId === PRODUCTION_FIREBASE_DATABASE_ID || envDatabaseId === PRODUCTION_FIREBASE_PROJECT_ID) {
+    throw new Error(
+      'Staging build cannot fall back to or target the production named Firestore database.'
+    );
+  }
+
+  const resolvedDatabaseId =
+    envDatabaseId && envDatabaseId !== envProjectId ? envDatabaseId : '(default)';
+
+  return {
+    projectId: envProjectId,
+    appId: rawEnv.VITE_FIREBASE_APP_ID?.trim() || '',
+    apiKey: rawEnv.VITE_FIREBASE_API_KEY?.trim() || '',
+    authDomain: rawEnv.VITE_FIREBASE_AUTH_DOMAIN?.trim() || `${envProjectId}.firebaseapp.com`,
+    firestoreDatabaseId: resolvedDatabaseId,
+    storageBucket: rawEnv.VITE_FIREBASE_STORAGE_BUCKET?.trim() || `${envProjectId}.firebasestorage.app`,
+    messagingSenderId: rawEnv.VITE_FIREBASE_MESSAGING_SENDER_ID?.trim() || '',
+    measurementId: rawEnv.VITE_FIREBASE_MEASUREMENT_ID?.trim() || '',
+    oAuthClientId: rawEnv.VITE_FIREBASE_OAUTH_CLIENT_ID?.trim() || ''
+  };
+}
+
+export function resolveFrontendOwnerAdminUid(
+  rawEnv: Record<string, string | undefined> = env
+): string {
+  if (!isFrontendStagingEnvironment(rawEnv)) {
+    return OWNER_ADMIN_UID;
+  }
+  const rawStagingUid = rawEnv.VITE_STAGING_OWNER_ADMIN_UID?.trim() || '';
+  if (!rawStagingUid) {
+    return OWNER_ADMIN_UID;
+  }
+  if (/[\s,;|]/.test(rawStagingUid) || rawStagingUid.length > 128) {
+    return '';
+  }
+  return rawStagingUid;
+}
+
+let resolvedConfig: FirebaseConfig = {
+  projectId: '',
+  appId: '',
+  apiKey: '',
+  authDomain: '',
+  firestoreDatabaseId: '',
+  storageBucket: '',
+  messagingSenderId: '',
+  measurementId: '',
+  oAuthClientId: ''
 };
 
 let appInstance: FirebaseApp;
@@ -47,16 +138,18 @@ let isInitializedSuccessfully = false;
 let initError: string | null = null;
 
 try {
+  resolvedConfig = resolveFrontendFirebaseConfig(env, firebaseConfigJson);
+
   if (!getApps().length) {
-    appInstance = initializeApp(firebaseConfig);
+    appInstance = initializeApp(resolvedConfig);
   } else {
     appInstance = getApp();
   }
 
   authInstance = getAuth(appInstance);
 
-  if (firebaseConfig.firestoreDatabaseId && firebaseConfig.firestoreDatabaseId !== '(default)') {
-    firestoreInstance = getFirestore(appInstance, firebaseConfig.firestoreDatabaseId);
+  if (resolvedConfig.firestoreDatabaseId && resolvedConfig.firestoreDatabaseId !== '(default)') {
+    firestoreInstance = getFirestore(appInstance, resolvedConfig.firestoreDatabaseId);
   } else {
     firestoreInstance = getFirestore(appInstance);
   }
@@ -68,14 +161,15 @@ try {
   isInitializedSuccessfully = false;
 }
 
-export const OWNER_ADMIN_UID = 'PjBRV7LAQ8cIwOdM3z474A16dWg2';
-export const OWNER_ADMIN_EMAIL = 'khayrulalam88@gmail.com';
+export const firebaseConfig: FirebaseConfig = resolvedConfig;
 
 export function isVerifiedOwnerAccount(
-  user?: { uid?: string | null; email?: string | null; emailVerified?: boolean | null } | null
+  user?: { uid?: string | null; email?: string | null; emailVerified?: boolean | null } | null,
+  rawEnvOverride?: Record<string, string | undefined>
 ): boolean {
   if (!user || !user.uid || !user.email) return false;
-  if (user.uid !== OWNER_ADMIN_UID) return false;
+  const effectiveOwnerUid = resolveFrontendOwnerAdminUid(rawEnvOverride ?? env);
+  if (!effectiveOwnerUid || user.uid !== effectiveOwnerUid) return false;
   if (user.email.toLowerCase().trim() !== OWNER_ADMIN_EMAIL) return false;
   if (user.emailVerified !== true) return false;
   return true;

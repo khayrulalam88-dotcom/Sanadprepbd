@@ -6,6 +6,7 @@ export interface UserSubscription {
   id: string;
   userId: string;
   studentName: string;
+  studentEmail?: string;
   studentPhone: string;
   packageId: string;
   packageNameBn: string;

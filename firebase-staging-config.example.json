@@ -1,0 +1,12 @@
+{
+  "projectId": "sanad-prep-bd-staging",
+  "appId": "REPLACE_WITH_STAGING_WEB_APP_ID",
+  "apiKey": "REPLACE_WITH_STAGING_WEB_API_KEY",
+  "authDomain": "sanad-prep-bd-staging.firebaseapp.com",
+  "firestoreDatabaseId": "(default)",
+  "storageBucket": "sanad-prep-bd-staging.firebasestorage.app",
+  "messagingSenderId": "REPLACE_WITH_STAGING_PROJECT_NUMBER",
+  "measurementId": "",
+  "oAuthClientId": "REPLACE_WITH_STAGING_WEB_OAUTH_CLIENT_ID_IF_USING_GOOGLE_SIGNIN",
+  "recaptchaSiteKey": ""
+}

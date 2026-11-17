@@ -14,6 +14,11 @@ import {
   Timestamp
 } from 'firebase/firestore';
 import { db, auth, isVerifiedOwnerAccount } from './firebase.ts';
+import {
+  buildUserProfileDocument,
+  type FirestoreProfileLookupResult,
+  type ValidatedUserProfileCreateDoc
+} from './profileHelpers.ts';
 import type {
   Question,
   Exam,
@@ -543,40 +548,71 @@ export async function fetchUsersFromFirestore(): Promise<UserProfile[]> {
   }
 }
 
-export async function fetchUserProfileFromFirestore(uid: string): Promise<UserProfile | null> {
-  if (!db) return null;
+export async function fetchUserProfileStatusFromFirestore(uid: string): Promise<FirestoreProfileLookupResult> {
+  if (!db) {
+    return { status: 'error', error: 'FIRESTORE_UNAVAILABLE' };
+  }
   try {
     const docSnap = await getDoc(doc(db, 'users', uid));
     if (docSnap.exists()) {
-      return normalizeUserProfile(docSnap.id, docSnap.data());
+      return {
+        status: 'found',
+        profile: normalizeUserProfile(docSnap.id, docSnap.data())
+      };
     }
-    return null;
+    return { status: 'missing' };
   } catch (err) {
+    const message = err instanceof Error ? err.message : String(err || 'Failed to read user profile');
     console.warn('Fetch user profile from Firestore notice:', err);
-    return null;
+    return { status: 'error', error: message };
   }
+}
+
+export async function fetchUserProfileFromFirestore(uid: string): Promise<UserProfile | null> {
+  const res = await fetchUserProfileStatusFromFirestore(uid);
+  return res.status === 'found' ? res.profile : null;
 }
 
 export function isVerifiedOwnerAdmin(): boolean {
   return isVerifiedOwnerAccount(auth?.currentUser);
 }
 
-export async function saveUserProfileToFirestore(user: UserProfile): Promise<void> {
+export async function saveUserProfileToFirestore(user: UserProfile | ValidatedUserProfileCreateDoc): Promise<void> {
   if (!db) return;
-  const path = `users/${user.uid}`;
+  const authUser = auth?.currentUser;
+  if (!authUser || !authUser.uid) {
+    throw new Error('UNAUTHENTICATED_PROFILE_WRITE: Signed-in Firebase user is required.');
+  }
+  const targetUid = authUser.uid;
+  const path = `users/${targetUid}`;
   try {
-    await setDoc(doc(db, 'users', user.uid), {
-      name: user.name,
-      email: user.email,
-      phone: user.phone || '',
-      role: user.role,
-      subscriptionStatus: user.subscriptionStatus,
-      subscriptionExpiresAt: toFirestoreTimestamp(user.subscriptionExpiresAt),
-      activePackageId: user.activePackageId || null,
-      activePackageNameBn: user.activePackageNameBn || null,
-      activePackageNameEn: user.activePackageNameEn || null,
-      createdAt: user.createdAt || new Date().toISOString()
-    }, { merge: true });
+    const docRef = doc(db, 'users', targetUid);
+    const existingSnap = await getDoc(docRef);
+    const validatedCreateDoc = buildUserProfileDocument({
+      authUser,
+      profile: user
+    });
+
+    if (!existingSnap.exists()) {
+      await setDoc(docRef, validatedCreateDoc);
+      return;
+    }
+
+    // Document already exists: only update rule-allowed mutable fields cleanly
+    const existingData = existingSnap.data() || {};
+    const patch: Record<string, unknown> = {};
+    if (validatedCreateDoc.name && validatedCreateDoc.name !== existingData.name) {
+      patch.name = validatedCreateDoc.name;
+    }
+    if (validatedCreateDoc.phone !== (existingData.phone || '')) {
+      patch.phone = validatedCreateDoc.phone;
+    }
+    if (isVerifiedOwnerAccount(authUser) && existingData.role !== 'admin') {
+      patch.role = 'admin';
+    }
+    if (Object.keys(patch).length > 0) {
+      await updateDoc(docRef, patch);
+    }
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, path);
   }

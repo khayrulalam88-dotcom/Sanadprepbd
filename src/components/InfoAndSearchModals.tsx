@@ -1,5 +1,7 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { useApp } from '../context/AppContext';
+import { apiFetchSanitizedQuestions } from '../lib/api';
+import type { Question } from '../types';
 import { 
   X, 
   Search, 
@@ -22,6 +24,8 @@ export const InfoAndSearchModals: React.FC = () => {
     setShowInfoModal,
     subjects,
     questions,
+    isLoggedIn,
+    isEmailVerified,
     startSubjectPractice,
     setActiveScreen,
     language,
@@ -29,17 +33,57 @@ export const InfoAndSearchModals: React.FC = () => {
   } = useApp();
 
   const [searchQuery, setSearchQuery] = useState('');
+  const [remoteResults, setRemoteResults] = useState<Question[]>([]);
+  const [isSearchingServer, setIsSearchingServer] = useState(false);
 
-  // Search Results
+  useEffect(() => {
+    const trimmed = searchQuery.trim();
+    if (!showSearchModal || !isLoggedIn || !isEmailVerified || trimmed.length < 2) {
+      setRemoteResults([]);
+      setIsSearchingServer(false);
+      return;
+    }
+
+    let cancelled = false;
+    setIsSearchingServer(true);
+    const timer = setTimeout(async () => {
+      try {
+        const res = await apiFetchSanitizedQuestions({ search: trimmed, limit: 15 });
+        if (!cancelled && res.ok && res.data?.questions) {
+          setRemoteResults(res.data.questions);
+        }
+      } catch {
+        // fallback cleanly to local questions
+      } finally {
+        if (!cancelled) {
+          setIsSearchingServer(false);
+        }
+      }
+    }, 300);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [showSearchModal, isLoggedIn, isEmailVerified, searchQuery]);
+
+  // Search Results (server-filtered when authenticated, merged with locally loaded questions)
   const searchResults = useMemo(() => {
     if (!searchQuery.trim() || searchQuery.trim().length < 2) return [];
     const query = searchQuery.toLowerCase().trim();
-    return questions.filter(q => 
+    const localMatches = questions.filter(q => 
       q.questionBn.toLowerCase().includes(query) ||
+      (q.questionEn && q.questionEn.toLowerCase().includes(query)) ||
       (q.legalReference && q.legalReference.toLowerCase().includes(query)) ||
       (q.explanationBn && q.explanationBn.toLowerCase().includes(query))
-    ).slice(0, 10);
-  }, [searchQuery, questions]);
+    );
+    const map = new Map<string, Question>();
+    remoteResults.forEach(q => map.set(q.id, q));
+    localMatches.forEach(q => {
+      if (!map.has(q.id)) map.set(q.id, q);
+    });
+    return Array.from(map.values()).slice(0, 15);
+  }, [searchQuery, questions, remoteResults]);
 
   return (
     <>
@@ -106,6 +150,10 @@ export const InfoAndSearchModals: React.FC = () => {
                       )}
                     </div>
                   ))
+                ) : isSearchingServer ? (
+                  <p className="text-center text-slate-400 py-8 text-xs">
+                    {t('প্রশ্ন খোঁজা হচ্ছে...', 'Searching question bank...')}
+                  </p>
                 ) : (
                   <p className="text-center text-slate-400 py-8 text-xs">
                     {t('কোনো ফলাফল পাওয়া যায়নি। অন্য শব্দ দিয়ে খুঁজুন।', 'No matching questions found.')}

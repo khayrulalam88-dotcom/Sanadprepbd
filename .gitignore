@@ -9,6 +9,7 @@ firebase-debug.log*
 firestore-debug.log*
 .env*
 !.env.example
+!.env.staging.example
 .backup_*/
 *service-account*.json
 *firebase-adminsdk*.json

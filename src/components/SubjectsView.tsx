@@ -21,6 +21,7 @@ export const SubjectsView: React.FC = () => {
     t, 
     subjects, 
     questions, 
+    totalQuestionCount,
     startSubjectPractice, 
     exams, 
     startExam,
@@ -31,7 +32,7 @@ export const SubjectsView: React.FC = () => {
   } = useApp();
 
   // Calculate Overall Syllabus Completion Across All 7 Legal Subjects
-  const totalQuestionsAllSubjects = questions.length;
+  const totalQuestionsAllSubjects = Math.max(questions.length, totalQuestionCount);
   const answeredQuestionIds = Object.keys(answeredQuestions);
   const totalAnsweredAllSubjects = answeredQuestionIds.length;
   const overallPercentage = totalQuestionsAllSubjects > 0 
