@@ -20,6 +20,7 @@ import {
   OWNER_ADMIN_EMAIL,
   EXPECTED_FIREBASE_PROJECT_ID,
   EXPECTED_FIREBASE_DATABASE_ID,
+  resolveEffectiveDatabaseId,
   assertExpectedNamedDatabase,
   getConfiguredDatabaseInfo,
   invalidateQuestionBankCache,
@@ -2519,6 +2520,9 @@ describe('Sanad Prep BD – Master Remediation Security & Input Validation Suite
         EXPECTED_FIREBASE_DATABASE_ID,
         'ai-studio-barcouncilmcqpre-9a5aecc8-3819-4aeb-b7e2-c6066b637cab'
       );
+      assert.equal(resolveEffectiveDatabaseId(EXPECTED_FIREBASE_PROJECT_ID), EXPECTED_FIREBASE_DATABASE_ID);
+      assert.equal(resolveEffectiveDatabaseId(''), EXPECTED_FIREBASE_DATABASE_ID);
+      assert.equal(resolveEffectiveDatabaseId('(default)'), '(default)');
 
       const goodHealth = await fetch(`${url}/api/health`);
       assert.equal(goodHealth.status, 200);

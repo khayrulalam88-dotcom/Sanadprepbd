@@ -43,20 +43,6 @@ export function resolveWorkspacePath(...segments: string[]): string {
 
 export const OWNER_ADMIN_UID = 'PjBRV7LAQ8cIwOdM3z474A16dWg2';
 export const OWNER_ADMIN_EMAIL = 'khayrulalam88@gmail.com';
-export const EXPECTED_FIREBASE_PROJECT_ID = 'galvanic-aviary-tzp2g';
-export const EXPECTED_FIREBASE_DATABASE_ID =
-  'ai-studio-barcouncilmcqpre-9a5aecc8-3819-4aeb-b7e2-c6066b637cab';
-
-export const FIREBASE_PROJECT_ID =
-  (process.env.FIREBASE_PROJECT_ID || process.env.VITE_FIREBASE_PROJECT_ID || EXPECTED_FIREBASE_PROJECT_ID).trim() ||
-  EXPECTED_FIREBASE_PROJECT_ID;
-export const FIREBASE_DATABASE_ID =
-  (
-    process.env.FIREBASE_DATABASE_ID ||
-    process.env.VITE_FIREBASE_DATABASE_ID ||
-    EXPECTED_FIREBASE_DATABASE_ID
-  ).trim() || EXPECTED_FIREBASE_DATABASE_ID;
-
 function loadServerJson<T>(relativePath: string, fallback: T): T {
   try {
     const fullPath = resolveWorkspacePath(...relativePath.split('/'));
@@ -68,6 +54,39 @@ function loadServerJson<T>(relativePath: string, fallback: T): T {
   }
   return fallback;
 }
+
+const appletFirebaseConfig = loadServerJson<{ projectId?: string; firestoreDatabaseId?: string }>(
+  'firebase-applet-config.json',
+  {}
+);
+
+export const EXPECTED_FIREBASE_PROJECT_ID =
+  appletFirebaseConfig.projectId?.trim() || 'galvanic-aviary-tzp2g';
+export const EXPECTED_FIREBASE_DATABASE_ID =
+  appletFirebaseConfig.firestoreDatabaseId?.trim() ||
+  'ai-studio-barcouncilmcqpre-9a5aecc8-3819-4aeb-b7e2-c6066b637cab';
+
+export const FIREBASE_PROJECT_ID =
+  (process.env.FIREBASE_PROJECT_ID || process.env.VITE_FIREBASE_PROJECT_ID || EXPECTED_FIREBASE_PROJECT_ID).trim() ||
+  EXPECTED_FIREBASE_PROJECT_ID;
+
+export function resolveEffectiveDatabaseId(rawEnvDbId?: string): string {
+  const trimmed = (rawEnvDbId || '').trim();
+  if (!trimmed) {
+    return EXPECTED_FIREBASE_DATABASE_ID;
+  }
+  if (trimmed === FIREBASE_PROJECT_ID || trimmed === EXPECTED_FIREBASE_PROJECT_ID) {
+    console.warn(
+      `[SanadPrep Server] Ignoring FIREBASE_DATABASE_ID "${trimmed}" because it matches the Firebase Project ID; using named database "${EXPECTED_FIREBASE_DATABASE_ID}".`
+    );
+    return EXPECTED_FIREBASE_DATABASE_ID;
+  }
+  return trimmed;
+}
+
+export const FIREBASE_DATABASE_ID = resolveEffectiveDatabaseId(
+  process.env.FIREBASE_DATABASE_ID || process.env.VITE_FIREBASE_DATABASE_ID
+);
 
 export function initFirebaseAdminApp(): App {
   if (getAdminApps().length > 0) {
