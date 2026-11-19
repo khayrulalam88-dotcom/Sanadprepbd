@@ -1,5 +1,3 @@
-import { GoogleGenAI } from '@google/genai';
-
 export const DEFAULT_GEMINI_MODEL = 'gemini-4-hydrogen';
 
 const ALLOWED_GEMINI_MODELS = new Set<string>([
@@ -28,33 +26,12 @@ export function redactGeminiSecrets(input: string): string {
     .replace(/([?&](?:key|api_key|apiKey)=)[^&\s"']+/gi, '$1[REDACTED]');
 }
 
-function readServerGeminiApiKey(): string | null {
-  const raw = process.env.GEMINI_API_KEY;
-  if (!raw) return null;
-  const trimmed = raw.trim();
-  if (!trimmed || trimmed === 'MY_GEMINI_API_KEY') {
-    return null;
-  }
-  return trimmed;
-}
-
 export function isGeminiConfigured(): boolean {
-  return readServerGeminiApiKey() !== null;
+  return false;
 }
 
-export function getGeminiClient(): GoogleGenAI | null {
-  const apiKey = readServerGeminiApiKey();
-  if (!apiKey) {
-    return null;
-  }
-  return new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build'
-      }
-    }
-  });
+export function getGeminiClient(): null {
+  return null;
 }
 
 export interface ValidatedGeminiRequest {
@@ -176,7 +153,7 @@ export function normalizeGeminiError(err: unknown): {
   };
 }
 
-export async function generateGeminiText(params: {
+export async function generateGeminiText(_params: {
   prompt: unknown;
   systemInstruction?: unknown;
   model?: unknown;
@@ -184,45 +161,10 @@ export async function generateGeminiText(params: {
   | { ok: true; text: string; model: string }
   | { ok: false; status: number; code: string; message: string }
 > {
-  const validation = validateGeminiRequest(params);
-  if (!validation.valid) {
-    return {
-      ok: false,
-      status: validation.status || 400,
-      code: validation.code || 'INVALID_REQUEST',
-      message: validation.message || 'Invalid Gemini request.'
-    };
-  }
-
-  const client = getGeminiClient();
-  if (!client) {
-    return {
-      ok: false,
-      status: 503,
-      code: 'GEMINI_NOT_CONFIGURED',
-      message: 'Gemini API is not configured on the server (GEMINI_API_KEY missing).'
-    };
-  }
-
-  try {
-    const response = await client.models.generateContent({
-      model: validation.model!,
-      contents: validation.prompt!,
-      ...(validation.systemInstruction
-        ? { config: { systemInstruction: validation.systemInstruction } }
-        : {})
-    });
-    return {
-      ok: true,
-      text: (response.text ?? '').trim(),
-      model: validation.model!
-    };
-  } catch (err) {
-    const normalized = normalizeGeminiError(err);
-    console.error('[SanadPrep][Gemini]', normalized.code, redactGeminiSecrets(err instanceof Error ? err.message : String(err || '')));
-    return {
-      ok: false,
-      ...normalized
-    };
-  }
+  return {
+    ok: false,
+    status: 503,
+    code: 'GEMINI_DISABLED',
+    message: 'Gemini API integration is disabled in Sanad Prep BD.'
+  };
 }

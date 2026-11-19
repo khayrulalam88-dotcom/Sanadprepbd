@@ -35,6 +35,7 @@ import {
 } from '../server/services/firestoreBackend.ts';
 import {
   isGeminiConfigured,
+  getGeminiClient,
   validateGeminiRequest,
   normalizeGeminiError,
   redactGeminiSecrets,
@@ -1834,25 +1835,37 @@ describe('Sanad Prep BD – Stage 3 Frontend Security, Strict CORS & Deployment 
 });
 
 describe('Sanad Prep BD – Gemini API Key Security & Backend Isolation Suite', () => {
-  test('G1. Missing or placeholder GEMINI_API_KEY fails safely with 503 GEMINI_NOT_CONFIGURED and never leaks secrets', async () => {
+  test('G1. Gemini API is strictly disabled regardless of GEMINI_API_KEY and never invokes generateContent', async () => {
     const prevKey = process.env.GEMINI_API_KEY;
     try {
       delete process.env.GEMINI_API_KEY;
       assert.equal(isGeminiConfigured(), false);
+      assert.equal(getGeminiClient(), null);
       const resMissing = await generateGeminiText({ prompt: 'Summarize CPC Section 11' });
       assert.equal(resMissing.ok, false);
       if (!resMissing.ok) {
         assert.equal(resMissing.status, 503);
-        assert.equal(resMissing.code, 'GEMINI_NOT_CONFIGURED');
+        assert.equal(resMissing.code, 'GEMINI_DISABLED');
       }
 
       process.env.GEMINI_API_KEY = 'MY_GEMINI_API_KEY';
       assert.equal(isGeminiConfigured(), false);
+      assert.equal(getGeminiClient(), null);
       const resPlaceholder = await generateGeminiText({ prompt: 'Summarize CPC Section 11' });
       assert.equal(resPlaceholder.ok, false);
       if (!resPlaceholder.ok) {
         assert.equal(resPlaceholder.status, 503);
-        assert.equal(resPlaceholder.code, 'GEMINI_NOT_CONFIGURED');
+        assert.equal(resPlaceholder.code, 'GEMINI_DISABLED');
+      }
+
+      process.env.GEMINI_API_KEY = 'AIzaSyFakeKeyForDisabledVerification12345';
+      assert.equal(isGeminiConfigured(), false);
+      assert.equal(getGeminiClient(), null);
+      const resProvided = await generateGeminiText({ prompt: 'Summarize CPC Section 11' });
+      assert.equal(resProvided.ok, false);
+      if (!resProvided.ok) {
+        assert.equal(resProvided.status, 503);
+        assert.equal(resProvided.code, 'GEMINI_DISABLED');
       }
     } finally {
       if (prevKey !== undefined) {
@@ -1925,6 +1938,14 @@ describe('Sanad Prep BD – Gemini API Key Security & Backend Isolation Suite', 
       assert.equal(content.includes('@google/genai'), false, `Found @google/genai import in client file ${file}`);
     }
 
+    for (const dirName of ['server', 'worker']) {
+      for (const file of walkFiles(path.join(rootDir, dirName))) {
+        const content = fs.readFileSync(file, 'utf8');
+        assert.equal(content.includes('@google/genai'), false, `Found @google/genai import in ${file}`);
+        assert.equal(content.includes('generateContent'), false, `Found generateContent call in ${file}`);
+      }
+    }
+
     const healthMirror = createMemoryMirror();
     const { app } = createSanadPrepApp({
       mirror: healthMirror,
@@ -1939,7 +1960,7 @@ describe('Sanad Prep BD – Gemini API Key Security & Backend Isolation Suite', 
       const res = await fetch(`http://127.0.0.1:${port}/api/health`);
       const json = (await res.json()) as Record<string, unknown>;
       assert.equal(res.status, 200);
-      assert.equal(typeof json.geminiConfigured, 'boolean');
+      assert.equal(json.geminiConfigured, false);
       assert.equal('GEMINI_API_KEY' in json, false);
     } finally {
       await new Promise<void>(resolve => srv.close(() => resolve()));
