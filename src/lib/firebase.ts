@@ -111,7 +111,7 @@ export function resolveFrontendOwnerAdminUid(
   }
   const rawStagingUid = rawEnv.VITE_STAGING_OWNER_ADMIN_UID?.trim() || '';
   if (!rawStagingUid) {
-    return OWNER_ADMIN_UID;
+    return '';
   }
   if (/[\s,;|]/.test(rawStagingUid) || rawStagingUid.length > 128) {
     return '';

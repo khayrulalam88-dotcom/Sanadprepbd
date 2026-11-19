@@ -39,7 +39,7 @@ import {
   getFirebaseProjectDetails,
   auth,
   googleProvider,
-  OWNER_ADMIN_UID,
+  resolveFrontendOwnerAdminUid,
   isVerifiedOwnerAccount
 } from '../lib/firebase';
 import {
@@ -2654,9 +2654,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     expiresAt?: string;
     isSessionRevoked?: boolean;
   }): Promise<{ success: boolean; message: string }> => {
-    const safeRole: UserRole = params.role === 'admin' && params.userId !== OWNER_ADMIN_UID
-      ? 'student'
-      : params.role;
+    const effectiveOwnerAdminUid = resolveFrontendOwnerAdminUid();
+    const safeRole: UserRole =
+      params.role === 'admin' && (!effectiveOwnerAdminUid || params.userId !== effectiveOwnerAdminUid)
+        ? 'student'
+        : params.role;
 
     const res = await executeAuthoritativeAdminApi({
       isVerifiedOwner: isVerifiedOwnerAccount(auth?.currentUser),

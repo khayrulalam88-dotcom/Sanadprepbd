@@ -628,8 +628,44 @@ export function createSanadPrepApp(options?: {
     }
   });
 
-  app.get('/api/subjects', (_req, res) => {
-    res.json({ subjects: mirror.subjects });
+  app.get('/api/subjects', async (_req, res) => {
+    try {
+      if (useFirestore()) {
+        const snap = await db.collection('subjects').get();
+        const subjectList = snap.docs.map(d => ({
+          id: d.id,
+          ...(d.data() as Record<string, unknown>)
+        }));
+        return res.json({ subjects: subjectList.length > 0 ? subjectList : mirror.subjects });
+      }
+      if (!allowMemoryFallback) {
+        return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+      }
+      return res.json({ subjects: mirror.subjects });
+    } catch (err) {
+      return sendRouteError(res, 'GET /api/subjects', err);
+    }
+  });
+
+  app.get('/api/subjects/counts', async (_req, res) => {
+    try {
+      const list = await getSanitizedQuestionsAuthoritative(
+        mirror,
+        db,
+        allowMemoryFallback,
+        useFirestore(),
+        { ttlMs: options?.questionBankCacheTtlMs }
+      );
+      const counts: Record<string, number> = {};
+      for (const q of list) {
+        if (q.subjectId) {
+          counts[q.subjectId] = (counts[q.subjectId] || 0) + 1;
+        }
+      }
+      return res.json({ counts, total: list.length });
+    } catch (err) {
+      return sendRouteError(res, 'GET /api/subjects/counts', err);
+    }
   });
 
   app.get('/api/exams', async (_req, res) => {
@@ -774,19 +810,30 @@ export function createSanadPrepApp(options?: {
       const uid = req.authUser!.uid;
       const isOwner = isOwnerUser(req.authUser);
       const { questionId, selectedOption } = req.body || {};
+      const cleanQuestionId = typeof questionId === 'string' ? questionId.trim() : '';
 
-      if (!questionId || typeof selectedOption !== 'number') {
-        return res.status(400).json({ error: 'INVALID_REQUEST', message: 'questionId and selectedOption required.' });
+      if (
+        !cleanQuestionId ||
+        cleanQuestionId.length > 128 ||
+        typeof selectedOption !== 'number' ||
+        !Number.isInteger(selectedOption) ||
+        selectedOption < 0 ||
+        selectedOption > 3
+      ) {
+        return res.status(400).json({
+          error: 'INVALID_REQUEST',
+          message: 'Valid questionId and integer selectedOption (0-3) are required.'
+        });
       }
 
       const qMap = await getAuthoritativeQuestionMap(
-        [String(questionId)],
+        [cleanQuestionId],
         mirror,
         db,
         allowMemoryFallback,
         useFirestore()
       );
-      const q = qMap.get(String(questionId));
+      const q = qMap.get(cleanQuestionId);
       if (!q) {
         return res.status(404).json({ error: 'QUESTION_NOT_FOUND', message: 'Question not found.' });
       }
@@ -992,8 +1039,9 @@ export function createSanadPrepApp(options?: {
     try {
       const uid = req.authUser!.uid;
       const { method, senderNumber, transactionId, packageId, studentPhone, studentName } = req.body || {};
+      const cleanSenderNumber = typeof senderNumber === 'string' ? senderNumber.trim() : '';
 
-      if (!method || !senderNumber || !transactionId || !packageId) {
+      if (!method || !cleanSenderNumber || !transactionId || !packageId) {
         return res.status(400).json({
           error: 'MISSING_FIELDS',
           message: 'অনুগ্রহ করে সকল আবশ্যিক পেমেন্ট তথ্য প্রদান করুন। (Missing required payment fields)'
@@ -1004,6 +1052,13 @@ export function createSanadPrepApp(options?: {
         return res.status(400).json({
           error: 'INVALID_METHOD',
           message: 'অবৈধ পেমেন্ট মাধ্যম। bKash বা Nagad ব্যবহার করুন।'
+        });
+      }
+
+      if (cleanSenderNumber.length < 6 || cleanSenderNumber.length > 20) {
+        return res.status(400).json({
+          error: 'INVALID_SENDER_NUMBER',
+          message: 'সঠিক প্রেরকের মোবাইল নম্বর প্রদান করুন।'
         });
       }
 
@@ -1025,10 +1080,11 @@ export function createSanadPrepApp(options?: {
       let authoritativeAmount = 0;
 
       if (useFirestore()) {
-        const [pkgSnap, configSnap, dupQuerySnap] = await Promise.all([
+        const [pkgSnap, configSnap, dupQuerySnap, dupSubSnap] = await Promise.all([
           db.collection('packages').doc(String(packageId)).get(),
           db.collection('config').doc('examDate').get(),
-          db.collection('paymentRequests').where('transactionId', '==', cleanTrxId).limit(1).get()
+          db.collection('paymentRequests').where('transactionId', '==', cleanTrxId).limit(1).get(),
+          db.collection('subscriptions').where('transactionId', '==', cleanTrxId).limit(1).get()
         ]);
 
         if (!pkgSnap.exists) {
@@ -1064,6 +1120,12 @@ export function createSanadPrepApp(options?: {
                 : 'এই ট্রানজাকশন আইডিটি (TrxID) ইতিপূর্বে ব্যবহার করা হয়েছে। একই TrxID পুনরায় গ্রহণযোগ্য নয়।'
           });
         }
+        if (!dupSubSnap.empty) {
+          return res.status(409).json({
+            error: 'DUPLICATE_TRX_ID',
+            message: 'এই ট্রানজাকশন আইডিটি (TrxID) ইতিপূর্বে একটি সাবস্ক্রিপশনে ব্যবহৃত হয়েছে।'
+          });
+        }
       } else {
         if (!allowMemoryFallback) {
           return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
@@ -1090,6 +1152,13 @@ export function createSanadPrepApp(options?: {
                 : 'এই ট্রানজাকশন আইডিটি (TrxID) ইতিপূর্বে ব্যবহার করা হয়েছে। একই TrxID পুনরায় গ্রহণযোগ্য নয়।'
           });
         }
+        const existingSubLocal = mirror.subscriptions.find(s => s.transactionId === cleanTrxId);
+        if (existingSubLocal) {
+          return res.status(409).json({
+            error: 'DUPLICATE_TRX_ID',
+            message: 'এই ট্রানজাকশন আইডিটি (TrxID) ইতিপূর্বে একটি সাবস্ক্রিপশনে ব্যবহৃত হয়েছে।'
+          });
+        }
       }
 
       if (!Number.isFinite(authoritativeAmount) || authoritativeAmount <= 0) {
@@ -1107,9 +1176,9 @@ export function createSanadPrepApp(options?: {
         id: docId,
         userId: uid,
         studentName: String(studentName || req.authUser!.name || 'Student').trim().slice(0, 100),
-        studentPhone: String(studentPhone || senderNumber).trim().slice(0, 20),
+        studentPhone: String(studentPhone || cleanSenderNumber).trim().slice(0, 20),
         method: method as 'bKash' | 'Nagad' | 'Rocket',
-        senderNumber: String(senderNumber).trim().slice(0, 20),
+        senderNumber: cleanSenderNumber.slice(0, 20),
         transactionId: cleanTrxId,
         amount: authoritativeAmount,
         packageId: pkg.id,
@@ -1201,25 +1270,53 @@ export function createSanadPrepApp(options?: {
     }
   });
 
-  app.get('/api/payments', requireFirebaseAuth, authenticateSession, async (req: AuthenticatedRequest, res) => {
+  app.get(['/api/payments', '/api/payments/my'], requireFirebaseAuth, authenticateSession, async (req: AuthenticatedRequest, res) => {
     try {
       const isOwner = isOwnerUser(req.authUser);
+      const isAllAllowed = req.path === '/api/payments' && isOwner;
+      let list: PaymentRequest[];
       if (useFirestore()) {
-        const snap = isOwner
+        const snap = isAllAllowed
           ? await db.collection('paymentRequests').get()
           : await db.collection('paymentRequests').where('userId', '==', req.authUser!.uid).get();
-        const list = snap.docs.map(d => ({ id: d.id, ...(d.data() as Omit<PaymentRequest, 'id'>) }));
-        return res.json({ paymentRequests: list });
+        list = snap.docs.map(d => ({ id: d.id, ...(d.data() as Omit<PaymentRequest, 'id'>) }));
+      } else {
+        if (!allowMemoryFallback) {
+          return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+        }
+        list = isAllAllowed
+          ? [...mirror.paymentRequests]
+          : mirror.paymentRequests.filter(p => p.userId === req.authUser!.uid);
       }
-      if (!allowMemoryFallback) {
-        return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
-      }
-      const list = isOwner
-        ? [...mirror.paymentRequests]
-        : mirror.paymentRequests.filter(p => p.userId === req.authUser!.uid);
+      list.sort(
+        (a, b) =>
+          new Date(String(b.requestedAt || 0)).getTime() - new Date(String(a.requestedAt || 0)).getTime()
+      );
       return res.json({ paymentRequests: list });
     } catch (err) {
       return sendRouteError(res, 'GET /api/payments', err);
+    }
+  });
+
+  app.get('/api/admin/payments', requireFirebaseAuth, requireOwnerAdmin, async (_req: AuthenticatedRequest, res) => {
+    try {
+      let list: PaymentRequest[];
+      if (useFirestore()) {
+        const snap = await db.collection('paymentRequests').get();
+        list = snap.docs.map(d => ({ id: d.id, ...(d.data() as Omit<PaymentRequest, 'id'>) }));
+      } else {
+        if (!allowMemoryFallback) {
+          return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+        }
+        list = [...mirror.paymentRequests];
+      }
+      list.sort(
+        (a, b) =>
+          new Date(String(b.requestedAt || 0)).getTime() - new Date(String(a.requestedAt || 0)).getTime()
+      );
+      return res.json({ paymentRequests: list });
+    } catch (err) {
+      return sendRouteError(res, 'GET /api/admin/payments', err);
     }
   });
 
@@ -1576,8 +1673,21 @@ export function createSanadPrepApp(options?: {
   app.post('/api/admin/packages/update', requireFirebaseAuth, requireOwnerAdmin, async (req: AuthenticatedRequest, res) => {
     try {
       const { id, price, durationDays, isActive } = req.body || {};
-      if (!id || typeof id !== 'string') {
+      if (!id || typeof id !== 'string' || !id.trim()) {
         return res.status(400).json({ error: 'INVALID_PACKAGE_ID', message: 'Package id is required' });
+      }
+
+      if (price !== undefined) {
+        const parsedPrice = Number(price);
+        if (!Number.isFinite(parsedPrice) || parsedPrice <= 0) {
+          return res.status(400).json({ error: 'INVALID_PACKAGE_PRICE', message: 'Valid positive price is required.' });
+        }
+      }
+      if (durationDays !== undefined) {
+        const parsedDays = Number(durationDays);
+        if (!Number.isFinite(parsedDays) || parsedDays <= 0) {
+          return res.status(400).json({ error: 'INVALID_DURATION', message: 'Valid positive durationDays is required.' });
+        }
       }
 
       if (useFirestore()) {
@@ -2014,86 +2124,205 @@ export function createSanadPrepApp(options?: {
         }
         cleanExpiresIso = parsedExp.toISOString();
       }
-      const nowIso = new Date().toISOString();
 
-      const cleanEmail = typeof email === 'string' ? email.trim() : '';
-      const cleanPhone = typeof phone === 'string' ? phone.trim() : '';
+      const rawEmailInput = typeof email === 'string' ? email.trim() : '';
+      if (rawEmailInput) {
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (rawEmailInput.length > 150 || !emailRegex.test(rawEmailInput)) {
+          return res.status(400).json({ error: 'INVALID_EMAIL', message: 'Valid email address is required.' });
+        }
+      }
+
+      const nowIso = new Date().toISOString();
+      const cleanPhone = typeof phone === 'string' ? phone.trim().slice(0, 20) : '';
+      const cleanSubId = typeof subscriptionId === 'string' && subscriptionId.trim() ? subscriptionId.trim() : '';
 
       if (useFirestore()) {
         const userRef = db.collection('users').doc(targetUid);
-        const [userSnap, userSessSnap, subSnap] = await Promise.all([
+        const [userSnap, userSessSnap, queriedSubsSnap, explicitSubSnap] = await Promise.all([
           userRef.get(),
           isSessionRevoked ? db.collection('userSessions').doc(targetUid).get() : Promise.resolve(null),
-          subscriptionId
-            ? db.collection('subscriptions').doc(String(subscriptionId)).get()
-            : db.collection('subscriptions').where('userId', '==', targetUid).limit(1).get()
+          db.collection('subscriptions').where('userId', '==', targetUid).get(),
+          cleanSubId ? db.collection('subscriptions').doc(cleanSubId).get() : Promise.resolve(null)
         ]);
 
-        const existingUserData = userSnap.exists ? userSnap.data() : {};
-        const batch = db.batch();
-        const userPayload = {
+        const targetSubMap = new Map<string, Record<string, unknown> & { id: string }>();
+        queriedSubsSnap.forEach(d => {
+          const data = d.data() as Record<string, unknown>;
+          if (String(data.userId || '') === targetUid) {
+            targetSubMap.set(d.id, { ...data, id: d.id });
+          }
+        });
+        if (explicitSubSnap && explicitSubSnap.exists) {
+          const explicitData = explicitSubSnap.data() as Record<string, unknown>;
+          if (explicitData.userId && String(explicitData.userId) !== targetUid) {
+            return res.status(403).json({
+              error: 'SUBSCRIPTION_USER_MISMATCH',
+              message: 'Subscription record does not belong to target user.'
+            });
+          }
+          targetSubMap.set(explicitSubSnap.id, { ...explicitData, id: explicitSubSnap.id });
+        }
+
+        const allUserSubDocs = Array.from(targetSubMap.values()).sort(
+          (a, b) =>
+            new Date(timestampToIso(b.createdAt) || 0).getTime() -
+            new Date(timestampToIso(a.createdAt) || 0).getTime()
+        );
+
+        const existingUserData = userSnap.exists ? (userSnap.data() as Record<string, unknown>) : {};
+        const existingEmail =
+          typeof existingUserData?.email === 'string' ? existingUserData.email.trim() : '';
+        const resolvedEmail = rawEmailInput
+          ? rawEmailInput.toLowerCase().slice(0, 150)
+          : existingEmail;
+
+        const existingExpiresIso = timestampToIso(existingUserData?.subscriptionExpiresAt);
+        const effectiveUserExpiresIso = cleanExpiresIso || existingExpiresIso;
+        const resolvedActivePackageId =
+          typeof packageId === 'string' && packageId
+            ? packageId
+            : (existingUserData?.activePackageId as string | undefined) ?? null;
+        const resolvedActivePackageNameBn =
+          typeof packageNameBn === 'string' && packageNameBn
+            ? packageNameBn
+            : (existingUserData?.activePackageNameBn as string | undefined) ?? null;
+        const resolvedActivePackageNameEn =
+          typeof packageNameEn === 'string' && packageNameEn
+            ? packageNameEn
+            : (existingUserData?.activePackageNameEn as string | undefined) ?? null;
+
+        const userPayloadForResponse = {
           uid: targetUid,
           name: cleanName,
-          email: cleanEmail,
+          email: resolvedEmail,
           phone: cleanPhone,
           role: safeRole,
           subscriptionStatus: safeSubStatus,
-          subscriptionExpiresAt: isoToTimestamp(cleanExpiresIso),
-          activePackageId: packageId || null,
-          activePackageNameBn: packageNameBn || null,
-          activePackageNameEn: packageNameEn || null,
-          createdAt: existingUserData?.createdAt || nowIso
+          subscriptionExpiresAt: effectiveUserExpiresIso,
+          activePackageId: resolvedActivePackageId,
+          activePackageNameBn: resolvedActivePackageNameBn,
+          activePackageNameEn: resolvedActivePackageNameEn,
+          createdAt: (existingUserData?.createdAt as string) || nowIso
         };
-        batch.set(userRef, userPayload, { merge: true });
+
+        const userFirestorePayload: Record<string, unknown> = {
+          ...userPayloadForResponse,
+          subscriptionExpiresAt: effectiveUserExpiresIso ? isoToTimestamp(effectiveUserExpiresIso) : null
+        };
+        if (!resolvedEmail) {
+          delete userFirestorePayload.email;
+        }
+
+        const batch = db.batch();
+        batch.set(userRef, userFirestorePayload, { merge: true });
 
         let persistedSubscription: UserSubscription | null = null;
-        const resolvedSubDoc =
-          subscriptionId && 'exists' in subSnap
-            ? (subSnap.exists ? subSnap : null)
-            : !subscriptionId && 'docs' in subSnap && subSnap.docs.length > 0
-            ? subSnap.docs[0]
-            : null;
+        const updatedSubscriptions: UserSubscription[] = [];
 
-        if (subscriptionId || resolvedSubDoc || safeSubStatus === 'pro') {
-          const targetSubId = subscriptionId
-            ? String(subscriptionId)
-            : resolvedSubDoc
-            ? resolvedSubDoc.id
-            : `sub_admin_${targetUid}`;
-          const existingSubData = resolvedSubDoc?.data() as Record<string, unknown> | undefined;
-          const pkgMatch = mirror.packages.find(p => p.id === (packageId || existingSubData?.packageId)) || mirror.packages[0];
-          const nextSubStatus =
-            safeSubStatus === 'pro' ? 'active' : safeSubStatus === 'expired' ? 'expired' : 'cancelled';
+        if (safeSubStatus === 'pro') {
+          const resolvedSubDoc =
+            (cleanSubId ? targetSubMap.get(cleanSubId) : undefined) || allUserSubDocs[0] || null;
+          const targetSubId = cleanSubId || resolvedSubDoc?.id || `sub_admin_${targetUid}`;
+          const pkgMatch =
+            mirror.packages.find(p => p.id === (packageId || resolvedSubDoc?.packageId)) || mirror.packages[0];
           const effectiveExpiresIso =
             cleanExpiresIso ||
-            timestampToIso(existingSubData?.expiresAt) ||
+            timestampToIso(resolvedSubDoc?.expiresAt) ||
             new Date(Date.now() + 90 * 24 * 3600 * 1000).toISOString();
+          const activatedIso = timestampToIso(resolvedSubDoc?.activatedAt) || nowIso;
 
           const subFirestorePayload: Record<string, unknown> = {
             id: targetSubId,
             userId: targetUid,
             studentName: cleanName,
             studentPhone: cleanPhone,
-            packageId: packageId || (existingSubData?.packageId as string) || pkgMatch.id,
-            packageNameBn: packageNameBn || (existingSubData?.packageNameBn as string) || pkgMatch.nameBn,
-            packageNameEn: packageNameEn || (existingSubData?.packageNameEn as string) || pkgMatch.nameEn,
-            pricePaid: typeof existingSubData?.pricePaid === 'number' ? existingSubData.pricePaid : pkgMatch.price,
-            paymentRequestId: (existingSubData?.paymentRequestId as string) || `admin_grant_${targetUid}`,
-            paymentMethod: (existingSubData?.paymentMethod as string) || 'bKash',
-            transactionId: (existingSubData?.transactionId as string) || `ADMIN_GRANT_${Date.now().toString().slice(-6)}`,
-            validityType: (existingSubData?.validityType as 'days' | 'exam_date') || pkgMatch.validityType,
-            status: nextSubStatus,
-            activatedAt: (existingSubData?.activatedAt as string) || nowIso,
+            packageId:
+              (typeof packageId === 'string' && packageId) ||
+              (resolvedSubDoc?.packageId as string) ||
+              pkgMatch.id,
+            packageNameBn:
+              (typeof packageNameBn === 'string' && packageNameBn) ||
+              (resolvedSubDoc?.packageNameBn as string) ||
+              pkgMatch.nameBn,
+            packageNameEn:
+              (typeof packageNameEn === 'string' && packageNameEn) ||
+              (resolvedSubDoc?.packageNameEn as string) ||
+              pkgMatch.nameEn,
+            pricePaid: typeof resolvedSubDoc?.pricePaid === 'number' ? resolvedSubDoc.pricePaid : pkgMatch.price,
+            paymentRequestId: (resolvedSubDoc?.paymentRequestId as string) || `admin_grant_${targetUid}`,
+            paymentMethod: (resolvedSubDoc?.paymentMethod as string) || 'bKash',
+            transactionId:
+              (resolvedSubDoc?.transactionId as string) || `ADMIN_GRANT_${Date.now().toString().slice(-6)}`,
+            validityType: (resolvedSubDoc?.validityType as 'days' | 'exam_date') || pkgMatch.validityType,
+            status: 'active',
+            activatedAt: isoToTimestamp(activatedIso) || activatedIso,
             expiresAt: isoToTimestamp(effectiveExpiresIso),
-            createdAt: (existingSubData?.createdAt as string) || nowIso,
+            createdAt: timestampToIso(resolvedSubDoc?.createdAt) || nowIso,
             updatedAt: nowIso
           };
 
           batch.set(db.collection('subscriptions').doc(targetSubId), subFirestorePayload, { merge: true });
           persistedSubscription = {
             ...(subFirestorePayload as unknown as UserSubscription),
+            ...(resolvedEmail ? { studentEmail: resolvedEmail } : {}),
+            activatedAt: activatedIso,
             expiresAt: effectiveExpiresIso
           };
+          updatedSubscriptions.push(persistedSubscription);
+        } else {
+          const nextSubStatus: 'expired' | 'cancelled' =
+            safeSubStatus === 'expired' ? 'expired' : 'cancelled';
+          const subsToUpdate = allUserSubDocs.filter(
+            doc =>
+              String(doc.userId || '') === targetUid &&
+              (doc.status === 'active' || (cleanSubId && doc.id === cleanSubId))
+          );
+
+          for (const subDoc of subsToUpdate) {
+            const isPrimaryEdited = Boolean(cleanSubId && subDoc.id === cleanSubId);
+            const existingSubExpIso = timestampToIso(subDoc.expiresAt) || nowIso;
+            const effectiveExpiresIso =
+              isPrimaryEdited && cleanExpiresIso ? cleanExpiresIso : existingSubExpIso;
+            const activatedIso = timestampToIso(subDoc.activatedAt) || nowIso;
+            const pkgMatch =
+              mirror.packages.find(p => p.id === (subDoc.packageId || packageId)) || mirror.packages[0];
+
+            const subFirestorePayload: Record<string, unknown> = {
+              id: subDoc.id,
+              userId: targetUid,
+              studentName: isPrimaryEdited ? cleanName : String(subDoc.studentName || cleanName),
+              studentPhone: isPrimaryEdited ? cleanPhone : String(subDoc.studentPhone || cleanPhone),
+              packageId:
+                (subDoc.packageId as string) || (typeof packageId === 'string' && packageId) || pkgMatch.id,
+              packageNameBn: (subDoc.packageNameBn as string) || pkgMatch.nameBn,
+              packageNameEn: (subDoc.packageNameEn as string) || pkgMatch.nameEn,
+              pricePaid: typeof subDoc.pricePaid === 'number' ? subDoc.pricePaid : pkgMatch.price,
+              paymentRequestId: (subDoc.paymentRequestId as string) || `admin_grant_${targetUid}`,
+              paymentMethod: (subDoc.paymentMethod as string) || 'bKash',
+              transactionId:
+                (subDoc.transactionId as string) || `ADMIN_GRANT_${Date.now().toString().slice(-6)}`,
+              validityType: (subDoc.validityType as 'days' | 'exam_date') || pkgMatch.validityType,
+              status: nextSubStatus,
+              activatedAt: isoToTimestamp(activatedIso) || activatedIso,
+              expiresAt: isoToTimestamp(effectiveExpiresIso),
+              createdAt: timestampToIso(subDoc.createdAt) || nowIso,
+              updatedAt: nowIso
+            };
+
+            batch.set(db.collection('subscriptions').doc(subDoc.id), subFirestorePayload, { merge: true });
+            updatedSubscriptions.push({
+              ...(subFirestorePayload as unknown as UserSubscription),
+              ...(resolvedEmail ? { studentEmail: resolvedEmail } : {}),
+              activatedAt: activatedIso,
+              expiresAt: effectiveExpiresIso
+            });
+          }
+
+          persistedSubscription =
+            (cleanSubId ? updatedSubscriptions.find(s => s.id === cleanSubId) : undefined) ||
+            updatedSubscriptions[0] ||
+            null;
         }
 
         if (isSessionRevoked && userSessSnap?.exists) {
@@ -2112,7 +2341,9 @@ export function createSanadPrepApp(options?: {
           userId: req.authUser!.uid,
           userName: req.authUser!.email || 'Owner Admin',
           action: 'USER_EDITED_BY_ADMIN',
-          details: `Admin updated user ${targetUid} (role=${safeRole}, status=${safeSubStatus}).`,
+          details: `Admin updated user ${targetUid} (role=${safeRole}, status=${safeSubStatus}, subsUpdated=${updatedSubscriptions.length}${
+            isSessionRevoked ? ', session_revoked' : ''
+          }).`,
           timestamp: nowIso
         };
         batch.set(db.collection('auditLogs').doc(auditEntry.id), auditEntry);
@@ -2120,11 +2351,10 @@ export function createSanadPrepApp(options?: {
 
         return res.json({
           success: true,
-          user: {
-            ...userPayload,
-            subscriptionExpiresAt: cleanExpiresIso
-          },
-          subscription: persistedSubscription
+          user: userPayloadForResponse,
+          subscription: persistedSubscription,
+          updatedSubscriptions,
+          revokedSubscriptionCount: safeSubStatus === 'pro' ? 0 : updatedSubscriptions.length
         });
       }
 
@@ -2132,59 +2362,108 @@ export function createSanadPrepApp(options?: {
         return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
       }
 
+      if (cleanSubId) {
+        const explicitMirrorSub = mirror.subscriptions.find(s => s.id === cleanSubId);
+        if (explicitMirrorSub && explicitMirrorSub.userId && explicitMirrorSub.userId !== targetUid) {
+          return res.status(403).json({
+            error: 'SUBSCRIPTION_USER_MISMATCH',
+            message: 'Subscription record does not belong to target user.'
+          });
+        }
+      }
+
       const existing = mirror.users[targetUid];
+      const existingEmail = typeof existing?.email === 'string' ? existing.email.trim() : '';
+      const resolvedEmail = rawEmailInput ? rawEmailInput.toLowerCase().slice(0, 150) : existingEmail;
+      const effectiveUserExpiresIso = cleanExpiresIso || existing?.subscriptionExpiresAt;
+      const resolvedActivePackageId =
+        typeof packageId === 'string' && packageId ? packageId : existing?.activePackageId;
+      const resolvedActivePackageNameBn =
+        typeof packageNameBn === 'string' && packageNameBn ? packageNameBn : existing?.activePackageNameBn;
+      const resolvedActivePackageNameEn =
+        typeof packageNameEn === 'string' && packageNameEn ? packageNameEn : existing?.activePackageNameEn;
+
       mirror.users[targetUid] = {
         ...(existing || { uid: targetUid, createdAt: nowIso }),
         uid: targetUid,
         name: cleanName,
-        email: cleanEmail,
+        email: resolvedEmail,
         phone: cleanPhone,
         role: safeRole,
         subscriptionStatus: safeSubStatus,
-        subscriptionExpiresAt: cleanExpiresIso,
-        activePackageId: packageId,
-        activePackageNameBn: packageNameBn,
-        activePackageNameEn: packageNameEn
+        subscriptionExpiresAt: effectiveUserExpiresIso,
+        activePackageId: resolvedActivePackageId,
+        activePackageNameBn: resolvedActivePackageNameBn,
+        activePackageNameEn: resolvedActivePackageNameEn
       };
 
       let mirrorSub: UserSubscription | null = null;
-      const existingSubIdx = mirror.subscriptions.findIndex(
-        s => s.userId === targetUid || (subscriptionId && s.id === subscriptionId)
-      );
-      if (existingSubIdx >= 0) {
-        const prevSub = mirror.subscriptions[existingSubIdx];
-        mirrorSub = {
-          ...prevSub,
-          studentName: cleanName,
-          studentPhone: cleanPhone,
-          packageId: packageId || prevSub.packageId,
-          packageNameBn: packageNameBn || prevSub.packageNameBn,
-          packageNameEn: packageNameEn || prevSub.packageNameEn,
-          status: safeSubStatus === 'pro' ? 'active' : safeSubStatus === 'expired' ? 'expired' : 'cancelled',
-          expiresAt: cleanExpiresIso || prevSub.expiresAt
-        };
-        mirror.subscriptions[existingSubIdx] = mirrorSub;
-      } else if (safeSubStatus === 'pro') {
-        const pkgMatch = mirror.packages.find(p => p.id === packageId) || mirror.packages[0];
-        mirrorSub = {
-          id: `sub_admin_${targetUid}`,
-          userId: targetUid,
-          studentName: cleanName,
-          studentPhone: cleanPhone,
-          packageId: pkgMatch.id,
-          packageNameBn: packageNameBn || pkgMatch.nameBn,
-          packageNameEn: packageNameEn || pkgMatch.nameEn,
-          pricePaid: pkgMatch.price,
-          paymentRequestId: `admin_grant_${Date.now()}`,
-          paymentMethod: 'bKash',
-          transactionId: `ADMIN_GRANT_${Date.now().toString().slice(-6)}`,
-          activatedAt: nowIso,
-          expiresAt: cleanExpiresIso || new Date(Date.now() + 90 * 24 * 3600 * 1000).toISOString(),
-          validityType: pkgMatch.validityType,
-          status: 'active',
-          createdAt: nowIso
-        };
-        mirror.subscriptions.unshift(mirrorSub);
+      const updatedSubscriptions: UserSubscription[] = [];
+
+      if (safeSubStatus === 'pro') {
+        const targetIdx = mirror.subscriptions.findIndex(s =>
+          cleanSubId ? s.id === cleanSubId : s.userId === targetUid
+        );
+        if (targetIdx >= 0) {
+          const prevSub = mirror.subscriptions[targetIdx];
+          mirrorSub = {
+            ...prevSub,
+            studentName: cleanName,
+            studentPhone: cleanPhone,
+            ...(resolvedEmail ? { studentEmail: resolvedEmail } : {}),
+            packageId: (typeof packageId === 'string' && packageId) || prevSub.packageId,
+            packageNameBn: (typeof packageNameBn === 'string' && packageNameBn) || prevSub.packageNameBn,
+            packageNameEn: (typeof packageNameEn === 'string' && packageNameEn) || prevSub.packageNameEn,
+            status: 'active',
+            expiresAt: cleanExpiresIso || prevSub.expiresAt
+          };
+          mirror.subscriptions[targetIdx] = mirrorSub;
+        } else {
+          const pkgMatch = mirror.packages.find(p => p.id === packageId) || mirror.packages[0];
+          mirrorSub = {
+            id: cleanSubId || `sub_admin_${targetUid}`,
+            userId: targetUid,
+            studentName: cleanName,
+            studentPhone: cleanPhone,
+            ...(resolvedEmail ? { studentEmail: resolvedEmail } : {}),
+            packageId: pkgMatch.id,
+            packageNameBn: (typeof packageNameBn === 'string' && packageNameBn) || pkgMatch.nameBn,
+            packageNameEn: (typeof packageNameEn === 'string' && packageNameEn) || pkgMatch.nameEn,
+            pricePaid: pkgMatch.price,
+            paymentRequestId: `admin_grant_${Date.now()}`,
+            paymentMethod: 'bKash',
+            transactionId: `ADMIN_GRANT_${Date.now().toString().slice(-6)}`,
+            activatedAt: nowIso,
+            expiresAt: cleanExpiresIso || new Date(Date.now() + 90 * 24 * 3600 * 1000).toISOString(),
+            validityType: pkgMatch.validityType,
+            status: 'active',
+            createdAt: nowIso
+          };
+          mirror.subscriptions.unshift(mirrorSub);
+        }
+        updatedSubscriptions.push(mirrorSub);
+      } else {
+        const nextSubStatus: 'expired' | 'cancelled' = safeSubStatus === 'expired' ? 'expired' : 'cancelled';
+        for (let i = 0; i < mirror.subscriptions.length; i++) {
+          const sub = mirror.subscriptions[i];
+          if (sub.userId === targetUid && (sub.status === 'active' || (cleanSubId && sub.id === cleanSubId))) {
+            const isPrimaryEdited = Boolean(cleanSubId && sub.id === cleanSubId);
+            const updated: UserSubscription = {
+              ...sub,
+              studentName: isPrimaryEdited ? cleanName : sub.studentName,
+              studentPhone: isPrimaryEdited ? cleanPhone : sub.studentPhone,
+              ...(resolvedEmail ? { studentEmail: resolvedEmail } : {}),
+              status: nextSubStatus,
+              expiresAt: isPrimaryEdited && cleanExpiresIso ? cleanExpiresIso : sub.expiresAt
+            };
+            mirror.subscriptions[i] = updated;
+            updatedSubscriptions.push(updated);
+          }
+        }
+        mirrorSub =
+          (cleanSubId ? updatedSubscriptions.find(s => s.id === cleanSubId) : undefined) ||
+          updatedSubscriptions[0] ||
+          null;
       }
 
       if (isSessionRevoked) {
@@ -2195,7 +2474,13 @@ export function createSanadPrepApp(options?: {
         }
       }
 
-      return res.json({ success: true, user: mirror.users[targetUid], subscription: mirrorSub });
+      return res.json({
+        success: true,
+        user: mirror.users[targetUid],
+        subscription: mirrorSub,
+        updatedSubscriptions,
+        revokedSubscriptionCount: safeSubStatus === 'pro' ? 0 : updatedSubscriptions.length
+      });
     } catch (err) {
       return sendRouteError(res, 'POST /api/admin/users/update', err);
     }
@@ -2233,6 +2518,7 @@ export function createSanadPrepApp(options?: {
       if (
         !q ||
         !cleanQuestionBn ||
+        cleanQuestionBn.length > 1000 ||
         typeof q.subjectId !== 'string' ||
         !validSubjectIds.has(q.subjectId) ||
         cleanOptionsBn.length !== 4 ||
@@ -2244,7 +2530,8 @@ export function createSanadPrepApp(options?: {
       ) {
         return res.status(400).json({
           error: 'INVALID_QUESTION',
-          message: 'Valid subjectId, questionBn, 4 non-empty optionsBn, and integer correctOptionIndex (0-3) are required.'
+          message:
+            'Valid subjectId, questionBn (<= 1000 chars), 4 non-empty optionsBn, and integer correctOptionIndex (0-3) are required.'
         });
       }
 
@@ -2255,25 +2542,33 @@ export function createSanadPrepApp(options?: {
 
       const now = new Date().toISOString();
       const fullQ: ServerQuestion = {
-        id: typeof q.id === 'string' && q.id.trim() ? q.id.trim() : `q_custom_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+        id:
+          typeof q.id === 'string' && q.id.trim()
+            ? q.id.trim().slice(0, 128)
+            : `q_custom_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
         subjectId: q.subjectId,
-        topicId: typeof q.topicId === 'string' && q.topicId.trim() ? q.topicId.trim() : undefined,
+        topicId: typeof q.topicId === 'string' && q.topicId.trim() ? q.topicId.trim().slice(0, 64) : undefined,
         questionBn: cleanQuestionBn,
-        questionEn: typeof q.questionEn === 'string' && q.questionEn.trim() ? q.questionEn.trim() : cleanQuestionBn,
+        questionEn:
+          typeof q.questionEn === 'string' && q.questionEn.trim()
+            ? q.questionEn.trim().slice(0, 1000)
+            : cleanQuestionBn,
         optionsBn: cleanOptionsBn,
         optionsEn: cleanOptionsEn,
         correctOptionIndex: correctIdx,
-        explanationBn: typeof q.explanationBn === 'string' ? q.explanationBn.trim() : '',
-        explanationEn: typeof q.explanationEn === 'string' ? q.explanationEn.trim() : '',
-        legalReference: typeof q.legalReference === 'string' ? q.legalReference.trim() : '',
+        explanationBn: typeof q.explanationBn === 'string' ? q.explanationBn.trim().slice(0, 2000) : '',
+        explanationEn: typeof q.explanationEn === 'string' ? q.explanationEn.trim().slice(0, 2000) : '',
+        legalReference: typeof q.legalReference === 'string' ? q.legalReference.trim().slice(0, 200) : '',
         difficulty: q.difficulty === 'easy' || q.difficulty === 'hard' ? q.difficulty : 'medium',
         status: q.status === 'draft' || q.status === 'reviewed' ? q.status : 'published',
         isDemoSample: Boolean(q.isDemoSample),
-        createdAt: typeof q.createdAt === 'string' && q.createdAt.trim() ? q.createdAt : now,
+        createdAt: typeof q.createdAt === 'string' && q.createdAt.trim() ? q.createdAt.trim() : now,
         updatedAt: now,
-        createdBy: typeof q.createdBy === 'string' && q.createdBy.trim() ? q.createdBy.trim() : 'Owner Admin'
+        createdBy:
+          typeof q.createdBy === 'string' && q.createdBy.trim() ? q.createdBy.trim().slice(0, 100) : 'Owner Admin'
       };
 
+      const versionPayload = createQuestionBankVersionPayload(now);
       if (useFirestore()) {
         const batch = db.batch();
         batch.set(db.collection('questions').doc(fullQ.id), sanitizeQuestionForClient(fullQ));
@@ -2286,7 +2581,7 @@ export function createSanadPrepApp(options?: {
         });
         batch.set(
           db.collection('config').doc('questionBankVersion'),
-          createQuestionBankVersionPayload(now),
+          versionPayload,
           { merge: true }
         );
         const auditEntry: AuditLog = {
@@ -2308,23 +2603,57 @@ export function createSanadPrepApp(options?: {
         if (existingIdx >= 0) mirror.questions[existingIdx] = fullQ;
         else mirror.questions.unshift(fullQ);
       }
-      return res.json({ success: true, question: fullQ });
+      return res.json({ success: true, question: fullQ, versionToken: versionPayload.versionToken });
     } catch (err) {
       return sendRouteError(res, 'POST /api/admin/questions', err);
     }
   });
 
+  app.post('/api/admin/questions/invalidate-cache', requireFirebaseAuth, requireOwnerAdmin, async (req: AuthenticatedRequest, res) => {
+    try {
+      const now = new Date().toISOString();
+      const versionPayload = createQuestionBankVersionPayload(now);
+      if (useFirestore()) {
+        const auditEntry: AuditLog = {
+          id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          userId: req.authUser!.uid,
+          userName: req.authUser!.email || 'Owner Admin',
+          action: 'INVALIDATE_QUESTION_CACHE',
+          details: `Owner invalidated question bank cache (token: ${versionPayload.versionToken})`,
+          timestamp: now
+        };
+        const batch = db.batch();
+        batch.set(db.collection('config').doc('questionBankVersion'), versionPayload, { merge: true });
+        batch.set(db.collection('auditLogs').doc(auditEntry.id), auditEntry);
+        await batch.commit();
+        invalidateQuestionBankCache(db);
+        return res.json({ success: true, version: versionPayload });
+      }
+      if (!allowMemoryFallback) {
+        return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
+      }
+      invalidateQuestionBankCache(db);
+      return res.json({ success: true, version: versionPayload });
+    } catch (err) {
+      return sendRouteError(res, 'POST /api/admin/questions/invalidate-cache', err);
+    }
+  });
+
   app.delete('/api/admin/questions/:id', requireFirebaseAuth, requireOwnerAdmin, async (req: AuthenticatedRequest, res) => {
     try {
-      const id = String(req.params.id);
+      const id = decodeURIComponent(String(req.params.id || '')).trim();
+      if (!id || id.length > 128) {
+        return res.status(400).json({ error: 'INVALID_REQUEST', message: 'Valid questionId is required.' });
+      }
       const now = new Date().toISOString();
+      const versionPayload = createQuestionBankVersionPayload(now);
       if (useFirestore()) {
         const batch = db.batch();
         batch.delete(db.collection('questions').doc(id));
         batch.delete(db.collection('questionKeys').doc(id));
         batch.set(
           db.collection('config').doc('questionBankVersion'),
-          createQuestionBankVersionPayload(now),
+          versionPayload,
           { merge: true }
         );
         const auditEntry: AuditLog = {
@@ -2344,7 +2673,7 @@ export function createSanadPrepApp(options?: {
         }
         mirror.questions = mirror.questions.filter(q => q.id !== id);
       }
-      return res.json({ success: true });
+      return res.json({ success: true, versionToken: versionPayload.versionToken });
     } catch (err) {
       return sendRouteError(res, 'DELETE /api/admin/questions/:id', err);
     }
@@ -2434,6 +2763,7 @@ export function createSanadPrepApp(options?: {
     try {
       const now = Date.now();
       let subList: UserSubscription[];
+      const userEmailMap = new Map<string, string>();
       if (useFirestore()) {
         const snap = await db.collection('subscriptions').get();
         subList = snap.docs.map(d => {
@@ -2446,19 +2776,46 @@ export function createSanadPrepApp(options?: {
             createdAt: timestampToIso(raw.createdAt) || new Date().toISOString()
           };
         });
+
+        const uniqueUids = Array.from(
+          new Set(subList.map(s => (typeof s.userId === 'string' ? s.userId.trim() : '')).filter(Boolean))
+        );
+        for (let i = 0; i < uniqueUids.length; i += 50) {
+          const chunk = uniqueUids.slice(i, i + 50);
+          const userSnaps = await Promise.all(
+            chunk.map(uid => db.collection('users').doc(uid).get())
+          ).catch(() => []);
+          for (const uSnap of userSnaps) {
+            if (uSnap.exists) {
+              const emailVal = uSnap.data()?.email;
+              if (typeof emailVal === 'string' && emailVal.trim()) {
+                userEmailMap.set(uSnap.id, emailVal.trim());
+              }
+            }
+          }
+        }
       } else {
         if (!allowMemoryFallback) {
           return res.status(503).json({ error: 'FIRESTORE_UNAVAILABLE' });
         }
         subList = mirror.subscriptions;
+        for (const [uid, u] of Object.entries(mirror.users)) {
+          if (typeof u.email === 'string' && u.email.trim()) {
+            userEmailMap.set(uid, u.email.trim());
+          }
+        }
       }
 
       const mapped = subList.map(s => {
         const expMs = new Date(s.expiresAt).getTime();
         const isExpired = isNaN(expMs) || expMs <= now;
         const daysRemaining = isNaN(expMs) ? 0 : Math.max(0, Math.ceil((expMs - now) / (1000 * 60 * 60 * 24)));
+        const rawStudentEmail =
+          typeof s.studentEmail === 'string' && s.studentEmail.trim() ? s.studentEmail.trim() : '';
+        const resolvedStudentEmail = userEmailMap.get(String(s.userId || '').trim()) || rawStudentEmail;
         return {
           ...s,
+          ...(resolvedStudentEmail ? { studentEmail: resolvedStudentEmail } : {}),
           status: isExpired && s.status === 'active' ? ('expired' as const) : s.status,
           daysRemaining
         };
@@ -2569,6 +2926,7 @@ export function createSanadPrepApp(options?: {
         rejectedPayments,
         expiredSubscriptions,
         totalVerifiedRevenue,
+        totalExamsCompleted: results.length,
         monthlyRevenueReport: []
       });
     } catch (err) {
@@ -2729,7 +3087,7 @@ export function createSanadPrepApp(options?: {
       }
 
       const cleanedAnswers: Record<string, number> | undefined =
-        answers && typeof answers === 'object'
+        answers && typeof answers === 'object' && !Array.isArray(answers)
           ? Object.entries(answers).reduce<Record<string, number>>((acc, [k, v]) => {
               if (typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= 3) {
                 acc[k] = v;
@@ -2737,8 +3095,23 @@ export function createSanadPrepApp(options?: {
               return acc;
             }, {})
           : undefined;
-      const cleanedFlagged = Array.isArray(flaggedQuestionIds) ? flaggedQuestionIds.map(String) : undefined;
-      const cleanedIndex = typeof currentQuestionIndex === 'number' ? currentQuestionIndex : undefined;
+      const cleanedFlagged = Array.isArray(flaggedQuestionIds)
+        ? flaggedQuestionIds.map(String).slice(0, 200)
+        : undefined;
+      let cleanedIndex: number | undefined;
+      if (currentQuestionIndex !== undefined) {
+        if (
+          typeof currentQuestionIndex !== 'number' ||
+          !Number.isInteger(currentQuestionIndex) ||
+          currentQuestionIndex < 0
+        ) {
+          return res.status(400).json({
+            error: 'INVALID_REQUEST',
+            message: 'currentQuestionIndex must be a non-negative integer.'
+          });
+        }
+        cleanedIndex = currentQuestionIndex;
+      }
       const lastSavedAt = new Date().toISOString();
 
       if (useFirestore()) {
@@ -2822,10 +3195,14 @@ export function createSanadPrepApp(options?: {
           passThresholdPercentage: exam.passThresholdPercentage
         });
 
+        const nowMs = Date.now();
         const startTimeMs = new Date(attempt.startTime).getTime();
         const deadlineMs = new Date(attempt.deadlineTime).getTime();
-        const submissionTimeMs = Math.min(Date.now(), isNaN(deadlineMs) ? Date.now() : deadlineMs + 15000);
-        const timeSpentSeconds = Math.max(1, Math.round((submissionTimeMs - startTimeMs) / 1000));
+        const submissionTimeMs = Math.min(nowMs, isNaN(deadlineMs) ? nowMs : deadlineMs + 15000);
+        const timeSpentSeconds = Math.max(
+          1,
+          Math.round((submissionTimeMs - (isNaN(startTimeMs) ? nowMs : startTimeMs)) / 1000)
+        );
 
         const subjectScores: ExamResult['subjectWiseScores'] = {};
         for (const sub of mirror.subjects) {
@@ -2853,8 +3230,10 @@ export function createSanadPrepApp(options?: {
           }
         }
 
-        const submittedAt = new Date().toISOString();
-        const nextAttemptStatus: ExamAttempt['status'] = isAutoTimeout ? 'timed_out' : 'submitted';
+        const isServerTimedOut = !isNaN(deadlineMs) && nowMs > deadlineMs + 15000;
+        const effectiveTimedOut = Boolean(isAutoTimeout) || isServerTimedOut;
+        const submittedAt = new Date(nowMs).toISOString();
+        const nextAttemptStatus: ExamAttempt['status'] = effectiveTimedOut ? 'timed_out' : 'submitted';
 
         const newResult: ExamResult = {
           id: `res_${attempt.id}`,
@@ -2899,7 +3278,7 @@ export function createSanadPrepApp(options?: {
           completedAt: submittedAt
         };
 
-        return { sanitizedAnswers, submittedAt, nextAttemptStatus, newResult, leaderboardEntry };
+        return { sanitizedAnswers, submittedAt, nextAttemptStatus, effectiveTimedOut, newResult, leaderboardEntry };
       };
 
       if (useFirestore()) {
@@ -2983,7 +3362,7 @@ export function createSanadPrepApp(options?: {
             throw new HttpError(500, 'QUESTIONS_UNAVAILABLE', 'Authoritative exam questions could not be loaded.');
           }
 
-          const { sanitizedAnswers, submittedAt, nextAttemptStatus, newResult, leaderboardEntry } =
+          const { sanitizedAnswers, submittedAt, nextAttemptStatus, effectiveTimedOut, newResult, leaderboardEntry } =
             buildEvaluation(attempt, exam, authoritativeQuestions);
 
           const resultRef = db.collection('examResults').doc(newResult.id);
@@ -3003,7 +3382,7 @@ export function createSanadPrepApp(options?: {
             id: auditRef.id,
             userId: uid,
             userName: attempt.studentName,
-            action: isAutoTimeout ? 'EXAM_TIMED_OUT' : 'SUBMIT_EXAM',
+            action: effectiveTimedOut ? 'EXAM_TIMED_OUT' : 'SUBMIT_EXAM',
             details: `Server graded "${exam.titleEn}": ${newResult.finalScore}/${newResult.totalQuestions} (${newResult.percentage}%)`,
             timestamp: submittedAt
           });
@@ -3038,7 +3417,7 @@ export function createSanadPrepApp(options?: {
         return res.status(404).json({ error: 'EXAM_NOT_FOUND', message: 'Exam not found.' });
       }
       const examQuestions = getQuestionsForExam(exam, mirror.questions) as ServerQuestion[];
-      const { sanitizedAnswers, submittedAt, nextAttemptStatus, newResult, leaderboardEntry } =
+      const { sanitizedAnswers, submittedAt, nextAttemptStatus, effectiveTimedOut, newResult, leaderboardEntry } =
         buildEvaluation(attempt, exam, examQuestions);
 
       attempt.status = nextAttemptStatus;
@@ -3053,7 +3432,7 @@ export function createSanadPrepApp(options?: {
         id: `log_${Date.now()}`,
         userId: uid,
         userName: attempt.studentName,
-        action: isAutoTimeout ? 'EXAM_TIMED_OUT' : 'SUBMIT_EXAM',
+        action: effectiveTimedOut ? 'EXAM_TIMED_OUT' : 'SUBMIT_EXAM',
         details: `Server graded "${exam.titleEn}": ${newResult.finalScore}/${newResult.totalQuestions} (${newResult.percentage}%)`,
         timestamp: submittedAt
       });

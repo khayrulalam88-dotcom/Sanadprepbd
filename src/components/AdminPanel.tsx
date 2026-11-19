@@ -44,7 +44,7 @@ import { Question, QuestionDifficulty, QuestionStatus, Exam, SubscriptionPackage
 import { BulkImportModal } from './BulkImportModal';
 import { EditUserModal, EditableUserData } from './EditUserModal';
 import { AdminCreateExamModal } from './AdminCreateExamModal';
-import { auth, OWNER_ADMIN_UID, OWNER_ADMIN_EMAIL, isVerifiedOwnerAccount } from '../lib/firebase';
+import { auth, OWNER_ADMIN_EMAIL, isVerifiedOwnerAccount, resolveFrontendOwnerAdminUid } from '../lib/firebase';
 import { buildManualQuestionInput } from '../lib/adminQuestionHelpers';
 
 export const AdminPanel: React.FC = () => {
@@ -549,7 +549,12 @@ export const AdminPanel: React.FC = () => {
 
   // Access Control: Only verified Firebase authenticated super admin UID is allowed
   const hasRealFirebaseAuth = Boolean(auth?.currentUser);
-  const isOwnerAuthenticated = hasRealFirebaseAuth && isVerifiedOwnerAccount(auth?.currentUser) && currentUser.uid === OWNER_ADMIN_UID;
+  const effectiveOwnerAdminUid = resolveFrontendOwnerAdminUid();
+  const isOwnerAuthenticated =
+    hasRealFirebaseAuth &&
+    Boolean(effectiveOwnerAdminUid) &&
+    isVerifiedOwnerAccount(auth?.currentUser) &&
+    currentUser.uid === effectiveOwnerAdminUid;
 
   if (!isOwnerAuthenticated) {
     return (
@@ -1442,7 +1447,7 @@ export const AdminPanel: React.FC = () => {
                             name: sub.studentName,
                             email: sub.studentEmail || (sub.userId === currentUser.uid ? currentUser.email : ''),
                             phone: sub.studentPhone || '',
-                            role: sub.userId === OWNER_ADMIN_UID ? 'admin' : 'student',
+                            role: effectiveOwnerAdminUid && sub.userId === effectiveOwnerAdminUid ? 'admin' : 'student',
                             subscriptionStatus: !isExpired ? 'pro' : 'expired',
                             packageId: sub.packageId,
                             packageNameBn: sub.packageNameBn,

@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { useApp } from '../context/AppContext';
-import { OWNER_ADMIN_UID } from '../lib/firebase';
+import { resolveFrontendOwnerAdminUid } from '../lib/firebase';
 import {
   buildEditUserSubmitPayload,
   formatDateToLocalDateTimeInput,
@@ -54,6 +54,7 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
   onSaved
 }) => {
   const { language, t, packages, adminUpdateUser } = useApp();
+  const effectiveOwnerAdminUid = resolveFrontendOwnerAdminUid();
 
   const [name, setName] = useState<string>(user.name || '');
   const [email, setEmail] = useState<string>(user.email || '');
@@ -288,7 +289,7 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
                 >
                   <option value="student">{t('শিক্ষার্থী (Student)', 'Student')}</option>
                   <option value="question_manager">{t('প্রশ্ন ব্যবস্থাপক (Question Manager)', 'Question Manager')}</option>
-                  {user.userId === OWNER_ADMIN_UID && (
+                  {Boolean(effectiveOwnerAdminUid) && user.userId === effectiveOwnerAdminUid && (
                     <option value="admin">{t('অ্যাডমিন (Admin)', 'Administrator')}</option>
                   )}
                 </select>

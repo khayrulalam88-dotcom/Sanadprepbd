@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useApp } from '../context/AppContext';
-import { OWNER_ADMIN_UID, auth, isVerifiedOwnerAccount } from '../lib/firebase';
+import { auth, isVerifiedOwnerAccount, resolveFrontendOwnerAdminUid } from '../lib/firebase';
 import { Logo } from './Logo';
 import {
   X,
@@ -34,6 +34,8 @@ export const LoginModal: React.FC = () => {
     t,
     language
   } = useApp();
+
+  const effectiveOwnerAdminUid = resolveFrontendOwnerAdminUid();
 
   const [authTab, setAuthTab] = useState<'email' | 'phone'>('email');
   const [emailMode, setEmailMode] = useState<'signin' | 'signup' | 'forgot'>('signin');
@@ -283,7 +285,9 @@ export const LoginModal: React.FC = () => {
               )}
 
               <div className="flex items-center gap-2 pt-2 border-t border-slate-200">
-                {isVerifiedOwnerAccount(auth?.currentUser) && currentUser.uid === OWNER_ADMIN_UID && (
+                {isVerifiedOwnerAccount(auth?.currentUser) &&
+                  Boolean(effectiveOwnerAdminUid) &&
+                  currentUser.uid === effectiveOwnerAdminUid && (
                   <button
                     onClick={() => {
                       setActiveScreen('admin');
