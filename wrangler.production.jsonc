@@ -13,7 +13,7 @@
     {
       "binding": "DB",
       "database_name": "sanad-prep-edge-db-production",
-      "database_id": "REPLACE_WITH_CREATED_PRODUCTION_D1_DATABASE_ID",
+      "database_id": "81bce5d2-fb29-4d2a-9542-cc3b7465fa39",
       "migrations_dir": "./worker/migrations"
     }
   ],
