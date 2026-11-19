@@ -345,7 +345,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [examResults, setExamResults] = useState<ExamResult[]>(() => {
     try {
       const saved = localStorage.getItem(LOCAL_STORAGE_KEY_RESULTS);
-      if (saved) return JSON.parse(saved);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) return parsed;
+      }
     } catch (e) {}
     return [];
   });
@@ -375,7 +378,12 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       const saved = localStorage.getItem(LOCAL_STORAGE_KEY_PACKAGES);
       if (saved) {
         const parsed: SubscriptionPackage[] = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.some(p => p.id === 'pkg_monthly') && parsed.length >= 4) {
+        if (
+          Array.isArray(parsed) &&
+          parsed.some(p => p && p.id === 'pkg_monthly') &&
+          parsed.length >= 4 &&
+          parsed.every(p => p && typeof p.id === 'string' && Array.isArray(p.featuresBn) && Array.isArray(p.featuresEn))
+        ) {
           return parsed;
         }
       }
@@ -387,7 +395,12 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [examDateConfig, setExamDateConfig] = useState<ExamDateConfig>(() => {
     try {
       const saved = localStorage.getItem(LOCAL_STORAGE_KEY_EXAM_CONFIG);
-      if (saved) return JSON.parse(saved);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && parsed.targetExamDate) {
+          return { ...INITIAL_EXAM_DATE_CONFIG, ...parsed };
+        }
+      }
     } catch (e) {}
     return INITIAL_EXAM_DATE_CONFIG;
   });
@@ -397,11 +410,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   // Payment Settings (Configurable bKash & Nagad numbers)
   const [paymentSettings, setPaymentSettings] = useState<PaymentSettings>(() => {
-    try {
-      const saved = localStorage.getItem(LOCAL_STORAGE_KEY_PAYMENT_SETTINGS);
-      if (saved) return JSON.parse(saved);
-    } catch (e) {}
-    return {
+    const defaults: PaymentSettings = {
       bkashNumber: '01712607777',
       nagadNumber: '01712607777',
       packagePrice: 300,
@@ -410,18 +419,34 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       whatsappNumber: '+8801671819027',
       whatsappMessage: 'Hello Sanad Prep BD Support, I need help with my account or subscription.'
     };
+    try {
+      const saved = localStorage.getItem(LOCAL_STORAGE_KEY_PAYMENT_SETTINGS);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          return { ...defaults, ...parsed };
+        }
+      }
+    } catch (e) {}
+    return defaults;
   });
 
   // Support Contact Settings (Configurable WhatsApp Support)
   const [supportSettings, setSupportSettings] = useState<SupportContactSettings>(() => {
-    try {
-      const saved = localStorage.getItem(LOCAL_STORAGE_KEY_SUPPORT_SETTINGS);
-      if (saved) return JSON.parse(saved);
-    } catch (e) {}
-    return {
+    const defaults: SupportContactSettings = {
       whatsappNumber: '+8801671819027',
       whatsappMessage: 'Hello Sanad Prep BD Support, I need help with my account or subscription.'
     };
+    try {
+      const saved = localStorage.getItem(LOCAL_STORAGE_KEY_SUPPORT_SETTINGS);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          return { ...defaults, ...parsed };
+        }
+      }
+    } catch (e) {}
+    return defaults;
   });
 
   // Payments Requests (Loaded strictly from Firestore for authenticated session)
@@ -451,7 +476,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       const saved = localStorage.getItem(LOCAL_STORAGE_KEY_ATTEMPT);
       if (saved) {
         const parsed: ExamAttempt = JSON.parse(saved);
-        if (parsed.status === 'in_progress') return parsed;
+        if (parsed && typeof parsed === 'object' && parsed.status === 'in_progress') return parsed;
       }
     } catch (e) {}
     return null;
@@ -522,7 +547,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       const saved = localStorage.getItem(LOCAL_STORAGE_KEY_ANSWERED_QUESTIONS);
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (parsed && typeof parsed === 'object') return parsed;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
       }
     } catch (e) {}
     return {};

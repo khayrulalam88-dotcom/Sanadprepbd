@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { Suspense, lazy, useState } from 'react';
+import React, { Component, Suspense, lazy, useState } from 'react';
 import { AppProvider, useApp } from './context/AppContext';
 import { Navbar } from './components/Navbar';
 import { LandingPage } from './components/LandingPage';
@@ -232,10 +232,79 @@ const MainContent: React.FC = () => {
   );
 };
 
+interface ErrorBoundaryState {
+  hasError: boolean;
+  errorMessage: string;
+}
+
+class AppErrorBoundary extends Component<{ children: React.ReactNode }, ErrorBoundaryState> {
+  state: ErrorBoundaryState = { hasError: false, errorMessage: '' };
+
+  static getDerivedStateFromError(error: unknown): ErrorBoundaryState {
+    return {
+      hasError: true,
+      errorMessage: error instanceof Error ? error.message : 'Unexpected application error'
+    };
+  }
+
+  componentDidCatch(error: unknown) {
+    console.error('[SanadPrep UI ErrorBoundary]', error);
+  }
+
+  private handleResetAndReload = () => {
+    try {
+      [
+        'barprep_bd_active_attempt',
+        'barprep_bd_exam_results',
+        'barprep_bd_payment_settings',
+        'barprep_bd_support_settings',
+        'barprep_bd_subscription_packages',
+        'barprep_bd_exam_date_config',
+        'sanadprep_bd_exams',
+        'sanadprep_answered_questions',
+        'sanadprep_bd_leaderboard'
+      ].forEach(key => localStorage.removeItem(key));
+    } catch {
+      // ignore storage errors
+    }
+    window.location.reload();
+  };
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen flex items-center justify-center bg-[#F5F7FA] p-4 text-[#243447]">
+          <div className="max-w-md w-full bg-white rounded-3xl border border-slate-200 shadow-lg p-6 sm:p-8 text-center space-y-4">
+            <div className="w-12 h-12 rounded-2xl bg-amber-50 border border-amber-200 text-amber-700 flex items-center justify-center mx-auto">
+              <AlertTriangle className="w-6 h-6" />
+            </div>
+            <h2 className="text-lg font-extrabold text-[#102A43]">
+              অ্যাপ্লিকেশন লোড করতে সমস্যা হয়েছে
+            </h2>
+            <p className="text-xs sm:text-sm text-slate-600 leading-relaxed">
+              ব্রাউজার ক্যাশ বা সাময়িক ত্রুটির কারণে পেজটি সঠিকভাবে রেন্ডার করা যায়নি। নিচের বাটনে ক্লিক করে রিলোড করুন।
+            </p>
+            <button
+              type="button"
+              onClick={this.handleResetAndReload}
+              className="w-full py-3 px-4 rounded-xl bg-[#102A43] hover:bg-[#243B53] text-[#D4AF37] font-bold text-sm cursor-pointer transition"
+            >
+              রিসেট ও রিলোড করুন (Reload App)
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export default function App() {
   return (
-    <AppProvider>
-      <MainContent />
-    </AppProvider>
+    <AppErrorBoundary>
+      <AppProvider>
+        <MainContent />
+      </AppProvider>
+    </AppErrorBoundary>
   );
 }

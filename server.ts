@@ -456,7 +456,7 @@ export function createSanadPrepApp(options?: {
     } else {
       res.setHeader(
         'Content-Security-Policy',
-        "frame-ancestors 'self' https://aistudio.google.com https://*.google.com https://*.googleusercontent.com"
+        "frame-ancestors 'self' https://aistudio.google.com https://*.google.com https://*.googleusercontent.com https://*.usercontent.goog"
       );
     }
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
