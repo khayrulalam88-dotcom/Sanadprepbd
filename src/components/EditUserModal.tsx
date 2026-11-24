@@ -60,8 +60,9 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
   const [email, setEmail] = useState<string>(user.email || '');
   const [phone, setPhone] = useState<string>(user.phone || '');
   const [role, setRole] = useState<UserRole>(user.role || 'student');
+  const defaultPackage = packages.find(p => p.isActive) || packages[0];
   const [subscriptionStatus, setSubscriptionStatus] = useState<'free' | 'pro' | 'expired'>(user.subscriptionStatus || 'pro');
-  const [packageId, setPackageId] = useState<string>(user.packageId || packages[0]?.id || 'pkg_pro_mock');
+  const [packageId, setPackageId] = useState<string>(user.packageId || defaultPackage?.id || 'pkg_monthly');
 
   const initialDateStr = formatDateToLocalDateTimeInput(user.expiresAt);
   const [expiryDateInput, setExpiryDateInput] = useState<string>(initialDateStr);
@@ -71,12 +72,13 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
   const [errorMsg, setErrorMsg] = useState<string>('');
 
   useEffect(() => {
+    const activeDefaultPkg = packages.find(p => p.isActive) || packages[0];
     setName(user.name || '');
     setEmail(user.email || '');
     setPhone(user.phone || '');
     setRole(user.role || 'student');
     setSubscriptionStatus(user.subscriptionStatus || 'pro');
-    setPackageId(user.packageId || packages[0]?.id || 'pkg_pro_mock');
+    setPackageId(user.packageId || activeDefaultPkg?.id || 'pkg_monthly');
     setExpiryDateInput(formatDateToLocalDateTimeInput(user.expiresAt));
     setIsSessionRevoked(user.isSessionRevoked || false);
     setSuccessMsg('');
@@ -140,8 +142,8 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
         role,
         subscriptionStatus,
         packageId,
-        packageNameBn: selectedPkg?.nameBn || 'প্রো মডেল টেস্ট পাস',
-        packageNameEn: selectedPkg?.nameEn || 'Pro Model Test Pass',
+        packageNameBn: selectedPkg?.nameBn || defaultPackage?.nameBn || 'মাসিক সাবস্ক্রিপশন',
+        packageNameEn: selectedPkg?.nameEn || defaultPackage?.nameEn || 'Monthly Subscription',
         expiryDateInput,
         initialDateInput: initialDateStr,
         originalExpiresAtIso: user.expiresAt,

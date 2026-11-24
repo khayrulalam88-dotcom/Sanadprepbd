@@ -33,7 +33,6 @@ import {
   type FirebaseJwk
 } from '../worker/firebaseAuth.ts';
 import {
-  clearServiceAccountTokenCacheForTests,
   decodeDocumentFields,
   encodeDocumentFields,
   type FirestoreRestValue
@@ -127,6 +126,7 @@ async function createMigratedTestD1(): Promise<SqliteD1Adapter> {
   const db = new SqliteD1Adapter();
   await db.exec(fs.readFileSync(path.resolve('worker/migrations/0001_initial_edge_state.sql'), 'utf-8'));
   await db.exec(fs.readFileSync(path.resolve('worker/migrations/0002_question_bank_cache.sql'), 'utf-8'));
+  await db.exec(fs.readFileSync(path.resolve('worker/migrations/0003_keyless_edge_collections.sql'), 'utf-8'));
   return db;
 }
 
@@ -167,7 +167,7 @@ async function signJwt(
   return `${headerSeg}.${payloadSeg}.${base64UrlEncodeBytes(new Uint8Array(sig))}`;
 }
 
-function createPhase45FirestoreStub(serviceAccountEmail: string) {
+function createPhase45FirestoreStub() {
   const expectedPrefix = `https://firestore.googleapis.com/v1/projects/${EXPECTED_FIREBASE_PROJECT_ID}/databases/${EXPECTED_FIREBASE_DATABASE_ID}/documents`;
   const collections = new Map<string, Map<string, Record<string, unknown>>>();
   const readLog: Array<{ op: string; collection: string; docId?: string }> = [];
@@ -192,12 +192,7 @@ function createPhase45FirestoreStub(serviceAccountEmail: string) {
     const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
     const method = (init?.method || 'GET').toUpperCase();
 
-    if (urlStr === 'https://oauth2.googleapis.com/token') {
-      return new Response(
-        JSON.stringify({ access_token: `sa_token_${serviceAccountEmail}`, expires_in: 3600 }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } }
-      );
-    }
+    assert.equal(urlStr.startsWith('https://oauth2.googleapis.com'), false, 'Keyless Worker must never call oauth2 token API');
 
     if (urlStr === `${expectedPrefix}:batchGet`) {
       const body = JSON.parse(String(init?.body || '{}')) as { documents?: string[] };
@@ -702,10 +697,9 @@ describe('Phase 4.5 — Tasks 4 & 5: Cache TTL, Pagination, Empty-Cache Guard, C
 
   beforeEach(async () => {
     clearFirebaseJwksCacheForTests();
-    clearServiceAccountTokenCacheForTests();
     db = await createMigratedTestD1();
     keypair = await generateRs256Keypair('kid-phase45');
-    fsStub = createPhase45FirestoreStub('worker-sa@galvanic-aviary-tzp2g.iam.gserviceaccount.com');
+    fsStub = createPhase45FirestoreStub();
 
     fsStub.seedDoc('config', 'questionBankVersion', {
       version: 10,
@@ -802,10 +796,6 @@ describe('Phase 4.5 — Tasks 4 & 5: Cache TTL, Pagination, Empty-Cache Guard, C
       DB: db,
       FIREBASE_PROJECT_ID: EXPECTED_FIREBASE_PROJECT_ID,
       FIREBASE_DATABASE_ID: EXPECTED_FIREBASE_DATABASE_ID,
-      FIREBASE_SERVICE_ACCOUNT_JSON: JSON.stringify({
-        client_email: 'worker-sa@galvanic-aviary-tzp2g.iam.gserviceaccount.com',
-        private_key: keypair.pkcs8Pem
-      }),
       ALLOWED_ORIGIN: 'https://s--khayrul-alam.khayrulalam88.workers.dev'
     };
   }

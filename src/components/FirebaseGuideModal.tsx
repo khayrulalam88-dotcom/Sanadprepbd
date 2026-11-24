@@ -102,16 +102,15 @@ export const FirebaseGuideModal: React.FC = () => {
           </div>
         </div>
 
-        {/* Step-by-step Roadmap */}
+        {/* Architecture Checklist */}
         <div className="space-y-3 mb-6 p-4 rounded-2xl bg-slate-50 border border-slate-200 text-xs sm:text-sm">
-          <h4 className="font-bold text-[#102A43]">{t('পরবর্তী স্টেজসমূহ (Roadmap):', 'Upcoming Stages Roadmap:')}</h4>
+          <h4 className="font-bold text-[#102A43]">{t('প্রোডাকশন আর্কিটেকচার স্ট্যাটাস:', 'Production Architecture Checklist:')}</h4>
           <ol className="list-decimal list-inside space-y-1.5 text-slate-600">
-            <li><strong>Stage 1 (Done):</strong> Working UI, 60-min timed exam, exact marking, review page, Sanad Prep BD branding.</li>
-            <li><strong>Stage 2:</strong> Connect Firebase Authentication & Cloud Firestore database with terms confirmation.</li>
-            <li><strong>Stage 3:</strong> Trusted server-side timing and answer scoring functions.</li>
-            <li><strong>Stage 4:</strong> Production admin dashboard and question workflow.</li>
-            <li><strong>Stage 5:</strong> Live bKash/Nagad payment verification.</li>
-            <li><strong>Stage 6:</strong> Firestore Security Rules (`firestore.rules`) and production deployment.</li>
+            <li><strong>Active:</strong> Sanad Prep BD UI, 60-minute timed exam engine, +1/-0.25 scoring, and answer review.</li>
+            <li><strong>Active:</strong> Firebase Authentication (Google Sign-In &amp; Email/Password) with email verification enforcement.</li>
+            <li><strong>Active:</strong> Server-authoritative timing, exam scoring, and question key isolation on Cloudflare Workers + Firestore.</li>
+            <li><strong>Active:</strong> Owner Admin Panel with single-owner authorization, manual bKash/Nagad approval, and audit logs.</li>
+            <li><strong>Active:</strong> Fail-closed Firestore Security Rules (`firestore.rules`) and D1 edge session/rate-limit enforcement.</li>
           </ol>
         </div>
 

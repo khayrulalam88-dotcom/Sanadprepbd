@@ -33,9 +33,15 @@ export const SubscriptionPlansSection: React.FC<Props> = ({
     t, 
     packages, 
     examDateConfig, 
+    paymentSettings,
     activeSubscription, 
     openSubscriptionModal 
   } = useApp();
+
+  const paymentSupportLabel =
+    paymentSettings.bkashNumber === paymentSettings.nagadNumber
+      ? `Support: ${paymentSettings.bkashNumber} (bKash/Nagad)`
+      : `Support: bKash ${paymentSettings.bkashNumber} / Nagad ${paymentSettings.nagadNumber}`;
 
   const formattedExamDate = new Date(examDateConfig.targetExamDate).toLocaleDateString(
     language === 'bn' ? 'bn-BD' : 'en-US',
@@ -227,7 +233,7 @@ export const SubscriptionPlansSection: React.FC<Props> = ({
           </span>
         </div>
         <span className="text-[11px] font-bold text-slate-500 whitespace-nowrap">
-          Support: 01712607777 (bKash/Nagad)
+          {paymentSupportLabel}
         </span>
       </div>
 

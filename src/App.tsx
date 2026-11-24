@@ -7,26 +7,56 @@ import React, { Component, Suspense, lazy, useState } from 'react';
 import { AppProvider, useApp } from './context/AppContext';
 import { Navbar } from './components/Navbar';
 import { LandingPage } from './components/LandingPage';
-import { Dashboard } from './components/Dashboard';
-import { ExamScreen } from './components/ExamScreen';
-import { PracticeScreen } from './components/PracticeScreen';
-import { ResultsScreen } from './components/ResultsScreen';
-import { SubjectsView } from './components/SubjectsView';
-import { HistoryView } from './components/HistoryView';
-import { QuestionBankView } from './components/QuestionBankView';
-import { CustomTestModal } from './components/CustomTestModal';
-import { SubscriptionModal } from './components/SubscriptionModal';
-import { FirebaseGuideModal } from './components/FirebaseGuideModal';
-import { LoginModal } from './components/LoginModal';
-import { InfoAndSearchModals } from './components/InfoAndSearchModals';
 import { Logo } from './components/Logo';
-import { Scale, Mail, Shield, FileText, CheckCircle2, AlertTriangle, X } from 'lucide-react';
+import { Shield, AlertTriangle, X } from 'lucide-react';
 
+const Dashboard = lazy(() =>
+  import('./components/Dashboard').then(m => ({ default: m.Dashboard }))
+);
+const ExamScreen = lazy(() =>
+  import('./components/ExamScreen').then(m => ({ default: m.ExamScreen }))
+);
+const PracticeScreen = lazy(() =>
+  import('./components/PracticeScreen').then(m => ({ default: m.PracticeScreen }))
+);
+const ResultsScreen = lazy(() =>
+  import('./components/ResultsScreen').then(m => ({ default: m.ResultsScreen }))
+);
+const SubjectsView = lazy(() =>
+  import('./components/SubjectsView').then(m => ({ default: m.SubjectsView }))
+);
+const HistoryView = lazy(() =>
+  import('./components/HistoryView').then(m => ({ default: m.HistoryView }))
+);
+const QuestionBankView = lazy(() =>
+  import('./components/QuestionBankView').then(m => ({ default: m.QuestionBankView }))
+);
+const CustomTestModal = lazy(() =>
+  import('./components/CustomTestModal').then(m => ({ default: m.CustomTestModal }))
+);
+const SubscriptionModal = lazy(() =>
+  import('./components/SubscriptionModal').then(m => ({ default: m.SubscriptionModal }))
+);
+const FirebaseGuideModal = lazy(() =>
+  import('./components/FirebaseGuideModal').then(m => ({ default: m.FirebaseGuideModal }))
+);
+const LoginModal = lazy(() =>
+  import('./components/LoginModal').then(m => ({ default: m.LoginModal }))
+);
+const InfoAndSearchModals = lazy(() =>
+  import('./components/InfoAndSearchModals').then(m => ({ default: m.InfoAndSearchModals }))
+);
 const TestingSuiteModal = lazy(() =>
   import('./components/TestingSuiteModal').then(m => ({ default: m.TestingSuiteModal }))
 );
 const AdminPanel = lazy(() =>
   import('./components/AdminPanel').then(m => ({ default: m.AdminPanel }))
+);
+
+const ScreenLoaderFallback: React.FC = () => (
+  <div className="py-20 text-center text-sm font-semibold text-slate-500">
+    লোড হচ্ছে...
+  </div>
 );
 
 const MainContent: React.FC = () => {
@@ -66,33 +96,34 @@ const MainContent: React.FC = () => {
       )}
 
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 pt-6 sm:pt-8">
-        {activeScreen === 'landing' && <LandingPage />}
-        {activeScreen === 'dashboard' && <Dashboard />}
-        {activeScreen === 'exam' && <ExamScreen />}
-        {activeScreen === 'practice' && <PracticeScreen />}
-        {activeScreen === 'result' && <ResultsScreen />}
-        {activeScreen === 'subjects' && <SubjectsView />}
-        {activeScreen === 'question_bank' && <QuestionBankView />}
-        {activeScreen === 'history' && <HistoryView />}
-        {activeScreen === 'admin' && (
-          <Suspense fallback={<div className="py-20 text-center text-sm text-slate-500">Loading Admin Console...</div>}>
-            <AdminPanel />
+        {activeScreen === 'landing' ? (
+          <LandingPage />
+        ) : (
+          <Suspense fallback={<ScreenLoaderFallback />}>
+            {activeScreen === 'dashboard' && <Dashboard />}
+            {activeScreen === 'exam' && <ExamScreen />}
+            {activeScreen === 'practice' && <PracticeScreen />}
+            {activeScreen === 'result' && <ResultsScreen />}
+            {activeScreen === 'subjects' && <SubjectsView />}
+            {activeScreen === 'question_bank' && <QuestionBankView />}
+            {activeScreen === 'history' && <HistoryView />}
+            {activeScreen === 'admin' && <AdminPanel />}
           </Suspense>
         )}
       </main>
 
       {/* Global Modals */}
-      <SubscriptionModal />
       <Suspense fallback={null}>
+        <SubscriptionModal />
         <TestingSuiteModal />
+        <FirebaseGuideModal />
+        <LoginModal />
+        <InfoAndSearchModals />
+        <CustomTestModal 
+          isOpen={showCustomTestModal} 
+          onClose={() => setShowCustomTestModal(false)} 
+        />
       </Suspense>
-      <FirebaseGuideModal />
-      <LoginModal />
-      <InfoAndSearchModals />
-      <CustomTestModal 
-        isOpen={showCustomTestModal} 
-        onClose={() => setShowCustomTestModal(false)} 
-      />
 
       {/* Privacy / Terms Modal */}
       {showPolicyModal && (
@@ -284,6 +315,11 @@ class AppErrorBoundary extends Component<{ children: React.ReactNode }, ErrorBou
             <p className="text-xs sm:text-sm text-slate-600 leading-relaxed">
               ব্রাউজার ক্যাশ বা সাময়িক ত্রুটির কারণে পেজটি সঠিকভাবে রেন্ডার করা যায়নি। নিচের বাটনে ক্লিক করে রিলোড করুন।
             </p>
+            {this.state.errorMessage && (
+              <p className="text-[11px] font-mono text-rose-700 bg-rose-50 border border-rose-200 rounded-xl p-2.5 break-words text-left">
+                {this.state.errorMessage}
+              </p>
+            )}
             <button
               type="button"
               onClick={this.handleResetAndReload}

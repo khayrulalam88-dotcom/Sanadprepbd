@@ -1,18 +1,26 @@
 import { INITIAL_SUBJECTS } from '../src/data/mockData.ts';
+import { INITIAL_EXAMS } from '../src/data/initialExams.ts';
 import { INITIAL_EXAM_DATE_CONFIG, INITIAL_PACKAGES } from '../src/data/initialPackages.ts';
 import { getQuestionsForExam } from '../src/utils/modelTestGenerator.ts';
 import type { Exam, Question, SubscriptionPackage } from '../src/types/index.ts';
 import {
   assertOwnerAdmin,
   authenticateFirebaseRequest,
+  extractBearerToken,
   isOwnerUser,
   type JwksFetcher
 } from './firebaseAuth.ts';
+import { FirestoreRestClient } from './firestoreRest.ts';
 import {
-  checkUserHasActiveSubscriptionRest,
-  FirestoreRestClient
-} from './firestoreRest.ts';
-import { consumeRateLimitD1, validateAndTouchSessionD1, type RateLimitResult } from './d1Store.ts';
+  checkUserHasActiveSubscriptionKeyless,
+  consumeRateLimitD1,
+  getExamFromCacheD1,
+  listExamsFromCacheD1,
+  upsertExamsBatchD1,
+  validateAndTouchSessionD1,
+  writeAuditLogD1,
+  type RateLimitResult
+} from './d1Store.ts';
 import {
   createQuestionBankVersionPayload,
   deleteQuestionFromCacheD1,
@@ -26,6 +34,7 @@ import {
   parseQuestionBankCacheTtlMs,
   querySanitizedQuestionsFromD1,
   sanitizeQuestion,
+  syncQuestionsAndKeysToD1,
   upsertSingleQuestionCacheD1
 } from './questionCache.ts';
 import {
@@ -118,6 +127,44 @@ async function parseJsonObjectBody(request: Request): Promise<Record<string, unk
   }
 }
 
+function normalizeExamRecord(d: Record<string, unknown> & { id: string }): Exam {
+  return {
+    ...(d as unknown as Omit<Exam, 'id'>),
+    id: d.id,
+    isActive: d.isActive !== undefined ? Boolean(d.isActive) : !d.isPaid || d.id === 'exam_model_test_01',
+    scheduledDate: typeof d.scheduledDate === 'string' && d.scheduledDate ? d.scheduledDate : undefined
+  };
+}
+
+export async function resolveExamByIdKeyless(
+  db: NonNullable<WorkerEnv['DB']>,
+  client: FirestoreRestClient,
+  examId: string
+): Promise<Exam | null> {
+  const cached = await getExamFromCacheD1(db, examId);
+  try {
+    const doc = await client.getDocument<Record<string, unknown>>('exams', examId);
+    if (doc) {
+      const normalized = normalizeExamRecord(doc);
+      await upsertExamsBatchD1(db, [normalized]).catch(() => undefined);
+      return normalized;
+    }
+  } catch (err) {
+    if (!(err instanceof WorkerHttpError && (err.status === 403 || err.code === 'PERMISSION_DENIED'))) {
+      if (!cached) {
+        const staticFallback = INITIAL_EXAMS.find(e => e.id === examId);
+        if (staticFallback) return normalizeExamRecord(staticFallback as unknown as Record<string, unknown> & { id: string });
+      }
+      throw err;
+    }
+  }
+  if (cached) return cached;
+  const staticExam = INITIAL_EXAMS.find(e => e.id === examId);
+  return staticExam
+    ? normalizeExamRecord(staticExam as unknown as Record<string, unknown> & { id: string })
+    : null;
+}
+
 export async function handlePhase2Routes(
   ctx: Phase2RouteContext
 ): Promise<Phase2RouteResult | null> {
@@ -128,21 +175,30 @@ export async function handlePhase2Routes(
     ctx.questionBankCacheTtlMsOverride
   );
   const windowMs = ctx.rateLimitOverrides?.windowMs ?? 60_000;
+  const nowIso = new Date(nowMs).toISOString();
 
   // ---------------------------------------------------------
   // 1. PUBLIC CATALOG ENDPOINTS (No keys/explanations exposed)
   // ---------------------------------------------------------
   if (pathname === '/api/subjects' && method === 'GET') {
-    const subjectDocs = await firestoreClient.listDocuments<Record<string, unknown>>('subjects', {
-      pageSize: 100,
-      maxPages: 2
-    });
+    const subjectDocs = await firestoreClient
+      .listDocuments<Record<string, unknown>>('subjects', {
+        pageSize: 100,
+        maxPages: 2
+      })
+      .catch(() => []);
     const subjects = subjectDocs.length > 0 ? subjectDocs : INITIAL_SUBJECTS;
     return { status: 200, payload: { subjects } };
   }
 
   if (pathname === '/api/subjects/counts' && method === 'GET') {
-    await ensureSanitizedQuestionsSyncedD1(db, firestoreClient, { ttlMs, nowMs });
+    const bearer = extractBearerToken(ctx.request);
+    const readerClient = bearer ? firestoreClient.withToken(bearer) : firestoreClient;
+    await ensureSanitizedQuestionsSyncedD1(db, readerClient, {
+      ttlMs,
+      nowMs,
+      allowEmptyOnForbidden: true
+    });
     const { counts, total } = await getSubjectQuestionCountsFromD1(db);
     return { status: 200, payload: { counts, total } };
   }
@@ -150,19 +206,26 @@ export async function handlePhase2Routes(
   const subjectChaptersMatch = pathname.match(/^\/api\/subjects\/([^/]+)\/chapters$/);
   if (subjectChaptersMatch && method === 'GET') {
     const subjectId = decodeURIComponent(subjectChaptersMatch[1]).trim();
-    const subjectDocs = await firestoreClient.listDocuments<Record<string, unknown>>('subjects', {
-      pageSize: 100,
-      maxPages: 2
-    });
+    const subjectDocs = await firestoreClient
+      .listDocuments<Record<string, unknown>>('subjects', {
+        pageSize: 100,
+        maxPages: 2
+      })
+      .catch(() => []);
     const catalog = subjectDocs.length > 0 ? subjectDocs : INITIAL_SUBJECTS;
     const subject = catalog.find(s => String(s.id) === subjectId);
     if (!subject) {
       throw new WorkerHttpError(404, 'SUBJECT_NOT_FOUND', 'Subject not found.');
     }
 
-    await ensureSanitizedQuestionsSyncedD1(db, firestoreClient, { ttlMs, nowMs });
+    const bearer = extractBearerToken(ctx.request);
+    const readerClient = bearer ? firestoreClient.withToken(bearer) : firestoreClient;
+    await ensureSanitizedQuestionsSyncedD1(db, readerClient, {
+      ttlMs,
+      nowMs,
+      allowEmptyOnForbidden: true
+    });
 
-    // Derive sanitized chapter/topic counts from D1 cache (only non-sensitive fields)
     const topicRows = await db
       .prepare(
         `SELECT COALESCE(NULLIF(topic_id, ''), 'general') AS chapter_id,
@@ -245,15 +308,56 @@ export async function handlePhase2Routes(
   }
 
   if (pathname === '/api/exams' && method === 'GET') {
-    const examDocs = await firestoreClient.listDocuments<Record<string, unknown>>('exams', {
-      pageSize: 200,
-      maxPages: 5
-    });
-    const examList = examDocs.map(d => ({
-      ...d,
-      isActive: d.isActive !== undefined ? d.isActive : (!d.isPaid || d.id === 'exam_model_test_01'),
-      scheduledDate: typeof d.scheduledDate === 'string' && d.scheduledDate ? d.scheduledDate : undefined
-    }));
+    const bearer = extractBearerToken(ctx.request);
+    const readerClient = bearer ? firestoreClient.withToken(bearer) : firestoreClient;
+    const cachedExams = await listExamsFromCacheD1(db);
+
+    let liveExamDocs: Array<Record<string, unknown> & { id: string }> = [];
+    let fetchedFull = false;
+    try {
+      liveExamDocs = await readerClient.listDocuments<Record<string, unknown>>('exams', {
+        pageSize: 200,
+        maxPages: 5
+      });
+      fetchedFull = true;
+    } catch (err) {
+      if (!(err instanceof WorkerHttpError && (err.status === 403 || err.code === 'PERMISSION_DENIED'))) {
+        throw err;
+      }
+    }
+
+    if (!fetchedFull) {
+      liveExamDocs = await readerClient
+        .runQuery<Record<string, unknown>>({
+          collection: 'exams',
+          where: [{ field: 'isPaid', op: 'EQUAL', value: false }]
+        })
+        .catch(() => []);
+    }
+
+    const mergedMap = new Map<string, Exam>();
+    // Middle precedence: D1 cached exams synced by Owner Admin
+    for (const c of cachedExams) {
+      mergedMap.set(c.id, normalizeExamRecord(c as unknown as Record<string, unknown> & { id: string }));
+    }
+    // Highest precedence: live Firestore docs
+    const normalizedLive = liveExamDocs.map(d => normalizeExamRecord(d));
+    for (const live of normalizedLive) {
+      mergedMap.set(live.id, live);
+    }
+
+    if (normalizedLive.length > 0) {
+      await upsertExamsBatchD1(db, normalizedLive, nowIso).catch(() => undefined);
+    }
+
+    // Fallback to static catalog only if neither D1 cache nor Firestore returned any exams
+    if (mergedMap.size === 0) {
+      for (const s of INITIAL_EXAMS) {
+        mergedMap.set(s.id, normalizeExamRecord(s as unknown as Record<string, unknown> & { id: string }));
+      }
+    }
+
+    const examList = Array.from(mergedMap.values());
     return { status: 200, payload: { exams: examList } };
   }
 
@@ -272,7 +376,7 @@ export async function handlePhase2Routes(
     await validateAndTouchSessionD1(db, {
       sessionId: ctx.request.headers.get('x-session-id') || '',
       uid: authUser.uid,
-      nowIso: new Date(nowMs).toISOString()
+      nowIso
     });
 
     const remote = await getRemoteQuestionBankVersion(firestoreClient);
@@ -290,7 +394,7 @@ export async function handlePhase2Routes(
     await validateAndTouchSessionD1(db, {
       sessionId: ctx.request.headers.get('x-session-id') || '',
       uid: authUser.uid,
-      nowIso: new Date(nowMs).toISOString()
+      nowIso
     });
 
     const subjectId = url.searchParams.get('subjectId')?.trim() || undefined;
@@ -307,14 +411,20 @@ export async function handlePhase2Routes(
     const safeLimit = parseOptionalIntParam(url.searchParams.get('limit'), 'limit', 1, 500);
     const safeOffset = parseOptionalIntParam(url.searchParams.get('offset'), 'offset', 0) ?? 0;
 
-    await ensureSanitizedQuestionsSyncedD1(db, firestoreClient, { ttlMs, nowMs });
+    const isOwner = isOwnerUser(authUser, env);
+    const userClient = firestoreClient.withToken(authUser.idToken);
+
+    await ensureSanitizedQuestionsSyncedD1(db, userClient, {
+      ttlMs,
+      nowMs,
+      isOwner
+    });
 
     if (examId) {
-      const targetExamDoc = await firestoreClient.getDocument<Record<string, unknown>>('exams', examId);
-      if (targetExamDoc) {
-        const targetExam = targetExamDoc as unknown as Exam;
-        if (targetExam.isPaid && !isOwnerUser(authUser, env)) {
-          const subCheck = await checkUserHasActiveSubscriptionRest(firestoreClient, authUser.uid, nowMs);
+      const targetExam = await resolveExamByIdKeyless(db, userClient, examId);
+      if (targetExam) {
+        if (targetExam.isPaid && !isOwner) {
+          const subCheck = await checkUserHasActiveSubscriptionKeyless(db, userClient, authUser.uid, nowMs);
           if (!subCheck.active) {
             throw new WorkerHttpError(
               403,
@@ -396,7 +506,7 @@ export async function handlePhase2Routes(
     await validateAndTouchSessionD1(db, {
       sessionId: ctx.request.headers.get('x-session-id') || '',
       uid: authUser.uid,
-      nowIso: new Date(nowMs).toISOString()
+      nowIso
     });
 
     const subjectId = url.searchParams.get('subjectId')?.trim() || undefined;
@@ -413,9 +523,10 @@ export async function handlePhase2Routes(
     const safeOffset = parseOptionalIntParam(url.searchParams.get('offset'), 'offset', 0) ?? 0;
 
     const isOwner = isOwnerUser(authUser, env);
+    const userClient = firestoreClient.withToken(authUser.idToken);
     const subActive = isOwner
       ? true
-      : (await checkUserHasActiveSubscriptionRest(firestoreClient, authUser.uid, nowMs)).active;
+      : (await checkUserHasActiveSubscriptionKeyless(db, userClient, authUser.uid, nowMs)).active;
 
     if (paidOnly && !subActive) {
       throw new WorkerHttpError(
@@ -425,7 +536,7 @@ export async function handlePhase2Routes(
       );
     }
 
-    await ensureSanitizedQuestionsSyncedD1(db, firestoreClient, { ttlMs, nowMs });
+    await ensureSanitizedQuestionsSyncedD1(db, userClient, { ttlMs, nowMs, isOwner });
 
     const effectiveLimit = subActive ? requestedLimit : Math.min(10, requestedLimit);
     const { questions, total } = await querySanitizedQuestionsFromD1(db, {
@@ -493,7 +604,7 @@ export async function handlePhase2Routes(
     await validateAndTouchSessionD1(db, {
       sessionId: ctx.request.headers.get('x-session-id') || '',
       uid: authUser.uid,
-      nowIso: new Date(nowMs).toISOString()
+      nowIso
     });
 
     const body = await parseJsonObjectBody(ctx.request);
@@ -515,13 +626,16 @@ export async function handlePhase2Routes(
       );
     }
 
-    const qMeta = await getSanitizedQuestionMeta(db, firestoreClient, questionId);
+    const isOwner = isOwnerUser(authUser, env);
+    const userClient = firestoreClient.withToken(authUser.idToken);
+
+    const qMeta = await getSanitizedQuestionMeta(db, userClient, questionId);
     if (!qMeta) {
       throw new WorkerHttpError(404, 'QUESTION_NOT_FOUND', 'Question not found.');
     }
 
-    if (!qMeta.isDemoSample && !isOwnerUser(authUser, env)) {
-      const subCheck = await checkUserHasActiveSubscriptionRest(firestoreClient, authUser.uid, nowMs);
+    if (!qMeta.isDemoSample && !isOwner) {
+      const subCheck = await checkUserHasActiveSubscriptionKeyless(db, userClient, authUser.uid, nowMs);
       if (!subCheck.active) {
         throw new WorkerHttpError(
           403,
@@ -531,7 +645,7 @@ export async function handlePhase2Routes(
       }
     }
 
-    const keyMap = await getAuthoritativeQuestionKeys(db, firestoreClient, [questionId], { ttlMs, nowMs });
+    const keyMap = await getAuthoritativeQuestionKeys(db, userClient, [questionId], { ttlMs, nowMs });
     const qKey = keyMap.get(questionId);
     if (!qKey) {
       throw new WorkerHttpError(404, 'QUESTION_NOT_FOUND', 'Question answer key not found.');
@@ -554,9 +668,8 @@ export async function handlePhase2Routes(
   }
 
   // ---------------------------------------------------------
-  // 3. OWNER ADMIN QUESTION BANK CRUD & CACHE INVALIDATION
-  //    (Explicit Owner UID + Verified Email gate required — Service Account
-  //     bypasses Firestore rules, so Worker MUST enforce strict authorization!)
+  // 3. OWNER ADMIN QUESTION BANK CRUD & D1 EDGE SYNC
+  //    (Verified Owner Admin ID Token passes Firestore `isOwnerAccount()`)
   // ---------------------------------------------------------
   if (pathname === '/api/admin/questions' && method === 'GET') {
     const authUser = await authenticateFirebaseRequest(ctx.request, {
@@ -568,8 +681,56 @@ export async function handlePhase2Routes(
     });
     assertOwnerAdmin(authUser, env);
 
-    const list = await fetchAllQuestionsWithKeysAuthoritative(firestoreClient);
+    const ownerClient = firestoreClient.withToken(authUser.idToken);
+    const list = await fetchAllQuestionsWithKeysAuthoritative(ownerClient);
     return { status: 200, payload: { questions: list } };
+  }
+
+  if (pathname === '/api/admin/questions/sync-cache' && method === 'POST') {
+    const authUser = await authenticateFirebaseRequest(ctx.request, {
+      projectId,
+      environment: env.ENVIRONMENT,
+      jwksFetcher: ctx.jwksFetcher,
+      tokenVerifier: ctx.tokenVerifier,
+      nowMs
+    });
+    assertOwnerAdmin(authUser, env);
+
+    const ownerClient = firestoreClient.withToken(authUser.idToken);
+    const syncRes = await syncQuestionsAndKeysToD1(db, ownerClient, { nowMs });
+
+    const examDocs = await ownerClient
+      .listDocuments<Record<string, unknown>>('exams', { pageSize: 200, maxPages: 5 })
+      .catch(() => []);
+    if (examDocs.length > 0) {
+      await upsertExamsBatchD1(
+        db,
+        examDocs.map(d => normalizeExamRecord(d)),
+        nowIso
+      );
+    }
+
+    const auditEntry: AuditLog = {
+      id: `log_${nowMs}_${Math.random().toString(36).slice(2, 6)}`,
+      userId: authUser.uid,
+      userName: authUser.email || 'Owner Admin',
+      action: 'SYNC_EDGE_QUESTION_CACHE',
+      details: `Owner synced ${syncRes.questionCount} questions, ${syncRes.keyCount} keys, and ${examDocs.length} exams into D1 edge cache.`,
+      timestamp: nowIso
+    };
+    await writeAuditLogD1(db, auditEntry, true);
+    await ownerClient
+      .setDocument('auditLogs', auditEntry.id, { ...auditEntry })
+      .catch(() => undefined);
+
+    return {
+      status: 200,
+      payload: {
+        success: true,
+        ...syncRes,
+        examsCount: examDocs.length
+      }
+    };
   }
 
   if (pathname === '/api/admin/questions' && method === 'POST') {
@@ -616,7 +777,6 @@ export async function handlePhase2Routes(
         ? (q.optionsEn as string[]).map(opt => opt.trim())
         : cleanOptionsBn;
 
-    const nowIso = new Date(nowMs).toISOString();
     const qId =
       typeof q.id === 'string' && q.id.trim()
         ? q.id.trim().slice(0, 128)
@@ -658,7 +818,8 @@ export async function handlePhase2Routes(
       timestamp: nowIso
     };
 
-    await firestoreClient.commitWrites([
+    const ownerClient = firestoreClient.withToken(authUser.idToken);
+    await ownerClient.commitWrites([
       {
         type: 'set',
         collection: 'questions',
@@ -691,6 +852,7 @@ export async function handlePhase2Routes(
       }
     ]);
 
+    await writeAuditLogD1(db, auditEntry, true);
     await upsertSingleQuestionCacheD1(db, fullQ, versionPayload.versionToken, nowIso, {
       onlyIfCacheInitialized: true
     });
@@ -714,7 +876,6 @@ export async function handlePhase2Routes(
     });
     assertOwnerAdmin(authUser, env);
 
-    const nowIso = new Date(nowMs).toISOString();
     const versionPayload = createQuestionBankVersionPayload(nowIso, nowMs);
     const auditEntry: AuditLog = {
       id: `log_${nowMs}_${Math.random().toString(36).slice(2, 6)}`,
@@ -725,7 +886,8 @@ export async function handlePhase2Routes(
       timestamp: nowIso
     };
 
-    await firestoreClient.commitWrites([
+    const ownerClient = firestoreClient.withToken(authUser.idToken);
+    await ownerClient.commitWrites([
       {
         type: 'set',
         collection: 'config',
@@ -740,6 +902,7 @@ export async function handlePhase2Routes(
       }
     ]);
 
+    await writeAuditLogD1(db, auditEntry, true);
     await invalidateLocalD1QuestionCache(db);
     return {
       status: 200,
@@ -766,7 +929,6 @@ export async function handlePhase2Routes(
       throw new WorkerHttpError(400, 'INVALID_REQUEST', 'Valid questionId is required.');
     }
 
-    const nowIso = new Date(nowMs).toISOString();
     const versionPayload = createQuestionBankVersionPayload(nowIso, nowMs);
     const auditEntry: AuditLog = {
       id: `log_${nowMs}_${Math.random().toString(36).slice(2, 6)}`,
@@ -777,13 +939,15 @@ export async function handlePhase2Routes(
       timestamp: nowIso
     };
 
-    await firestoreClient.commitWrites([
+    const ownerClient = firestoreClient.withToken(authUser.idToken);
+    await ownerClient.commitWrites([
       { type: 'delete', collection: 'questions', docId: questionId },
       { type: 'delete', collection: 'questionKeys', docId: questionId },
       { type: 'set', collection: 'config', docId: 'questionBankVersion', data: versionPayload },
       { type: 'set', collection: 'auditLogs', docId: auditEntry.id, data: { ...auditEntry } }
     ]);
 
+    await writeAuditLogD1(db, auditEntry, true);
     await deleteQuestionFromCacheD1(db, questionId, versionPayload.versionToken, nowIso);
     return {
       status: 200,

@@ -55,10 +55,11 @@ service cloud.firestore {
     // Students must have verified email, valid bounded schema, and cannot elevate role/subscription fields.
     match /users/{userId} {
       allow read: if isOwner(userId) || isOwnerAccount();
-      allow create: if isAuthenticated() && request.auth.uid == userId && (
-        isOwnerAccount() || (
-          request.auth.token.email_verified == true &&
-          request.resource.data.keys().hasAll(['uid', 'name', 'role', 'subscriptionStatus', 'createdAt']) &&
+      allow create: if isOwnerAccount() || (
+        isAuthenticated() &&
+        request.auth.uid == userId &&
+        request.auth.token.email_verified == true &&
+        request.resource.data.keys().hasAll(['uid', 'name', 'role', 'subscriptionStatus', 'createdAt']) &&
           request.resource.data.keys().hasOnly([
             'uid', 'name', 'email', 'phone', 'role', 'subscriptionStatus',
             'subscriptionExpiresAt', 'activePackageId', 'activePackageNameBn',
@@ -73,7 +74,6 @@ service cloud.firestore {
           request.resource.data.role == 'student' &&
           request.resource.data.subscriptionStatus == 'free' &&
           (!('subscriptionExpiresAt' in request.resource.data) || request.resource.data.subscriptionExpiresAt == null)
-        )
       );
       allow update: if isOwnerAccount() || (
         isOwner(userId) &&
@@ -100,10 +100,11 @@ service cloud.firestore {
     // ---------------------------------------------------------
     // 3. PAYMENT REQUESTS (/paymentRequests/{paymentId})
     // ---------------------------------------------------------
-    // Backend Admin SDK ONLY for writes (single-source-of-truth pricing & TrxID enforcement).
+    // Students submit payments ONLY via the backend/Worker API; verified Owner Admin manages approvals.
     match /paymentRequests/{paymentId} {
       allow read: if (isAuthenticated() && resource.data.userId == request.auth.uid) || isOwnerAccount();
-      allow create, update, delete: if false;
+      allow create, update: if isOwnerAccount();
+      allow delete: if false;
     }
 
     // ---------------------------------------------------------
@@ -207,7 +208,8 @@ service cloud.firestore {
 
     match /auditLogs/{logId} {
       allow read: if isOwnerAccount();
-      allow create, update, delete: if false;
+      allow create: if isOwnerAccount();
+      allow update, delete: if false;
     }
   }
 }

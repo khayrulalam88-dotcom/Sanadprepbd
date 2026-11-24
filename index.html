@@ -15,7 +15,76 @@
     <link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;500;600;700&family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
   </head>
   <body class="bg-slate-50 text-slate-900 font-sans antialiased selection:bg-emerald-500 selection:text-white">
-    <div id="root"></div>
+    <div id="root">
+      <div id="premount-loader" style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;font-family:'Hind Siliguri','Inter',system-ui,sans-serif;background:#F5F7FA;color:#102A43;">
+        <div style="text-align:center;max-width:380px;">
+          <div style="width:40px;height:40px;margin:0 auto 14px;border:3px solid #cbd5e1;border-top-color:#102A43;border-radius:50%;animation:sanadSpin 0.8s linear infinite;"></div>
+          <p style="margin:0;font-weight:700;font-size:15px;">Sanad Prep BD লোড হচ্ছে...</p>
+          <p style="margin:6px 0 0;font-size:12px;color:#64748b;">অনুগ্রহ করে কয়েক সেকেন্ড অপেক্ষা করুন</p>
+        </div>
+      </div>
+      <style>@keyframes sanadSpin{to{transform:rotate(360deg)}}</style>
+    </div>
+    <script>
+      (function () {
+        var preMountErrors = [];
+        function showBootFallback(reason) {
+          if (window.__SANADPREP_MOUNTED__) return;
+          var root = document.getElementById('root');
+          if (!root) return;
+          var safeReason = String(reason || 'অ্যাপ্লিকেশন স্ক্রিপ্ট লোড হতে পারেনি।').slice(0, 300);
+          root.textContent = '';
+          var wrap = document.createElement('div');
+          wrap.style.cssText = 'min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;background:#F5F7FA;color:#102A43;font-family:system-ui,-apple-system,sans-serif;';
+          var card = document.createElement('div');
+          card.style.cssText = 'max-width:440px;width:100%;background:#fff;border:1px solid #e2e8f0;border-radius:20px;padding:24px;box-shadow:0 10px 25px rgba(16,42,67,0.08);text-align:center;';
+          var title = document.createElement('h2');
+          title.style.cssText = 'margin:0 0 8px;font-size:18px;font-weight:800;color:#102A43;';
+          title.textContent = 'অ্যাপটি লোড করতে সমস্যা হয়েছে';
+          var desc = document.createElement('p');
+          desc.style.cssText = 'margin:0 0 12px;font-size:13px;color:#475569;line-height:1.5;';
+          desc.textContent = 'প্রিভিউ বা ব্রাউজার সিকিউরিটি/নেটওয়ার্কের কারণে অ্যাপ্লিকেশন চালু হয়নি। নিচের বাটনে ক্লিক করে রিলোড করুন অথবা নতুন ট্যাবে খুলুন।';
+          var detail = document.createElement('div');
+          detail.style.cssText = 'margin:0 0 16px;padding:10px;border-radius:10px;background:#fef2f2;border:1px solid #fecaca;color:#991b1b;font-size:11px;font-family:monospace;word-break:break-word;text-align:left;';
+          detail.textContent = safeReason;
+          var btn = document.createElement('button');
+          btn.type = 'button';
+          btn.style.cssText = 'width:100%;padding:11px 16px;border-radius:12px;border:none;background:#102A43;color:#D4AF37;font-weight:700;font-size:13px;cursor:pointer;margin-bottom:8px;';
+          btn.textContent = 'পুনরায় লোড করুন (Reload)';
+          btn.onclick = function () { window.location.reload(); };
+          var link = document.createElement('a');
+          link.href = window.location.href;
+          link.target = '_blank';
+          link.rel = 'noopener noreferrer';
+          link.style.cssText = 'display:block;padding:9px 16px;border-radius:12px;border:1px solid #cbd5e1;color:#102A43;font-weight:600;font-size:12px;text-decoration:none;';
+          link.textContent = 'নতুন ট্যাবে খুলুন (Open in New Tab)';
+          card.appendChild(title);
+          card.appendChild(desc);
+          card.appendChild(detail);
+          card.appendChild(btn);
+          card.appendChild(link);
+          wrap.appendChild(card);
+          root.appendChild(wrap);
+        }
+        window.addEventListener('error', function (e) {
+          if (window.__SANADPREP_MOUNTED__) return;
+          var msg = (e && e.message) || (e && e.target && e.target.src ? 'Module load failed: ' + e.target.src : 'Script load error');
+          preMountErrors.push(msg);
+          showBootFallback(preMountErrors[0]);
+        }, true);
+        window.addEventListener('unhandledrejection', function (e) {
+          if (window.__SANADPREP_MOUNTED__) return;
+          var reason = e && e.reason ? (e.reason.message || String(e.reason)) : 'Unhandled promise rejection';
+          preMountErrors.push(reason);
+          showBootFallback(preMountErrors[0]);
+        });
+        setTimeout(function () {
+          if (!window.__SANADPREP_MOUNTED__) {
+            showBootFallback(preMountErrors[0] || 'Timeout: মডিউল লোড হতে অতিরিক্ত সময় লাগছে (Network / Preview timeout)।');
+          }
+        }, 18000);
+      })();
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

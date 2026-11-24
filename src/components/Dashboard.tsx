@@ -46,6 +46,7 @@ export const Dashboard: React.FC = () => {
     openSubscriptionModal,
     activeSubscription,
     calculateDaysRemaining,
+    packages,
     examDateConfig,
     isSessionRevoked,
     sessionRevokedReason,
@@ -581,13 +582,23 @@ export const Dashboard: React.FC = () => {
       </section>
 
       {/* The 3 Subscription Plans Section (Embedded on Dashboard) */}
-      <SubscriptionPlansSection
-        className="pt-4"
-        titleBn="বার কাউন্সিল প্রস্তুতি সাবস্ক্রিপশন প্যাকেজসমূহ"
-        titleEn="Bar Council Enrollment Subscription Passes"
-        subtitleBn="প্রো মডেল টেস্ট পাস, লং কোর্স পাস এবং বার কাউন্সিল এক্সাম পাস থেকে আপনার প্রয়োজনীয় প্যাকেজটি বেছে নিন।"
-        subtitleEn="Choose from Pro Model Test Pass (300 BDT), Long Course Pass (999 BDT), and Bar Council Exam Pass."
-      />
+      {(() => {
+        const monthlyPkg = packages.find(p => p.id === 'pkg_monthly');
+        const longPkg = packages.find(p => p.id === 'pkg_long_course');
+        const examPkg = packages.find(p => p.id === 'pkg_exam_pass');
+        const mPrice = monthlyPkg?.price ?? 150;
+        const lPrice = longPkg?.price ?? 999;
+        const ePrice = examPkg?.price ?? 650;
+        return (
+          <SubscriptionPlansSection
+            className="pt-4"
+            titleBn="বার কাউন্সিল প্রস্তুতি সাবস্ক্রিপশন প্যাকেজসমূহ"
+            titleEn="Bar Council Enrollment Subscription Passes"
+            subtitleBn={`মাসিক সাবস্ক্রিপশন (৳${mPrice}), লং কোর্স পাস (৳${lPrice}) এবং বার কাউন্সিল এক্সাম পাস (৳${ePrice}) থেকে আপনার প্রয়োজনীয় প্যাকেজটি বেছে নিন।`}
+            subtitleEn={`Choose from Monthly Subscription (${mPrice} BDT), Long Course Pass (${lPrice} BDT), and Bar Council Exam Pass (${ePrice} BDT).`}
+          />
+        );
+      })()}
 
       {/* Student Payment History Modal */}
       <StudentPaymentHistoryModal 

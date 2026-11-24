@@ -70,7 +70,6 @@ export interface ExecutionContext {
 export interface WorkerEnv {
   DB?: D1Database;
   ASSETS?: Fetcher;
-  FIREBASE_SERVICE_ACCOUNT_JSON?: string;
   FIREBASE_PROJECT_ID?: string;
   FIREBASE_DATABASE_ID?: string;
   STAGING_OWNER_ADMIN_UID?: string;
@@ -84,6 +83,7 @@ export interface DecodedAuthUser {
   email?: string;
   emailVerified: boolean;
   name?: string;
+  idToken?: string;
   authTime?: number;
   issuedAt?: number;
   expiresAt?: number;

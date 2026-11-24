@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { initializeApp as initializeAdminApp, getApps as getAdminApps, cert, App } from 'firebase-admin/app';
+import { initializeApp as initializeAdminApp, getApps as getAdminApps, App } from 'firebase-admin/app';
 import { getAuth as getAdminAuth } from 'firebase-admin/auth';
 import { getFirestore, Firestore, Timestamp } from 'firebase-admin/firestore';
 import type {
@@ -92,18 +92,7 @@ export function initFirebaseAdminApp(): App {
   if (getAdminApps().length > 0) {
     return getAdminApps()[0];
   }
-  const saJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  if (saJson && saJson.trim()) {
-    try {
-      const parsed = JSON.parse(saJson);
-      return initializeAdminApp({
-        credential: cert(parsed),
-        projectId: parsed.project_id || FIREBASE_PROJECT_ID
-      });
-    } catch (err) {
-      console.error('Invalid FIREBASE_SERVICE_ACCOUNT_JSON:', err);
-    }
-  }
+  // Keyless Application Default Credentials (ADC / Workload Identity on Cloud Run / local gcloud ADC)
   return initializeAdminApp({ projectId: FIREBASE_PROJECT_ID });
 }
 

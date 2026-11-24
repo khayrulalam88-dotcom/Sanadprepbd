@@ -316,24 +316,28 @@ export async function verifyFirebaseIdToken(
   };
 }
 
+export function extractBearerToken(request: Request): string | undefined {
+  const authHeader = request.headers.get('authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return undefined;
+  }
+  const token = authHeader.slice(7).trim();
+  return token || undefined;
+}
+
 export async function authenticateFirebaseRequest(
   request: Request,
   options?: VerifyFirebaseTokenOptions & {
     tokenVerifier?: (idToken: string) => Promise<DecodedAuthUser>;
   }
 ): Promise<DecodedAuthUser> {
-  const authHeader = request.headers.get('authorization');
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+  const idToken = extractBearerToken(request);
+  if (!idToken) {
     throw new WorkerHttpError(
       401,
       'UNAUTHORIZED',
       'Authentication required. Please sign in with Firebase.'
     );
-  }
-
-  const idToken = authHeader.slice(7).trim();
-  if (!idToken) {
-    throw new WorkerHttpError(401, 'UNAUTHORIZED', 'Missing bearer token.');
   }
 
   let decoded: DecodedAuthUser;
@@ -357,7 +361,10 @@ export async function authenticateFirebaseRequest(
     );
   }
 
-  return decoded;
+  return {
+    ...decoded,
+    idToken: decoded.idToken || idToken
+  };
 }
 
 export function resolveEffectiveOwnerAdmin(

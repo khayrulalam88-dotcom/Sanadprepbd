@@ -27,11 +27,9 @@ import {
 } from '../worker/firebaseAuth.ts';
 import {
   assertExpectedNamedDatabase,
-  clearServiceAccountTokenCacheForTests,
   decodeDocumentFields,
   encodeDocumentFields,
   FirestoreRestClient,
-  parseServiceAccountJson,
   type FirestoreRestValue
 } from '../worker/firestoreRest.ts';
 import { createWorkerHandler } from '../worker/index.ts';
@@ -134,6 +132,7 @@ async function createMigratedTestD1(): Promise<SqliteD1Adapter> {
   const db = new SqliteD1Adapter();
   await db.exec(fs.readFileSync(path.resolve('worker/migrations/0001_initial_edge_state.sql'), 'utf-8'));
   await db.exec(fs.readFileSync(path.resolve('worker/migrations/0002_question_bank_cache.sql'), 'utf-8'));
+  await db.exec(fs.readFileSync(path.resolve('worker/migrations/0003_keyless_edge_collections.sql'), 'utf-8'));
   return db;
 }
 
@@ -200,12 +199,7 @@ function createScopedFirestoreStub(targetProjectId: string, targetDatabaseId: st
     const method = (init?.method || 'GET').toUpperCase();
     requestedUrls.push(`${method} ${urlStr}`);
 
-    if (urlStr === 'https://oauth2.googleapis.com/token') {
-      return new Response(
-        JSON.stringify({ access_token: `sa_token_${targetProjectId}`, expires_in: 3600 }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } }
-      );
-    }
+    assert.equal(urlStr.startsWith('https://oauth2.googleapis.com'), false, 'Keyless Worker must never request SA OAuth tokens');
 
     if (!urlStr.startsWith(expectedPrefix)) {
       return new Response(
@@ -340,10 +334,9 @@ function createScopedFirestoreStub(targetProjectId: string, targetDatabaseId: st
 describe('Phase 5B — Firebase Staging Compatibility & Isolation', () => {
   beforeEach(() => {
     clearFirebaseJwksCacheForTests();
-    clearServiceAccountTokenCacheForTests();
   });
 
-  test('1. Staging configuration accepts separate staging Firebase project, (default) or named DB, and matching service account', () => {
+  test('1. Staging configuration accepts separate staging Firebase project, (default) or named DB, without any SA JSON', () => {
     assert.equal(resolveFirebaseProjectId(STAGING_PROJECT_ID, 'staging'), STAGING_PROJECT_ID);
     assert.equal(resolveFirebaseProjectId(STAGING_PROJECT_ID, ' STAGING '), STAGING_PROJECT_ID);
 
@@ -364,18 +357,16 @@ describe('Phase 5B — Firebase Staging Compatibility & Isolation', () => {
     assert.equal(namedStagingDbCheck.valid, true);
     assert.equal(namedStagingDbCheck.databaseId, 'sanad-prep-staging-db');
 
-    const parsedSa = parseServiceAccountJson(
-      JSON.stringify({
-        project_id: STAGING_PROJECT_ID,
-        client_email: 'sa@sanad-prep-bd-staging.iam.gserviceaccount.com',
-        private_key: '-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----'
-      }),
-      STAGING_PROJECT_ID
-    );
-    assert.equal(parsedSa.project_id, STAGING_PROJECT_ID);
+    const stagingClient = new FirestoreRestClient({
+      environment: 'staging',
+      projectId: STAGING_PROJECT_ID,
+      databaseId: '(default)'
+    });
+    assert.equal(stagingClient.projectId, STAGING_PROJECT_ID);
+    assert.equal(stagingClient.databaseId, '(default)');
   });
 
-  test('2. Staging rejects production service account, cross-project named DB pairing, and missing/invalid staging IDs', () => {
+  test('2. Staging rejects cross-project named DB pairing and missing/invalid staging IDs', () => {
     assert.throws(
       () => resolveFirebaseProjectId('', 'staging'),
       (err: unknown) => err instanceof WorkerHttpError && err.code === 'FIREBASE_PROJECT_MISMATCH'
@@ -402,42 +393,12 @@ describe('Phase 5B — Firebase Staging Compatibility & Isolation', () => {
 
     assert.throws(
       () =>
-        parseServiceAccountJson(
-          JSON.stringify({
-            project_id: EXPECTED_FIREBASE_PROJECT_ID,
-            client_email: 'sa@galvanic-aviary-tzp2g.iam.gserviceaccount.com',
-            private_key: '-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----'
-          }),
-          STAGING_PROJECT_ID
-        ),
-      (err: unknown) => err instanceof WorkerHttpError && err.code === 'FIREBASE_PROJECT_MISMATCH'
-    );
-
-    assert.throws(
-      () =>
-        parseServiceAccountJson(
-          JSON.stringify({
-            client_email: 'sa@sanad-prep-bd-staging.iam.gserviceaccount.com',
-            private_key: '-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----'
-          }),
-          STAGING_PROJECT_ID
-        ),
-      (err: unknown) => err instanceof WorkerHttpError && err.code === 'FIREBASE_PROJECT_MISMATCH'
-    );
-
-    assert.throws(
-      () =>
         new FirestoreRestClient({
           environment: 'staging',
           projectId: STAGING_PROJECT_ID,
-          databaseId: '(default)',
-          serviceAccountJson: JSON.stringify({
-            project_id: EXPECTED_FIREBASE_PROJECT_ID,
-            client_email: 'prod@galvanic-aviary-tzp2g.iam.gserviceaccount.com',
-            private_key: '-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----'
-          })
+          databaseId: EXPECTED_FIREBASE_DATABASE_ID
         }),
-      (err: unknown) => err instanceof WorkerHttpError && err.code === 'FIREBASE_PROJECT_MISMATCH'
+      (err: unknown) => err instanceof WorkerHttpError && err.code === 'NAMED_DATABASE_MISMATCH'
     );
   });
 
@@ -481,14 +442,12 @@ describe('Phase 5B — Firebase Staging Compatibility & Isolation', () => {
 
     assert.throws(
       () =>
-        parseServiceAccountJson(
-          JSON.stringify({
-            project_id: STAGING_PROJECT_ID,
-            client_email: 'sa@sanad-prep-bd-staging.iam.gserviceaccount.com',
-            private_key: '-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----'
-          })
-        ),
-      (err: unknown) => err instanceof WorkerHttpError && err.code === 'FIREBASE_PROJECT_MISMATCH'
+        new FirestoreRestClient({
+          environment: 'production',
+          projectId: STAGING_PROJECT_ID,
+          databaseId: '(default)'
+        }),
+      (err: unknown) => err instanceof WorkerHttpError && err.code === 'NAMED_DATABASE_MISMATCH'
     );
   });
 
@@ -658,18 +617,11 @@ describe('Phase 5B — Firebase Staging Compatibility & Isolation', () => {
       subscriptionStatus: 'free'
     });
 
-    const stagingSaJson = JSON.stringify({
-      project_id: STAGING_PROJECT_ID,
-      client_email: 'sa@sanad-prep-bd-staging.iam.gserviceaccount.com',
-      private_key: kp.pkcs8Pem
-    });
-
     const stagingEnv: WorkerEnv = {
       DB: d1,
       ENVIRONMENT: 'staging',
       FIREBASE_PROJECT_ID: STAGING_PROJECT_ID,
       FIREBASE_DATABASE_ID: '(default)',
-      FIREBASE_SERVICE_ACCOUNT_JSON: stagingSaJson,
       STAGING_OWNER_ADMIN_UID: STAGING_OWNER_UID,
       ALLOWED_ORIGIN: 'https://staging.example.com'
     };
@@ -793,17 +745,11 @@ describe('Phase 5B — Firebase Staging Compatibility & Isolation', () => {
 
     // Production env ignores STAGING_OWNER_ADMIN_UID completely
     const prodStub = createScopedFirestoreStub(EXPECTED_FIREBASE_PROJECT_ID, EXPECTED_FIREBASE_DATABASE_ID);
-    const prodSaJson = JSON.stringify({
-      project_id: EXPECTED_FIREBASE_PROJECT_ID,
-      client_email: 'sa@galvanic-aviary-tzp2g.iam.gserviceaccount.com',
-      private_key: kp.pkcs8Pem
-    });
     const prodEnv: WorkerEnv = {
       DB: d1,
       ENVIRONMENT: 'production',
       FIREBASE_PROJECT_ID: EXPECTED_FIREBASE_PROJECT_ID,
       FIREBASE_DATABASE_ID: EXPECTED_FIREBASE_DATABASE_ID,
-      FIREBASE_SERVICE_ACCOUNT_JSON: prodSaJson,
       STAGING_OWNER_ADMIN_UID: STAGING_OWNER_UID,
       ALLOWED_ORIGIN: 'https://sanad-prep.example.com'
     };

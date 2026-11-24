@@ -20,7 +20,6 @@ import {
   type FirebaseJwk
 } from '../worker/firebaseAuth.ts';
 import {
-  clearServiceAccountTokenCacheForTests,
   decodeDocumentFields,
   encodeDocumentFields
 } from '../worker/firestoreRest.ts';
@@ -113,6 +112,7 @@ async function createMigratedTestD1(): Promise<SqliteD1Adapter> {
   const db = new SqliteD1Adapter();
   await db.exec(fs.readFileSync(path.resolve('worker/migrations/0001_initial_edge_state.sql'), 'utf-8'));
   await db.exec(fs.readFileSync(path.resolve('worker/migrations/0002_question_bank_cache.sql'), 'utf-8'));
+  await db.exec(fs.readFileSync(path.resolve('worker/migrations/0003_keyless_edge_collections.sql'), 'utf-8'));
   return db;
 }
 
@@ -150,7 +150,7 @@ async function signJwt(privateKey: CryptoKey, kid: string, claims: Record<string
   return `${headerSeg}.${payloadSeg}.${base64UrlEncodeBytes(new Uint8Array(sig))}`;
 }
 
-function createPhase2FirestoreStub(serviceAccountEmail: string) {
+function createPhase2FirestoreStub(options?: { ownerOnlyQuestionReads?: boolean }) {
   const expectedPrefix = `https://firestore.googleapis.com/v1/projects/${EXPECTED_FIREBASE_PROJECT_ID}/databases/${EXPECTED_FIREBASE_DATABASE_ID}/documents`;
   const collections = new Map<string, Map<string, Record<string, unknown>>>();
   const readLog: Array<{ op: string; collection: string; docId?: string }> = [];
@@ -172,16 +172,25 @@ function createPhase2FirestoreStub(serviceAccountEmail: string) {
     readLog.length = 0;
   };
 
+  const isOwnerBearer = (init?: RequestInit) => {
+    const auth = new Headers(init?.headers).get('authorization') || '';
+    if (!auth.startsWith('Bearer ')) return false;
+    const token = auth.slice(7);
+    const parts = token.split('.');
+    if (parts.length !== 3) return false;
+    try {
+      const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf-8')) as Record<string, unknown>;
+      return payload.sub === OWNER_ADMIN_UID;
+    } catch {
+      return false;
+    }
+  };
+
   const fetchImpl: typeof fetch = async (input, init) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
     const method = (init?.method || 'GET').toUpperCase();
 
-    if (url === 'https://oauth2.googleapis.com/token') {
-      return new Response(JSON.stringify({ access_token: 'mock_phase2_access_token', expires_in: 3600 }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
+    assert.equal(url.startsWith('https://oauth2.googleapis.com'), false, 'Keyless Worker must never call oauth2 token API');
 
     assert.ok(url.startsWith(expectedPrefix), `Invalid Firestore REST database target: ${url}`);
     const restPath = url.slice(expectedPrefix.length);
@@ -265,6 +274,12 @@ function createPhase2FirestoreStub(serviceAccountEmail: string) {
       // listDocuments: GET /documents/{collection}?pageSize=...&pageToken=...
       if (segments.length === 1) {
         const col = segments[0];
+        if (options?.ownerOnlyQuestionReads && (col === 'questions' || col === 'questionKeys') && !isOwnerBearer(init)) {
+          return new Response(JSON.stringify({ error: { code: 403, status: 'PERMISSION_DENIED', message: 'Missing or insufficient permissions.' } }), {
+            status: 403,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
         readLog.push({ op: 'listDocuments', collection: col });
         const qs = new URLSearchParams(queryPart || '');
         const pageSize = Number(qs.get('pageSize') || '500');
@@ -306,7 +321,7 @@ function createPhase2FirestoreStub(serviceAccountEmail: string) {
       }
     }
 
-    throw new Error(`Unhandled Phase 2 mock Firestore call: ${method} ${url} (SA: ${serviceAccountEmail})`);
+    throw new Error(`Unhandled Phase 2 mock Firestore call: ${method} ${url}`);
   };
 
   return { fetchImpl, setDoc, getCol, readLog, resetReadLog };
@@ -314,13 +329,6 @@ function createPhase2FirestoreStub(serviceAccountEmail: string) {
 
 describe('Sanad Prep BD — Cloudflare Worker Phase 2 (Catalog, Question Bank & Practice APIs)', async () => {
   const keyPair = await generateRs256Keypair('phase2_kid_1');
-  const saKey = await generateRs256Keypair('phase2_sa_1');
-  const saJson = JSON.stringify({
-    type: 'service_account',
-    project_id: EXPECTED_FIREBASE_PROJECT_ID,
-    client_email: 'sanad-worker-sa@galvanic-aviary-tzp2g.iam.gserviceaccount.com',
-    private_key: saKey.pkcs8Pem
-  });
 
   let nowSec = Math.floor(Date.now() / 1000);
   let virtualNowMs = nowSec * 1000;
@@ -343,7 +351,6 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 2 (Catalog, Question Bank & 
 
   beforeEach(async () => {
     clearFirebaseJwksCacheForTests();
-    clearServiceAccountTokenCacheForTests();
     nowSec = Math.floor(Date.now() / 1000);
     virtualNowMs = nowSec * 1000;
     ownerToken = await issueToken({
@@ -459,9 +466,9 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 2 (Catalog, Question Bank & 
     });
   }
 
-  async function buildTestHarness(options?: { cacheTtlMs?: number; practiceLimit?: number }) {
+  async function buildTestHarness(options?: { cacheTtlMs?: number; practiceLimit?: number; ownerOnlyQuestionReads?: boolean }) {
     const db = await createMigratedTestD1();
-    const stub = createPhase2FirestoreStub('sanad-worker-sa@galvanic-aviary-tzp2g.iam.gserviceaccount.com');
+    const stub = createPhase2FirestoreStub({ ownerOnlyQuestionReads: options?.ownerOnlyQuestionReads });
     seedAuthoritativeFixtureData(stub);
 
     const handler = createWorkerHandler({
@@ -481,7 +488,6 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 2 (Catalog, Question Bank & 
       ENVIRONMENT: 'staging',
       FIREBASE_PROJECT_ID: EXPECTED_FIREBASE_PROJECT_ID,
       FIREBASE_DATABASE_ID: EXPECTED_FIREBASE_DATABASE_ID,
-      FIREBASE_SERVICE_ACCOUNT_JSON: saJson,
       ALLOWED_ORIGIN: 'https://s--khayrul-alam.khayrulalam88.workers.dev'
     };
 
@@ -984,5 +990,55 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 2 (Catalog, Question Bank & 
     assert.equal(limited.status, 429);
     assert.ok(Number(limited.headers.get('Retry-After')) >= 1);
     assert.equal(((await limited.json()) as { error: string }).error, 'RATE_LIMITED');
+  });
+
+  test('8. Keyless Firestore-rules mode: student 403 on /questions & /questionKeys succeeds after Owner /sync-cache warms D1', async () => {
+    const { handler, env, establishSession } = await buildTestHarness({
+      cacheTtlMs: 1_000,
+      ownerOnlyQuestionReads: true
+    });
+    const sessPro = await establishSession(proStudentToken);
+
+    // Owner syncs D1 question & key cache using their Firebase ID token
+    const syncRes = await handler(
+      new Request('https://s--khayrul-alam.khayrulalam88.workers.dev/api/admin/questions/sync-cache', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${ownerToken}` }
+      }),
+      env
+    );
+    assert.equal(syncRes.status, 200);
+    const syncJson = (await syncRes.json()) as { success: boolean; questionCount: number; keyCount: number };
+    assert.equal(syncJson.success, true);
+    assert.equal(syncJson.questionCount, 15);
+    assert.equal(syncJson.keyCount, 15);
+
+    // Advance past TTL so Worker checks Firestore; student gets 403 from Firestore rules and falls back cleanly to warmed D1!
+    virtualNowMs += 5_000;
+    const qRes = await handler(
+      new Request('https://s--khayrul-alam.khayrulalam88.workers.dev/api/questions?subjectId=sub_cpc', {
+        headers: { Authorization: `Bearer ${proStudentToken}`, 'X-Session-Id': sessPro }
+      }),
+      env
+    );
+    assert.equal(qRes.status, 200);
+    const qJson = (await qRes.json()) as { questions: Array<Record<string, unknown>> };
+    assert.equal(qJson.questions.length, 10);
+    assert.equal('correctOptionIndex' in qJson.questions[0], false);
+
+    const pracRes = await handler(
+      new Request('https://s--khayrul-alam.khayrulalam88.workers.dev/api/practice/check', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${proStudentToken}`,
+          'X-Session-Id': sessPro,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ questionId: 'q_06', selectedOption: 2 })
+      }),
+      env
+    );
+    assert.equal(pracRes.status, 200);
+    assert.equal(((await pracRes.json()) as { isCorrect: boolean }).isCorrect, true);
   });
 });

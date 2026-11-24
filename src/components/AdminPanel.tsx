@@ -46,6 +46,7 @@ import { EditUserModal, EditableUserData } from './EditUserModal';
 import { AdminCreateExamModal } from './AdminCreateExamModal';
 import { auth, OWNER_ADMIN_EMAIL, isVerifiedOwnerAccount, resolveFrontendOwnerAdminUid } from '../lib/firebase';
 import { buildManualQuestionInput } from '../lib/adminQuestionHelpers';
+import { buildExamResultsCsv } from '../utils/csvExport';
 
 export const AdminPanel: React.FC = () => {
   const { 
@@ -79,7 +80,6 @@ export const AdminPanel: React.FC = () => {
     subscriptions,
     currentSession,
     isSessionRevoked,
-    simulateConcurrentLogin,
     recoverSession,
     auditLogs,
     examResults,
@@ -451,28 +451,18 @@ export const AdminPanel: React.FC = () => {
     return matchesStatus && matchesSearch;
   });
 
-  // Export report to CSV
+  // Export report to CSV (RFC-4180 escaped + spreadsheet formula injection hardened + Blob download)
   const handleExportCSV = () => {
-    const headers = ['Attempt ID', 'Student Name', 'Exam Title', 'Score', 'Total Questions', 'Percentage', 'Passed', 'Date'];
-    const rows = examResults.map(r => [
-      r.attemptId,
-      `"${r.studentName}"`,
-      `"${r.examTitleEn}"`,
-      r.finalScore,
-      r.totalQuestions,
-      `${r.percentage}%`,
-      r.passed ? 'PASSED' : 'FAILED',
-      r.submittedAt
-    ]);
-
-    const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows.map(e => e.join(','))].join('\n');
-    const encodedUri = encodeURI(csvContent);
+    const csvContent = buildExamResultsCsv(examResults);
+    const blob = new Blob(['\uFEFF' + csvContent], { type: 'text/csv;charset=utf-8;' });
+    const blobUrl = URL.createObjectURL(blob);
     const link = document.createElement('a');
-    link.setAttribute('href', encodedUri);
+    link.setAttribute('href', blobUrl);
     link.setAttribute('download', `bar_council_exam_results_${Date.now()}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
   };
 
   const handleConfirmReject = async () => {
@@ -1838,7 +1828,7 @@ export const AdminPanel: React.FC = () => {
                       phone: currentUser.phone || '',
                       role: currentUser.role,
                       subscriptionStatus: currentUser.subscriptionStatus,
-                      packageId: targetSub?.packageId || (currentUser.subscriptionStatus === 'pro' ? 'pkg_pro_mock' : 'free_tier'),
+                      packageId: targetSub?.packageId || (currentUser.subscriptionStatus === 'pro' ? (packages.find(p => p.isActive)?.id || packages[0]?.id || 'pkg_monthly') : 'free_tier'),
                       expiresAt: targetSub?.expiresAt || new Date(Date.now() + 90 * 86400000).toISOString(),
                       isSessionRevoked: isSessionRevoked,
                     });
@@ -1862,35 +1852,26 @@ export const AdminPanel: React.FC = () => {
               </div>
             </div>
 
-            {/* Interactive Testing Buttons */}
+            {/* Session Recovery Controls */}
             <div className="p-4 rounded-2xl border border-slate-200 space-y-3">
               <h4 className="font-bold text-xs uppercase tracking-wider text-slate-700">
-                {t('সেশন নিরাপত্তা পরীক্ষা (Test Account Sharing Protection):', 'Session Security Demonstration Tools:')}
+                {t('সক্রিয় সেশন নিয়ন্ত্রণ (Single-Device Session Enforcement):', 'Active Session Controls:')}
               </h4>
 
               <div className="flex flex-wrap gap-3">
-                <button
-                  type="button"
-                  onClick={simulateConcurrentLogin}
-                  className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs transition cursor-pointer flex items-center gap-1.5"
-                >
-                  <AlertTriangle className="w-3.5 h-3.5" />
-                  <span>{t('অন্য ডিভাইস থেকে লগইন অনুকরণ করুন (Simulate Concurrent Login)', 'Simulate Concurrent Login')}</span>
-                </button>
-
                 <button
                   type="button"
                   onClick={recoverSession}
                   className="px-4 py-2 rounded-xl bg-[#102A43] hover:bg-[#243B53] text-[#D4AF37] font-bold text-xs transition cursor-pointer flex items-center gap-1.5"
                 >
                   <RefreshCw className="w-3.5 h-3.5" />
-                  <span>{t('সেশন রিকভার / নতুন ফ্রেশ লগইন (Recover Session)', 'Re-Establish Session')}</span>
+                  <span>{t('সেশন রিকভার / নতুন ফ্রেশ লগইন (Recover Session)', 'Re-Establish Active Session')}</span>
                 </button>
               </div>
 
               {isSessionRevoked && (
                 <div className="p-3 rounded-xl bg-rose-50 border border-rose-300 text-rose-800 text-xs">
-                  <strong>সতর্কতা:</strong> বর্তমান সেশনটি বাতিল করা হয়েছে। শিক্ষার্থী এখন কোনো পেইড টেস্ট শুরু বা উত্তর জমা দিতে পারবেন না যতক্ষণ না তিনি পুনরায় নিরাপদ সেশন স্থাপন করবেন।
+                  <strong>সতর্কতা:</strong> বর্তমান সেশনটি বাতিল করা হয়েছে। নিরাপদ সেশন পুনঃস্থাপন না করা পর্যন্ত পেইড টেস্ট শুরু বা উত্তর জমা নেওয়া হবে না।
                 </div>
               )}
             </div>

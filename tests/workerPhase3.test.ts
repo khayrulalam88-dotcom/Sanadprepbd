@@ -20,10 +20,10 @@ import {
   type FirebaseJwk
 } from '../worker/firebaseAuth.ts';
 import {
-  clearServiceAccountTokenCacheForTests,
   decodeDocumentFields,
   encodeDocumentFields
 } from '../worker/firestoreRest.ts';
+import { getPaymentRequestD1, listExamResultsByUserD1 } from '../worker/d1Store.ts';
 import { createWorkerHandler } from '../worker/index.ts';
 import { INITIAL_PACKAGES, INITIAL_EXAM_DATE_CONFIG } from '../src/data/initialPackages.ts';
 
@@ -118,6 +118,7 @@ async function createMigratedTestD1(): Promise<SqliteD1Adapter> {
   const db = new SqliteD1Adapter();
   await db.exec(fs.readFileSync(path.resolve('worker/migrations/0001_initial_edge_state.sql'), 'utf-8'));
   await db.exec(fs.readFileSync(path.resolve('worker/migrations/0002_question_bank_cache.sql'), 'utf-8'));
+  await db.exec(fs.readFileSync(path.resolve('worker/migrations/0003_keyless_edge_collections.sql'), 'utf-8'));
   return db;
 }
 
@@ -158,7 +159,7 @@ async function signJwt(
   return `${headerSeg}.${payloadSeg}.${base64UrlEncodeBytes(new Uint8Array(sig))}`;
 }
 
-function createPhase3FirestoreStub(serviceAccountEmail: string) {
+function createPhase3FirestoreStub() {
   const expectedPrefix = `https://firestore.googleapis.com/v1/projects/${EXPECTED_FIREBASE_PROJECT_ID}/databases/${EXPECTED_FIREBASE_DATABASE_ID}/documents`;
   const collections = new Map<string, Map<string, Record<string, unknown>>>();
   const rawEncodedFields = new Map<string, Map<string, Record<string, unknown>>>();
@@ -192,17 +193,14 @@ function createPhase3FirestoreStub(serviceAccountEmail: string) {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
     const method = (init?.method || 'GET').toUpperCase();
 
-    if (url === 'https://oauth2.googleapis.com/token') {
-      return new Response(
-        JSON.stringify({ access_token: 'mock_phase3_access_token', expires_in: 3600 }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } }
-      );
-    }
+    assert.equal(url.startsWith('https://oauth2.googleapis.com'), false, 'Keyless Worker must never request SA OAuth tokens');
 
     assert.ok(url.startsWith(expectedPrefix), `Unexpected Firestore URL: ${url}`);
     firestoreHttpCalls++;
     const authHeader = new Headers(init?.headers).get('authorization');
-    assert.equal(authHeader, 'Bearer mock_phase3_access_token');
+    if (authHeader !== null) {
+      assert.ok(authHeader.startsWith('Bearer '), `Unexpected authorization header: ${authHeader}`);
+    }
 
     const restPath = url.slice(expectedPrefix.length);
 
@@ -386,7 +384,7 @@ function createPhase3FirestoreStub(serviceAccountEmail: string) {
       }
     }
 
-    throw new Error(`Unhandled mock Firestore call (${serviceAccountEmail}): ${method} ${url}`);
+    throw new Error(`Unhandled mock Firestore call: ${method} ${url}`);
   };
 
   return {
@@ -445,16 +443,8 @@ function seedQuestions100(stub: ReturnType<typeof createPhase3FirestoreStub>): s
 
 describe('Sanad Prep BD — Cloudflare Worker Phase 3 Test Suite', async () => {
   const keyPair = await generateRs256Keypair('kid_phase3_v1');
-  const saKey = await generateRs256Keypair('sa_phase3_1');
-  const saJson = JSON.stringify({
-    type: 'service_account',
-    project_id: EXPECTED_FIREBASE_PROJECT_ID,
-    client_email: 'sanad-worker-sa@galvanic-aviary-tzp2g.iam.gserviceaccount.com',
-    private_key: saKey.pkcs8Pem
-  });
 
   const baseNowMs = new Date('2026-11-16T10:00:00.000Z').getTime();
-  const baseNowSec = Math.floor(baseNowMs / 1000);
 
   const makeToken = (
     uid: string,
@@ -478,7 +468,6 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 3 Test Suite', async () => {
 
   beforeEach(() => {
     clearFirebaseJwksCacheForTests();
-    clearServiceAccountTokenCacheForTests();
   });
 
   async function loginStudent(
@@ -501,7 +490,7 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 3 Test Suite', async () => {
 
   test('1. Payment creation: authoritative pricing, tampered amount ignored, duplicate TrxID 409, /api/payments/my isolation, rate limit', async () => {
     const db = await createMigratedTestD1();
-    const stub = createPhase3FirestoreStub('sanad-worker-sa@galvanic-aviary-tzp2g.iam.gserviceaccount.com');
+    const stub = createPhase3FirestoreStub();
     seedPackagesAndConfig(stub);
 
     const s1Token = await makeToken('student_1', 's1@example.com', 'Student One');
@@ -517,8 +506,7 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 3 Test Suite', async () => {
       DB: db,
       ENVIRONMENT: 'production',
       FIREBASE_PROJECT_ID: EXPECTED_FIREBASE_PROJECT_ID,
-      FIREBASE_DATABASE_ID: EXPECTED_FIREBASE_DATABASE_ID,
-      FIREBASE_SERVICE_ACCOUNT_JSON: saJson
+      FIREBASE_DATABASE_ID: EXPECTED_FIREBASE_DATABASE_ID
     };
 
     const s1Sess = await loginStudent(handler, env, s1Token, 'Student One');
@@ -634,11 +622,26 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 3 Test Suite', async () => {
       env
     );
     assert.equal(rateLimited.status, 429);
+
+    // D1 stores student payments atomically and Owner Admin can approve directly without SA JSON
+    const d1Pay = await getPaymentRequestD1(db, 'trx_BKASHTRX999A');
+    assert.equal(d1Pay?.amount, 999);
+    const ownerToken = await makeToken(OWNER_ADMIN_UID, OWNER_ADMIN_EMAIL, 'Khayrul Alam');
+    const approveD1Res = await handler(
+      new Request('https://s--khayrul-alam.khayrulalam88.workers.dev/api/admin/payments/trx_BKASHTRX999A/approve', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${ownerToken}` }
+      }),
+      env
+    );
+    assert.equal(approveD1Res.status, 200);
+    assert.equal(stub.getCol('paymentRequests').get('trx_BKASHTRX999A')?.status, 'approved');
+    assert.equal(stub.getCol('users').get('student_1')?.subscriptionStatus, 'pro');
   });
 
   test('2. Owner-only payment approval/rejection, atomic subscription Timestamps, Pro 90d & Exam Pass rules, replay blocked', async () => {
     const db = await createMigratedTestD1();
-    const stub = createPhase3FirestoreStub('sanad-worker-sa@galvanic-aviary-tzp2g.iam.gserviceaccount.com');
+    const stub = createPhase3FirestoreStub();
     seedPackagesAndConfig(stub);
 
     stub.setDoc('users', 'student_1', {
@@ -707,8 +710,7 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 3 Test Suite', async () => {
       DB: db,
       ENVIRONMENT: 'production',
       FIREBASE_PROJECT_ID: EXPECTED_FIREBASE_PROJECT_ID,
-      FIREBASE_DATABASE_ID: EXPECTED_FIREBASE_DATABASE_ID,
-      FIREBASE_SERVICE_ACCOUNT_JSON: saJson
+      FIREBASE_DATABASE_ID: EXPECTED_FIREBASE_DATABASE_ID
     };
 
     const s1Sess = await loginStudent(handler, env, studentToken, 'Student One');
@@ -850,7 +852,7 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 3 Test Suite', async () => {
 
   test('3. Mock exam engine: free vs paid gating, sanitized /start, /save-answer, /submit (+1/-0.25/0 + negative preserved + batched subrequests <= 15), double submit 400, results isolation, leaderboard', async () => {
     const db = await createMigratedTestD1();
-    const stub = createPhase3FirestoreStub('sanad-worker-sa@galvanic-aviary-tzp2g.iam.gserviceaccount.com');
+    const stub = createPhase3FirestoreStub();
     seedPackagesAndConfig(stub);
     const qIds100 = seedQuestions100(stub);
 
@@ -913,8 +915,7 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 3 Test Suite', async () => {
       DB: db,
       ENVIRONMENT: 'production',
       FIREBASE_PROJECT_ID: EXPECTED_FIREBASE_PROJECT_ID,
-      FIREBASE_DATABASE_ID: EXPECTED_FIREBASE_DATABASE_ID,
-      FIREBASE_SERVICE_ACCOUNT_JSON: saJson
+      FIREBASE_DATABASE_ID: EXPECTED_FIREBASE_DATABASE_ID
     };
 
     const freeSess = await loginStudent(handler, env, freeStudentToken, 'Free Student');
@@ -1109,11 +1110,26 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 3 Test Suite', async () => {
       env
     );
     assert.equal(hijackResultsRes.status, 403);
+
+    // D1 persisted exam results & Owner /api/admin/sync-edge-cache replicates them to Firestore cleanly
+    const proD1Results = await listExamResultsByUserD1(db, 'student_pro');
+    assert.equal(proD1Results.length, 1);
+    const ownerToken = await makeToken(OWNER_ADMIN_UID, OWNER_ADMIN_EMAIL, 'Khayrul Alam');
+    const syncRes = await handler(
+      new Request('https://s--khayrul-alam.khayrulalam88.workers.dev/api/admin/sync-edge-cache', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${ownerToken}` }
+      }),
+      env
+    );
+    assert.equal(syncRes.status, 200);
+    assert.equal(stub.getCol('examResults').size, 2);
+    assert.equal(stub.getCol('leaderboard').size, 2);
   });
 
   test('4. Owner Admin config/settings/stats/audit, Exam Pass extend_all policy, no secondary admin privilege escalation, & D1 session revocation', async () => {
     const db = await createMigratedTestD1();
-    const stub = createPhase3FirestoreStub('sanad-worker-sa@galvanic-aviary-tzp2g.iam.gserviceaccount.com');
+    const stub = createPhase3FirestoreStub();
     seedPackagesAndConfig(stub);
 
     stub.setDoc('users', 'student_ep', {
@@ -1146,8 +1162,7 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 3 Test Suite', async () => {
       DB: db,
       ENVIRONMENT: 'production',
       FIREBASE_PROJECT_ID: EXPECTED_FIREBASE_PROJECT_ID,
-      FIREBASE_DATABASE_ID: EXPECTED_FIREBASE_DATABASE_ID,
-      FIREBASE_SERVICE_ACCOUNT_JSON: saJson
+      FIREBASE_DATABASE_ID: EXPECTED_FIREBASE_DATABASE_ID
     };
 
     const studentSess = await loginStudent(handler, env, studentToken, 'Exam Pass Student');

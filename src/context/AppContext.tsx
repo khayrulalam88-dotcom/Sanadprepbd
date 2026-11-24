@@ -327,9 +327,13 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       const saved = localStorage.getItem(LOCAL_STORAGE_KEY_EXAMS);
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length >= 30) {
+        if (
+          Array.isArray(parsed) &&
+          parsed.length >= 30 &&
+          parsed.every((e: unknown) => !!e && typeof e === 'object' && typeof (e as Exam).id === 'string' && Array.isArray((e as Exam).questionIds))
+        ) {
           const test1 = parsed.find((e: Exam) => e.id === 'exam_model_test_01');
-          if (test1 && test1.questionIds && test1.questionIds.length === 100) {
+          if (test1 && test1.questionIds.length === 100) {
             return parsed.map((e: Exam) => ({
               ...e,
               isActive: e.isActive !== undefined ? e.isActive : (!e.isPaid || e.id === 'exam_model_test_01')
@@ -1238,6 +1242,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setSubscriptions([]);
     setPaymentRequests([]);
     setExamResults([]);
+    setAnsweredQuestions({});
     setCurrentSession(null);
     setActiveAttempt(null);
     setActiveScreen('landing');
@@ -1245,6 +1250,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       localStorage.removeItem('sanadprep_is_logged_in');
       localStorage.removeItem(LOCAL_STORAGE_KEY_RESULTS);
       localStorage.removeItem(LOCAL_STORAGE_KEY_ATTEMPT);
+      localStorage.removeItem(LOCAL_STORAGE_KEY_ANSWERED_QUESTIONS);
       localStorage.removeItem('barprep_bd_custom_questions');
       localStorage.removeItem('barprep_bd_payment_requests');
       localStorage.removeItem('barprep_bd_user_subscriptions');
@@ -1357,10 +1363,16 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         setQuestions(INITIAL_QUESTIONS);
         setSubscriptions([]);
         setPaymentRequests([]);
+        setExamResults([]);
+        setAnsweredQuestions({});
+        setActiveAttempt(null);
         setCurrentSession(null);
         setActiveScreen(prev => (prev === 'admin' || prev === 'question_bank') ? 'landing' : prev);
         try {
           localStorage.removeItem('sanadprep_is_logged_in');
+          localStorage.removeItem(LOCAL_STORAGE_KEY_RESULTS);
+          localStorage.removeItem(LOCAL_STORAGE_KEY_ATTEMPT);
+          localStorage.removeItem(LOCAL_STORAGE_KEY_ANSWERED_QUESTIONS);
           localStorage.removeItem('barprep_bd_payment_requests');
           localStorage.removeItem('barprep_bd_user_subscriptions');
           localStorage.removeItem('barprep_bd_current_session');

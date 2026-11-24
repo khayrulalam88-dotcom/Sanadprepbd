@@ -201,7 +201,7 @@ export const Navbar: React.FC = () => {
                   className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-slate-200 bg-slate-50 text-xs font-bold text-slate-800"
                 >
                   <User className="w-3.5 h-3.5 text-[#102A43]" />
-                  <span>{currentUser.name.split(' ')[0]}</span>
+                  <span>{(currentUser.name || 'Student').split(' ')[0]}</span>
                 </button>
                 <button
                   onClick={() => logoutUser()}

@@ -12,15 +12,29 @@ import {
   authenticateFirebaseRequest,
   isOwnerUser
 } from './firebaseAuth.ts';
-import { checkUserHasActiveSubscriptionRest } from './firestoreRest.ts';
-import { consumeRateLimitD1, validateAndTouchSessionD1, type RateLimitResult } from './d1Store.ts';
+import {
+  checkUserHasActiveSubscriptionKeyless,
+  commitExamSubmissionD1,
+  consumeRateLimitD1,
+  getExamAttemptD1,
+  insertExamAttemptD1,
+  isUniqueConstraintError,
+  listExamResultsByUserD1,
+  listLeaderboardEntriesD1,
+  updateExamAttemptProgressD1,
+  validateAndTouchSessionD1,
+  type RateLimitResult,
+  type StoredExamAttempt
+} from './d1Store.ts';
 import {
   ensureSanitizedQuestionsSyncedD1,
   getAuthoritativeQuestionKeys,
   parseQuestionBankCacheTtlMs,
+  querySanitizedQuestionsByIdsFromD1,
   querySanitizedQuestionsFromD1,
   sanitizeQuestion
 } from './questionCache.ts';
+import { resolveExamByIdKeyless } from './catalogAndPractice.ts';
 import {
   parsePhase3JsonBody,
   type Phase3RouteContext,
@@ -29,6 +43,7 @@ import {
 import {
   WorkerHttpError,
   type AuditLog,
+  type SanitizedQuestion,
   type ServerQuestion
 } from './types.ts';
 
@@ -42,37 +57,57 @@ function makeId(prefix: string, nowMs: number): string {
 
 function hydrateQuestionDoc(
   qId: string,
-  qDoc: Record<string, unknown>,
-  kDoc?: Record<string, unknown>
+  qDoc: Record<string, unknown> | SanitizedQuestion,
+  kDoc?: {
+    correctOptionIndex?: unknown;
+    explanationBn?: unknown;
+    explanationEn?: unknown;
+    legalReference?: unknown;
+  }
 ): ServerQuestion {
-  const optionsBn = Array.isArray(qDoc.optionsBn) ? qDoc.optionsBn.map(o => String(o ?? '')) : [];
-  const optionsEn = Array.isArray(qDoc.optionsEn)
-    ? qDoc.optionsEn.map(o => String(o ?? ''))
+  const raw = qDoc as Record<string, unknown>;
+  const optionsBn = Array.isArray(raw.optionsBn) ? raw.optionsBn.map(o => String(o ?? '')) : [];
+  const optionsEn = Array.isArray(raw.optionsEn)
+    ? raw.optionsEn.map(o => String(o ?? ''))
     : optionsBn;
+
+  const rawCorrectIdx = kDoc?.correctOptionIndex ?? raw.correctOptionIndex;
+  if (
+    typeof rawCorrectIdx !== 'number' ||
+    !Number.isInteger(rawCorrectIdx) ||
+    rawCorrectIdx < 0 ||
+    rawCorrectIdx > 3
+  ) {
+    throw new WorkerHttpError(
+      503,
+      'QUESTION_KEYS_UNAVAILABLE',
+      'Authoritative exam answer keys are unavailable in edge cache. Please ask admin to sync cache and retry.'
+    );
+  }
 
   return {
     id: qId,
-    subjectId: String(qDoc.subjectId ?? ''),
-    ...(typeof qDoc.topicId === 'string' && qDoc.topicId.trim()
-      ? { topicId: qDoc.topicId.trim() }
+    subjectId: String(raw.subjectId ?? ''),
+    ...(typeof raw.topicId === 'string' && raw.topicId.trim()
+      ? { topicId: raw.topicId.trim() }
       : {}),
-    questionBn: String(qDoc.questionBn ?? ''),
-    questionEn: String(qDoc.questionEn ?? qDoc.questionBn ?? ''),
+    questionBn: String(raw.questionBn ?? ''),
+    questionEn: String(raw.questionEn ?? raw.questionBn ?? ''),
     optionsBn,
     optionsEn,
-    legalReference: String(kDoc?.legalReference ?? qDoc.legalReference ?? ''),
+    legalReference: String(kDoc?.legalReference ?? raw.legalReference ?? ''),
     difficulty:
-      qDoc.difficulty === 'easy' || qDoc.difficulty === 'hard' ? qDoc.difficulty : 'medium',
-    status: qDoc.status === 'draft' || qDoc.status === 'reviewed' ? qDoc.status : 'published',
-    isDemoSample: Boolean(qDoc.isDemoSample),
-    createdAt: String(qDoc.createdAt ?? ''),
-    updatedAt: String(qDoc.updatedAt ?? ''),
-    ...(typeof qDoc.createdBy === 'string' && qDoc.createdBy.trim()
-      ? { createdBy: qDoc.createdBy.trim() }
+      raw.difficulty === 'easy' || raw.difficulty === 'hard' ? raw.difficulty : 'medium',
+    status: raw.status === 'draft' || raw.status === 'reviewed' ? raw.status : 'published',
+    isDemoSample: Boolean(raw.isDemoSample),
+    createdAt: String(raw.createdAt ?? ''),
+    updatedAt: String(raw.updatedAt ?? ''),
+    ...(typeof raw.createdBy === 'string' && raw.createdBy.trim()
+      ? { createdBy: raw.createdBy.trim() }
       : {}),
-    correctOptionIndex: Number(kDoc?.correctOptionIndex ?? qDoc.correctOptionIndex ?? 0),
-    explanationBn: String(kDoc?.explanationBn ?? qDoc.explanationBn ?? ''),
-    explanationEn: String(kDoc?.explanationEn ?? qDoc.explanationEn ?? '')
+    correctOptionIndex: rawCorrectIdx,
+    explanationBn: String(kDoc?.explanationBn ?? raw.explanationBn ?? ''),
+    explanationEn: String(kDoc?.explanationEn ?? raw.explanationEn ?? '')
   };
 }
 
@@ -89,22 +124,41 @@ export async function handleExamsAndResultsRoutes(
   const nowIso = new Date(nowMs).toISOString();
 
   // ---------------------------------------------------------
-  // 1. PUBLIC LEADERBOARD (Top 50 merit ranking)
+  // 1. PUBLIC LEADERBOARD (Top 50 merit ranking, merged Firestore + D1)
   // ---------------------------------------------------------
   if (pathname === '/api/leaderboard' && method === 'GET') {
     const examId = url.searchParams.get('examId')?.trim();
-    const docs =
-      examId && examId !== 'all'
-        ? await firestoreClient.runQuery<Record<string, unknown>>({
+    const [fsDocs, d1Entries] = await Promise.all([
+      (examId && examId !== 'all'
+        ? firestoreClient.runQuery<Record<string, unknown>>({
             collection: 'leaderboard',
             where: [{ field: 'examId', op: 'EQUAL', value: examId }]
           })
-        : await firestoreClient.listDocuments<Record<string, unknown>>('leaderboard', {
+        : firestoreClient.listDocuments<Record<string, unknown>>('leaderboard', {
             pageSize: 500,
             maxPages: 5
-          });
+          })
+      ).catch(() => [] as Array<Record<string, unknown> & { id: string }>),
+      listLeaderboardEntriesD1(db, examId)
+    ]);
 
-    const entries = docs.map(d => d as unknown as LeaderboardEntry);
+    const mergedMap = new Map<string, LeaderboardEntry>();
+    for (const d of fsDocs) {
+      const entry = d as unknown as LeaderboardEntry;
+      if (entry?.id) mergedMap.set(entry.id, entry);
+    }
+    for (const d1Entry of d1Entries) {
+      const existing = mergedMap.get(d1Entry.id);
+      if (
+        !existing ||
+        new Date(String(d1Entry.completedAt || 0)).getTime() >=
+          new Date(String(existing.completedAt || 0)).getTime()
+      ) {
+        mergedMap.set(d1Entry.id, d1Entry);
+      }
+    }
+
+    const entries = Array.from(mergedMap.values());
     entries.sort(
       (a, b) =>
         Number(b.score ?? 0) - Number(a.score ?? 0) ||
@@ -166,25 +220,14 @@ export async function handleExamsAndResultsRoutes(
       throw new WorkerHttpError(400, 'INVALID_EXAM_ID', 'Valid examId is required.');
     }
 
-    const examDoc = await firestoreClient.getDocument<Record<string, unknown>>('exams', examId);
-    if (!examDoc) {
+    const isOwner = isOwnerUser(authUser, env);
+    const userClient = firestoreClient.withToken(authUser.idToken);
+
+    const exam = await resolveExamByIdKeyless(db, userClient, examId);
+    if (!exam) {
       throw new WorkerHttpError(404, 'EXAM_NOT_FOUND', 'Exam not found.');
     }
 
-    const exam: Exam = {
-      ...(examDoc as unknown as Omit<Exam, 'id'>),
-      id: examDoc.id,
-      isActive:
-        examDoc.isActive !== undefined
-          ? Boolean(examDoc.isActive)
-          : !examDoc.isPaid || examDoc.id === 'exam_model_test_01',
-      scheduledDate:
-        typeof examDoc.scheduledDate === 'string' && examDoc.scheduledDate
-          ? examDoc.scheduledDate
-          : undefined
-    };
-
-    const isOwner = isOwnerUser(authUser, env);
     if (exam.isActive === false && !isOwner) {
       throw new WorkerHttpError(
         403,
@@ -200,7 +243,7 @@ export async function handleExamsAndResultsRoutes(
       );
     }
     if (exam.isPaid && !isOwner) {
-      const subCheck = await checkUserHasActiveSubscriptionRest(firestoreClient, authUser.uid, nowMs);
+      const subCheck = await checkUserHasActiveSubscriptionKeyless(db, userClient, authUser.uid, nowMs);
       if (!subCheck.active) {
         throw new WorkerHttpError(
           403,
@@ -210,7 +253,7 @@ export async function handleExamsAndResultsRoutes(
       }
     }
 
-    await ensureSanitizedQuestionsSyncedD1(db, firestoreClient, { ttlMs, nowMs });
+    await ensureSanitizedQuestionsSyncedD1(db, userClient, { ttlMs, nowMs, isOwner });
     const { questions: allSanitized } = await querySanitizedQuestionsFromD1(db);
     const examQuestions = getQuestionsForExam(exam, allSanitized as unknown as Question[])
       .map(q => sanitizeQuestion(q as unknown as ServerQuestion));
@@ -219,7 +262,7 @@ export async function handleExamsAndResultsRoutes(
     const durationMinutes = Number(exam.durationMinutes) || 60;
     const deadlineIso = new Date(nowMs + durationMinutes * 60 * 1000).toISOString();
 
-    const attempt: ExamAttempt = {
+    const attempt: StoredExamAttempt = {
       id: makeId('attempt', nowMs),
       examId: exam.id,
       userId: authUser.uid,
@@ -231,7 +274,8 @@ export async function handleExamsAndResultsRoutes(
       answers: {},
       flaggedQuestionIds: [],
       currentQuestionIndex: 0,
-      lastSavedAt: nowIso
+      lastSavedAt: nowIso,
+      resolvedQuestionIds
     };
 
     const auditEntry: AuditLog = {
@@ -243,30 +287,15 @@ export async function handleExamsAndResultsRoutes(
       timestamp: nowIso
     };
 
-    await firestoreClient.commitWrites([
-      {
-        type: 'set',
-        collection: 'examAttempts',
-        docId: attempt.id,
-        data: {
-          ...attempt,
-          sessionId: attempt.sessionId || null,
-          resolvedQuestionIds
-        }
-      },
-      {
-        type: 'set',
-        collection: 'auditLogs',
-        docId: auditEntry.id,
-        data: { ...auditEntry }
-      }
-    ]);
+    await insertExamAttemptD1(db, attempt, auditEntry);
+
+    const { resolvedQuestionIds: _internalIds, ...publicAttempt } = attempt;
 
     return {
       status: 200,
       payload: {
         success: true,
-        attempt,
+        attempt: publicAttempt,
         exam: {
           ...exam,
           questionIds: resolvedQuestionIds
@@ -280,7 +309,7 @@ export async function handleExamsAndResultsRoutes(
   }
 
   // ---------------------------------------------------------
-  // 3. SAVE IN-PROGRESS ANSWERS
+  // 3. SAVE IN-PROGRESS ANSWERS (Keyless D1 atomic progress)
   // ---------------------------------------------------------
   if (pathname === '/api/exams/save-answer' && method === 'POST') {
     const authUser = await authenticateFirebaseRequest(ctx.request, {
@@ -326,32 +355,32 @@ export async function handleExamsAndResultsRoutes(
         ? body.currentQuestionIndex
         : undefined;
 
-    await firestoreClient.runTransaction(async tx => {
-      const attemptDoc = await tx.get<Record<string, unknown>>('examAttempts', attemptId);
-      if (!attemptDoc) {
-        throw new WorkerHttpError(404, 'ATTEMPT_NOT_FOUND', 'Exam attempt not found.');
-      }
-      if (attemptDoc.userId !== authUser.uid) {
-        throw new WorkerHttpError(403, 'FORBIDDEN', 'Cannot modify another user exam attempt.');
-      }
-      if (attemptDoc.status !== 'in_progress') {
-        throw new WorkerHttpError(400, 'ALREADY_SUBMITTED', 'Attempt has already been submitted.');
-      }
+    const attemptDoc = await getExamAttemptD1(db, attemptId);
+    if (!attemptDoc) {
+      throw new WorkerHttpError(404, 'ATTEMPT_NOT_FOUND', 'Exam attempt not found.');
+    }
+    if (attemptDoc.userId !== authUser.uid) {
+      throw new WorkerHttpError(403, 'FORBIDDEN', 'Cannot modify another user exam attempt.');
+    }
+    if (attemptDoc.status !== 'in_progress') {
+      throw new WorkerHttpError(400, 'ALREADY_SUBMITTED', 'Attempt has already been submitted.');
+    }
 
-      tx.update('examAttempts', attemptId, {
-        ...(cleanedAnswers !== undefined ? { answers: cleanedAnswers } : {}),
-        ...(cleanedFlagged !== undefined ? { flaggedQuestionIds: cleanedFlagged } : {}),
-        ...(cleanedIndex !== undefined ? { currentQuestionIndex: cleanedIndex } : {}),
-        lastSavedAt: nowIso
-      });
-    });
+    const updatedAttempt: StoredExamAttempt = {
+      ...attemptDoc,
+      ...(cleanedAnswers !== undefined ? { answers: cleanedAnswers } : {}),
+      ...(cleanedFlagged !== undefined ? { flaggedQuestionIds: cleanedFlagged } : {}),
+      ...(cleanedIndex !== undefined ? { currentQuestionIndex: cleanedIndex } : {}),
+      lastSavedAt: nowIso
+    };
+    await updateExamAttemptProgressD1(db, updatedAttempt);
 
     return { status: 200, payload: { success: true } };
   }
 
   // ---------------------------------------------------------
   // 4. AUTHORITATIVE SERVER-SIDE EXAM GRADING & SUBMISSION
-  //    Uses batched reads inside transaction (stays <= 10 HTTP subrequests!)
+  //    (Evaluates against D1 authoritative question + key store)
   // ---------------------------------------------------------
   if (pathname === '/api/exams/submit' && method === 'POST') {
     const authUser = await authenticateFirebaseRequest(ctx.request, {
@@ -404,244 +433,231 @@ export async function handleExamsAndResultsRoutes(
     }
 
     const uid = authUser.uid;
-    const txOutcome = await firestoreClient.runTransaction(async tx => {
-      const attemptDoc = await tx.get<Record<string, unknown>>('examAttempts', attemptId);
-      if (!attemptDoc) {
-        throw new WorkerHttpError(404, 'ATTEMPT_NOT_FOUND', 'Exam attempt not found.');
-      }
+    const isOwner = isOwnerUser(authUser, env);
+    const userClient = firestoreClient.withToken(authUser.idToken);
 
-      const rawAttempt = attemptDoc as unknown as ExamAttempt & { resolvedQuestionIds?: string[] };
-      if (rawAttempt.userId !== uid) {
-        throw new WorkerHttpError(403, 'FORBIDDEN', 'Cannot submit another user exam attempt.');
+    const rawAttempt = await getExamAttemptD1(db, attemptId);
+    if (!rawAttempt) {
+      throw new WorkerHttpError(404, 'ATTEMPT_NOT_FOUND', 'Exam attempt not found.');
+    }
+    if (rawAttempt.userId !== uid) {
+      throw new WorkerHttpError(403, 'FORBIDDEN', 'Cannot submit another user exam attempt.');
+    }
+    if (rawAttempt.status !== 'in_progress') {
+      throw new WorkerHttpError(400, 'ALREADY_SUBMITTED', 'Attempt has already been submitted.');
+    }
+
+    const exam = await resolveExamByIdKeyless(db, userClient, rawAttempt.examId);
+    if (!exam) {
+      throw new WorkerHttpError(404, 'EXAM_NOT_FOUND', 'Exam not found.');
+    }
+
+    const resolvedIds =
+      Array.isArray(rawAttempt.resolvedQuestionIds) && rawAttempt.resolvedQuestionIds.length > 0
+        ? rawAttempt.resolvedQuestionIds
+        : exam.questionIds || [];
+
+    let authoritativeQuestions: ServerQuestion[] = [];
+    if (resolvedIds.length > 0 && resolvedIds.length <= 200) {
+      const [d1QuestionMap, keyMap] = await Promise.all([
+        querySanitizedQuestionsByIdsFromD1(db, resolvedIds),
+        getAuthoritativeQuestionKeys(db, userClient, resolvedIds, { ttlMs, nowMs })
+      ]);
+
+      const missingQuestionIds = resolvedIds.filter(qId => !d1QuestionMap.has(qId));
+      const fsQuestionMap =
+        missingQuestionIds.length > 0
+          ? await userClient
+              .batchGetDocuments<Record<string, unknown>>(
+                missingQuestionIds.map(qId => ({ collection: 'questions', docId: qId }))
+              )
+              .catch(() => new Map<string, Record<string, unknown> & { id: string }>())
+          : new Map<string, Record<string, unknown> & { id: string }>();
+
+      for (const qId of resolvedIds) {
+        const qBase = d1QuestionMap.get(qId) || fsQuestionMap.get(qId);
+        if (!qBase) continue;
+        const kRec = keyMap.get(qId);
+        authoritativeQuestions.push(hydrateQuestionDoc(qId, qBase, kRec));
       }
-      if (rawAttempt.status !== 'in_progress') {
+    } else {
+      await ensureSanitizedQuestionsSyncedD1(db, userClient, { ttlMs, nowMs, isOwner });
+      const { questions: allSanitized } = await querySanitizedQuestionsFromD1(db);
+      const examMetaWithIds = resolvedIds.length > 0 ? { ...exam, questionIds: resolvedIds } : exam;
+      const selectedSanitized = getQuestionsForExam(
+        examMetaWithIds,
+        allSanitized as unknown as Question[]
+      );
+      const keyMap = await getAuthoritativeQuestionKeys(
+        db,
+        userClient,
+        selectedSanitized.map(q => q.id),
+        { ttlMs, nowMs }
+      );
+      authoritativeQuestions = selectedSanitized.map(q =>
+        hydrateQuestionDoc(q.id, q as unknown as SanitizedQuestion, keyMap.get(q.id))
+      );
+    }
+
+    if (authoritativeQuestions.length === 0) {
+      throw new WorkerHttpError(
+        500,
+        'QUESTIONS_UNAVAILABLE',
+        'Authoritative exam questions could not be loaded.'
+      );
+    }
+
+    const validQIdSet = new Set(authoritativeQuestions.map(q => q.id));
+    const rawAnswersSource: Record<string, unknown> =
+      clientAnswers && typeof clientAnswers === 'object' && !Array.isArray(clientAnswers)
+        ? (clientAnswers as Record<string, unknown>)
+        : rawAttempt.answers || {};
+
+    const sanitizedAnswers: Record<string, number> = {};
+    for (const [qId, optVal] of Object.entries(rawAnswersSource)) {
+      if (
+        validQIdSet.has(qId) &&
+        typeof optVal === 'number' &&
+        Number.isInteger(optVal) &&
+        optVal >= 0 &&
+        optVal <= 3
+      ) {
+        sanitizedAnswers[qId] = optVal;
+      }
+    }
+
+    const positiveRatio = exam.positiveMarkRatio ?? 1.0;
+    const negativeRatio = exam.negativeMarkRatio ?? 0.25;
+    const scoreResult = calculateExamScore(
+      sanitizedAnswers,
+      authoritativeQuestions as unknown as Question[],
+      {
+        positiveMarkRatio: positiveRatio,
+        negativeMarkRatio: negativeRatio,
+        passThresholdPercentage: exam.passThresholdPercentage
+      }
+    );
+
+    const startTimeMs = new Date(rawAttempt.startTime).getTime();
+    const deadlineMs = new Date(rawAttempt.deadlineTime).getTime();
+    const submissionTimeMs = Math.min(nowMs, isNaN(deadlineMs) ? nowMs : deadlineMs + 15_000);
+    const timeSpentSeconds = Math.max(
+      1,
+      Math.round((submissionTimeMs - (isNaN(startTimeMs) ? nowMs : startTimeMs)) / 1000)
+    );
+
+    const subjectScores: ExamResult['subjectWiseScores'] = {};
+    for (const sub of INITIAL_SUBJECTS) {
+      const subQuestions = authoritativeQuestions.filter(q => q.subjectId === sub.id);
+      if (subQuestions.length > 0) {
+        let correct = 0;
+        let incorrect = 0;
+        let unanswered = 0;
+        for (const q of subQuestions) {
+          const ans = sanitizedAnswers[q.id];
+          if (ans === undefined || ans === null) unanswered++;
+          else if (ans === q.correctOptionIndex) correct++;
+          else incorrect++;
+        }
+        const score =
+          Math.round((correct * positiveRatio - incorrect * negativeRatio) * 100) / 100;
+        subjectScores[sub.id] = {
+          subjectNameBn: sub.nameBn,
+          subjectNameEn: sub.nameEn,
+          total: subQuestions.length,
+          correct,
+          incorrect,
+          unanswered,
+          score
+        };
+      }
+    }
+
+    const nextAttemptStatus: ExamAttempt['status'] =
+      isAutoTimeout || (!isNaN(deadlineMs) && nowMs > deadlineMs + 15_000)
+        ? 'timed_out'
+        : 'submitted';
+
+    const newResult: ExamResult = {
+      id: `res_${rawAttempt.id}`,
+      attemptId: rawAttempt.id,
+      examId: exam.id,
+      examTitleBn: exam.titleBn,
+      examTitleEn: exam.titleEn,
+      examType: exam.type,
+      userId: uid,
+      studentName: rawAttempt.studentName,
+      submittedAt: nowIso,
+      timeSpentSeconds,
+      totalQuestions: scoreResult.totalQuestions,
+      correctAnswersCount: scoreResult.correctAnswersCount,
+      incorrectAnswersCount: scoreResult.incorrectAnswersCount,
+      unansweredCount: scoreResult.unansweredCount,
+      positiveMarks: scoreResult.positiveMarks,
+      negativeMarks: scoreResult.negativeMarks,
+      finalScore: scoreResult.finalScore,
+      percentage: scoreResult.percentage,
+      passed: scoreResult.passed,
+      passThresholdPercentage: exam.passThresholdPercentage,
+      subjectWiseScores: subjectScores,
+      answers: sanitizedAnswers,
+      questions: authoritativeQuestions as unknown as Question[]
+    };
+
+    const leaderboardEntry: LeaderboardEntry = {
+      id: `lead_${uid}_${exam.id}`,
+      userId: uid,
+      studentName: rawAttempt.studentName,
+      examId: exam.id,
+      examTitleBn: exam.titleBn,
+      examTitleEn: exam.titleEn,
+      score: newResult.finalScore,
+      totalMarks: newResult.totalQuestions,
+      percentage: newResult.percentage,
+      correctAnswersCount: newResult.correctAnswersCount,
+      incorrectAnswersCount: newResult.incorrectAnswersCount,
+      unansweredCount: newResult.unansweredCount,
+      timeSpentSeconds,
+      completedAt: nowIso
+    };
+
+    const auditEntry: AuditLog = {
+      id: makeId('log', nowMs),
+      userId: uid,
+      userName: rawAttempt.studentName,
+      action: nextAttemptStatus === 'timed_out' ? 'EXAM_TIMED_OUT' : 'SUBMIT_EXAM',
+      details: `Server graded "${exam.titleEn}": ${newResult.finalScore}/${newResult.totalQuestions} (${newResult.percentage}%)`,
+      timestamp: nowIso
+    };
+
+    const updatedAttempt: StoredExamAttempt = {
+      ...rawAttempt,
+      status: nextAttemptStatus,
+      submittedTime: nowIso,
+      lastSavedAt: nowIso,
+      answers: sanitizedAnswers
+    };
+
+    try {
+      await commitExamSubmissionD1(db, {
+        attempt: updatedAttempt,
+        result: newResult,
+        leaderboardEntry,
+        auditEntry
+      });
+    } catch (err) {
+      if (isUniqueConstraintError(err)) {
         throw new WorkerHttpError(400, 'ALREADY_SUBMITTED', 'Attempt has already been submitted.');
       }
-
-      const examDoc = await tx.get<Record<string, unknown>>('exams', rawAttempt.examId);
-      if (!examDoc) {
-        throw new WorkerHttpError(404, 'EXAM_NOT_FOUND', 'Exam not found.');
-      }
-      const exam: Exam = {
-        ...(examDoc as unknown as Omit<Exam, 'id'>),
-        id: examDoc.id,
-        isActive:
-          examDoc.isActive !== undefined
-            ? Boolean(examDoc.isActive)
-            : !examDoc.isPaid || examDoc.id === 'exam_model_test_01'
-      };
-
-      const resolvedIds =
-        Array.isArray(rawAttempt.resolvedQuestionIds) && rawAttempt.resolvedQuestionIds.length > 0
-          ? rawAttempt.resolvedQuestionIds
-          : exam.questionIds || [];
-
-      let authoritativeQuestions: ServerQuestion[] = [];
-      if (resolvedIds.length > 0 && resolvedIds.length <= 200) {
-        // Batched snapshot reads inside transaction: max 2 subrequests per 100 questions!
-        const [qMap, kMap] = await Promise.all([
-          firestoreClient.batchGetDocuments<Record<string, unknown>>(
-            resolvedIds.map(qId => ({ collection: 'questions', docId: qId })),
-            { transactionId: tx.transactionId }
-          ),
-          firestoreClient.batchGetDocuments<Record<string, unknown>>(
-            resolvedIds.map(qId => ({ collection: 'questionKeys', docId: qId })),
-            { transactionId: tx.transactionId }
-          )
-        ]);
-        for (const qId of resolvedIds) {
-          const qDoc = qMap.get(qId);
-          if (!qDoc) continue;
-          const kDoc = kMap.get(qId);
-          authoritativeQuestions.push(hydrateQuestionDoc(qId, qDoc, kDoc));
-        }
-      } else {
-        await ensureSanitizedQuestionsSyncedD1(db, firestoreClient, { ttlMs, nowMs });
-        const { questions: allSanitized } = await querySanitizedQuestionsFromD1(db);
-        const examMetaWithIds = resolvedIds.length > 0 ? { ...exam, questionIds: resolvedIds } : exam;
-        const selectedSanitized = getQuestionsForExam(
-          examMetaWithIds,
-          allSanitized as unknown as Question[]
-        );
-        const keyMap = await getAuthoritativeQuestionKeys(
-          db,
-          firestoreClient,
-          selectedSanitized.map(q => q.id),
-          { ttlMs, nowMs }
-        );
-        authoritativeQuestions = selectedSanitized.map(q => {
-          const k = keyMap.get(q.id);
-          return {
-            ...(q as unknown as ServerQuestion),
-            correctOptionIndex: k?.correctOptionIndex ?? 0,
-            explanationBn: k?.explanationBn ?? '',
-            explanationEn: k?.explanationEn ?? '',
-            legalReference: k?.legalReference || q.legalReference || ''
-          };
-        });
-      }
-
-      if (authoritativeQuestions.length === 0) {
-        throw new WorkerHttpError(
-          500,
-          'QUESTIONS_UNAVAILABLE',
-          'Authoritative exam questions could not be loaded.'
-        );
-      }
-
-      const validQIdSet = new Set(authoritativeQuestions.map(q => q.id));
-      const rawAnswersSource: Record<string, unknown> =
-        clientAnswers && typeof clientAnswers === 'object' && !Array.isArray(clientAnswers)
-          ? (clientAnswers as Record<string, unknown>)
-          : rawAttempt.answers || {};
-
-      const sanitizedAnswers: Record<string, number> = {};
-      for (const [qId, optVal] of Object.entries(rawAnswersSource)) {
-        if (
-          validQIdSet.has(qId) &&
-          typeof optVal === 'number' &&
-          Number.isInteger(optVal) &&
-          optVal >= 0 &&
-          optVal <= 3
-        ) {
-          sanitizedAnswers[qId] = optVal;
-        }
-      }
-
-      const positiveRatio = exam.positiveMarkRatio ?? 1.0;
-      const negativeRatio = exam.negativeMarkRatio ?? 0.25;
-      const scoreResult = calculateExamScore(
-        sanitizedAnswers,
-        authoritativeQuestions as unknown as Question[],
-        {
-          positiveMarkRatio: positiveRatio,
-          negativeMarkRatio: negativeRatio,
-          passThresholdPercentage: exam.passThresholdPercentage
-        }
-      );
-
-      const startTimeMs = new Date(rawAttempt.startTime).getTime();
-      const deadlineMs = new Date(rawAttempt.deadlineTime).getTime();
-      const submissionTimeMs = Math.min(nowMs, isNaN(deadlineMs) ? nowMs : deadlineMs + 15_000);
-      const timeSpentSeconds = Math.max(
-        1,
-        Math.round((submissionTimeMs - (isNaN(startTimeMs) ? nowMs : startTimeMs)) / 1000)
-      );
-
-      const subjectScores: ExamResult['subjectWiseScores'] = {};
-      for (const sub of INITIAL_SUBJECTS) {
-        const subQuestions = authoritativeQuestions.filter(q => q.subjectId === sub.id);
-        if (subQuestions.length > 0) {
-          let correct = 0;
-          let incorrect = 0;
-          let unanswered = 0;
-          for (const q of subQuestions) {
-            const ans = sanitizedAnswers[q.id];
-            if (ans === undefined || ans === null) unanswered++;
-            else if (ans === q.correctOptionIndex) correct++;
-            else incorrect++;
-          }
-          const score =
-            Math.round((correct * positiveRatio - incorrect * negativeRatio) * 100) / 100;
-          subjectScores[sub.id] = {
-            subjectNameBn: sub.nameBn,
-            subjectNameEn: sub.nameEn,
-            total: subQuestions.length,
-            correct,
-            incorrect,
-            unanswered,
-            score
-          };
-        }
-      }
-
-      const nextAttemptStatus: ExamAttempt['status'] =
-        isAutoTimeout || (!isNaN(deadlineMs) && nowMs > deadlineMs + 15_000)
-          ? 'timed_out'
-          : 'submitted';
-
-      const newResult: ExamResult = {
-        id: `res_${rawAttempt.id}`,
-        attemptId: rawAttempt.id,
-        examId: exam.id,
-        examTitleBn: exam.titleBn,
-        examTitleEn: exam.titleEn,
-        examType: exam.type,
-        userId: uid,
-        studentName: rawAttempt.studentName,
-        submittedAt: nowIso,
-        timeSpentSeconds,
-        totalQuestions: scoreResult.totalQuestions,
-        correctAnswersCount: scoreResult.correctAnswersCount,
-        incorrectAnswersCount: scoreResult.incorrectAnswersCount,
-        unansweredCount: scoreResult.unansweredCount,
-        positiveMarks: scoreResult.positiveMarks,
-        negativeMarks: scoreResult.negativeMarks,
-        finalScore: scoreResult.finalScore,
-        percentage: scoreResult.percentage,
-        passed: scoreResult.passed,
-        passThresholdPercentage: exam.passThresholdPercentage,
-        subjectWiseScores: subjectScores,
-        answers: sanitizedAnswers,
-        questions: authoritativeQuestions as unknown as Question[]
-      };
-
-      const leaderboardEntry: LeaderboardEntry = {
-        id: `lead_${uid}_${exam.id}`,
-        userId: uid,
-        studentName: rawAttempt.studentName,
-        examId: exam.id,
-        examTitleBn: exam.titleBn,
-        examTitleEn: exam.titleEn,
-        score: newResult.finalScore,
-        totalMarks: newResult.totalQuestions,
-        percentage: newResult.percentage,
-        correctAnswersCount: newResult.correctAnswersCount,
-        incorrectAnswersCount: newResult.incorrectAnswersCount,
-        unansweredCount: newResult.unansweredCount,
-        timeSpentSeconds,
-        completedAt: nowIso
-      };
-
-      const { questions: _omittedQuestions, ...firestoreResultPayload } = newResult;
-      const auditId = makeId('log', nowMs);
-
-      tx.update('examAttempts', attemptId, {
-        status: nextAttemptStatus,
-        submittedTime: nowIso,
-        answers: sanitizedAnswers
-      });
-
-      tx.set('examResults', newResult.id, {
-        ...firestoreResultPayload,
-        score: newResult.finalScore
-      });
-
-      tx.set(
-        'leaderboard',
-        leaderboardEntry.id,
-        leaderboardEntry as unknown as Record<string, unknown>,
-        { merge: true }
-      );
-
-      tx.set('auditLogs', auditId, {
-        id: auditId,
-        userId: uid,
-        userName: rawAttempt.studentName,
-        action: nextAttemptStatus === 'timed_out' ? 'EXAM_TIMED_OUT' : 'SUBMIT_EXAM',
-        details: `Server graded "${exam.titleEn}": ${newResult.finalScore}/${newResult.totalQuestions} (${newResult.percentage}%)`,
-        timestamp: nowIso
-      });
-
-      return { newResult, leaderboardEntry };
-    });
+      throw err;
+    }
 
     return {
       status: 200,
       payload: {
         success: true,
-        result: txOutcome.newResult,
-        leaderboardEntry: txOutcome.leaderboardEntry
+        result: newResult,
+        leaderboardEntry
       },
       headers: rlHeaders
     };
@@ -664,10 +680,26 @@ export async function handleExamsAndResultsRoutes(
       nowIso
     });
 
-    const docs = await firestoreClient.runQuery<Record<string, unknown>>({
-      collection: 'examResults',
-      where: [{ field: 'userId', op: 'EQUAL', value: authUser.uid }]
-    });
+    const userClient = firestoreClient.withToken(authUser.idToken);
+    const [d1Results, fsDocs] = await Promise.all([
+      listExamResultsByUserD1(db, authUser.uid),
+      userClient
+        .runQuery<Record<string, unknown>>({
+          collection: 'examResults',
+          where: [{ field: 'userId', op: 'EQUAL', value: authUser.uid }]
+        })
+        .catch(() => [] as Array<Record<string, unknown> & { id: string }>)
+    ]);
+
+    const mergedMap = new Map<string, Record<string, unknown>>();
+    for (const d of fsDocs) {
+      if (d?.id) mergedMap.set(d.id, d);
+    }
+    for (const r of d1Results) {
+      if (r?.id) mergedMap.set(r.id, r as unknown as Record<string, unknown>);
+    }
+
+    const docs = Array.from(mergedMap.values());
     docs.sort(
       (a, b) =>
         new Date(String(b.submittedAt || 0)).getTime() - new Date(String(a.submittedAt || 0)).getTime()
@@ -695,10 +727,26 @@ export async function handleExamsAndResultsRoutes(
       throw new WorkerHttpError(403, 'FORBIDDEN', 'Cannot read another user exam results.');
     }
 
-    const docs = await firestoreClient.runQuery<Record<string, unknown>>({
-      collection: 'examResults',
-      where: [{ field: 'userId', op: 'EQUAL', value: requestedUid }]
-    });
+    const userClient = firestoreClient.withToken(authUser.idToken);
+    const [d1Results, fsDocs] = await Promise.all([
+      listExamResultsByUserD1(db, requestedUid),
+      userClient
+        .runQuery<Record<string, unknown>>({
+          collection: 'examResults',
+          where: [{ field: 'userId', op: 'EQUAL', value: requestedUid }]
+        })
+        .catch(() => [] as Array<Record<string, unknown> & { id: string }>)
+    ]);
+
+    const mergedMap = new Map<string, Record<string, unknown>>();
+    for (const d of fsDocs) {
+      if (d?.id) mergedMap.set(d.id, d);
+    }
+    for (const r of d1Results) {
+      if (r?.id) mergedMap.set(r.id, r as unknown as Record<string, unknown>);
+    }
+
+    const docs = Array.from(mergedMap.values());
     docs.sort(
       (a, b) =>
         new Date(String(b.submittedAt || 0)).getTime() - new Date(String(a.submittedAt || 0)).getTime()

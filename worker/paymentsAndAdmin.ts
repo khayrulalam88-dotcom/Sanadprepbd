@@ -17,21 +17,47 @@ import {
   type JwksFetcher
 } from './firebaseAuth.ts';
 import {
-  checkUserHasActiveSubscriptionRest,
   FirestoreRestClient,
   FirestoreTimestampValue,
   timestampToIso,
   type FirestoreWriteOp
 } from './firestoreRest.ts';
 import {
+  checkUserHasActiveSubscriptionKeyless,
   consumeRateLimitD1,
+  expireOrCancelUserSubscriptionsD1,
+  findPaymentRequestByTrxIdD1,
+  findSubscriptionByTrxIdD1,
+  getPaymentRequestD1,
+  insertPaymentRequestAtomicD1,
+  listAllExamResultsD1,
+  listAuditLogsD1,
+  listPaymentRequestsD1,
+  listSubscriptionsD1,
+  listUnsyncedAuditLogsD1,
+  listUnsyncedExamAttemptsD1,
+  listUnsyncedExamResultsD1,
+  listUnsyncedLeaderboardD1,
+  listUnsyncedPaymentRequestsD1,
+  markAuditLogsSyncedD1,
+  markExamAttemptsSyncedD1,
+  markExamResultsSyncedD1,
+  markLeaderboardSyncedD1,
+  markPaymentsSyncedD1,
   revokeUserSessionsByAdminD1,
+  upsertExamCacheD1,
+  upsertExamsBatchD1,
+  upsertPaymentRequestD1,
+  upsertSubscriptionD1,
   validateAndTouchSessionD1,
+  writeAuditLogD1,
   type RateLimitResult
 } from './d1Store.ts';
+import { syncQuestionsAndKeysToD1 } from './questionCache.ts';
 import {
   WorkerHttpError,
   type AuditLog,
+  type D1Database,
   type DecodedAuthUser,
   type UserSubscription,
   type WorkerEnv
@@ -137,6 +163,130 @@ async function commitWritesChunked(
   }
 }
 
+function mergePaymentRecords(
+  fsList: Array<Record<string, unknown>>,
+  d1List: PaymentRequest[]
+): Array<Record<string, unknown>> {
+  const map = new Map<string, Record<string, unknown>>();
+  for (const item of fsList) {
+    if (typeof item.id === 'string' && item.id) {
+      map.set(item.id, item);
+    }
+  }
+  for (const item of d1List) {
+    const existing = map.get(item.id);
+    if (!existing) {
+      map.set(item.id, item as unknown as Record<string, unknown>);
+      continue;
+    }
+    const existingPending = String(existing.status || 'pending') === 'pending';
+    const d1Resolved = item.status !== 'pending';
+    if (existingPending && d1Resolved) {
+      map.set(item.id, item as unknown as Record<string, unknown>);
+    }
+  }
+  const merged = Array.from(map.values());
+  merged.sort(
+    (a, b) =>
+      new Date(String(b.requestedAt || 0)).getTime() - new Date(String(a.requestedAt || 0)).getTime()
+  );
+  return merged;
+}
+
+/**
+ * Best-effort replication of D1 edge records into Firestore using verified Owner ID token.
+ * Satisfies `isOwnerAccount()` in firestore.rules without any service-account key.
+ */
+export async function syncEdgeRecordsWithOwnerFirestore(
+  db: D1Database,
+  ownerClient: FirestoreRestClient
+): Promise<{
+  paymentsSynced: number;
+  attemptsSynced: number;
+  resultsSynced: number;
+  leaderboardSynced: number;
+  auditLogsSynced: number;
+}> {
+  const [unsyncedPayments, unsyncedAttempts, unsyncedResults, unsyncedLeaderboard, unsyncedAudits] =
+    await Promise.all([
+      listUnsyncedPaymentRequestsD1(db),
+      listUnsyncedExamAttemptsD1(db, 100),
+      listUnsyncedExamResultsD1(db, 100),
+      listUnsyncedLeaderboardD1(db, 100),
+      listUnsyncedAuditLogsD1(db, 100)
+    ]);
+
+  const ops: FirestoreWriteOp[] = [];
+  for (const p of unsyncedPayments) {
+    ops.push({
+      type: 'set',
+      collection: 'paymentRequests',
+      docId: p.id,
+      data: { ...(p as unknown as Record<string, unknown>) },
+      merge: true
+    });
+  }
+  for (const a of unsyncedAttempts) {
+    ops.push({
+      type: 'set',
+      collection: 'examAttempts',
+      docId: a.id,
+      data: { ...(a as unknown as Record<string, unknown>) },
+      merge: true
+    });
+  }
+  for (const r of unsyncedResults) {
+    const { questions: _omitted, ...summary } = r;
+    ops.push({
+      type: 'set',
+      collection: 'examResults',
+      docId: r.id,
+      data: {
+        ...(summary as unknown as Record<string, unknown>),
+        score: r.finalScore
+      },
+      merge: true
+    });
+  }
+  for (const l of unsyncedLeaderboard) {
+    ops.push({
+      type: 'set',
+      collection: 'leaderboard',
+      docId: l.id,
+      data: { ...(l as unknown as Record<string, unknown>) },
+      merge: true
+    });
+  }
+  for (const log of unsyncedAudits) {
+    ops.push({
+      type: 'set',
+      collection: 'auditLogs',
+      docId: log.id,
+      data: { ...(log as unknown as Record<string, unknown>) },
+      merge: true
+    });
+  }
+
+  if (ops.length > 0) {
+    await commitWritesChunked(ownerClient, ops);
+    await Promise.all([
+      markPaymentsSyncedD1(db, unsyncedPayments.map(p => p.id)),
+      markExamAttemptsSyncedD1(db, unsyncedAttempts.map(a => a.id)),
+      markExamResultsSyncedD1(db, unsyncedResults.map(r => r.id)),
+      markLeaderboardSyncedD1(db, unsyncedLeaderboard.map(l => l.id)),
+      markAuditLogsSyncedD1(db, unsyncedAudits.map(a => a.id))
+    ]);
+  }
+
+  return {
+    paymentsSynced: unsyncedPayments.length,
+    attemptsSynced: unsyncedAttempts.length,
+    resultsSynced: unsyncedResults.length,
+    leaderboardSynced: unsyncedLeaderboard.length,
+    auditLogsSynced: unsyncedAudits.length
+  };
+}
+
 export async function handlePaymentsAndAdminRoutes(
   ctx: Phase3RouteContext
 ): Promise<Phase3RouteResult | null> {
@@ -146,7 +296,7 @@ export async function handlePaymentsAndAdminRoutes(
   const nowIso = new Date(nowMs).toISOString();
 
   // ---------------------------------------------------------
-  // 1. STUDENT PAYMENT SUBMISSION & RETRIEVAL
+  // 1. STUDENT PAYMENT SUBMISSION & RETRIEVAL (Keyless D1 Atomic)
   // ---------------------------------------------------------
   if (pathname === '/api/payments/create' && method === 'POST') {
     const authUser = await authenticateFirebaseRequest(ctx.request, {
@@ -234,21 +384,28 @@ export async function handlePaymentsAndAdminRoutes(
     }
 
     const docId = `trx_${cleanTrxId}`;
+    const userClient = firestoreClient.withToken(authUser.idToken);
 
-    // Authoritative Firestore lookups: package pricing, exam config, and duplicate TrxID checks
-    const [pkgDoc, configDoc, dupPayDocs, dupSubDocs] = await Promise.all([
+    // Public catalog lookups (packages & config have allow read: if true) + duplicate checks across D1 & Firestore
+    const [pkgDoc, configDoc, d1DupPay, d1DupSub, fsDupPayDocs, fsDupSubDocs] = await Promise.all([
       firestoreClient.getDocument<Record<string, unknown>>('packages', packageId),
       firestoreClient.getDocument<Record<string, unknown>>('config', 'examDate'),
-      firestoreClient.runQuery<Record<string, unknown>>({
-        collection: 'paymentRequests',
-        where: [{ field: 'transactionId', op: 'EQUAL', value: cleanTrxId }],
-        limit: 1
-      }),
-      firestoreClient.runQuery<Record<string, unknown>>({
-        collection: 'subscriptions',
-        where: [{ field: 'transactionId', op: 'EQUAL', value: cleanTrxId }],
-        limit: 1
-      })
+      findPaymentRequestByTrxIdD1(db, cleanTrxId),
+      findSubscriptionByTrxIdD1(db, cleanTrxId),
+      userClient
+        .runQuery<Record<string, unknown>>({
+          collection: 'paymentRequests',
+          where: [{ field: 'transactionId', op: 'EQUAL', value: cleanTrxId }],
+          limit: 1
+        })
+        .catch(() => [] as Array<Record<string, unknown> & { id: string }>),
+      userClient
+        .runQuery<Record<string, unknown>>({
+          collection: 'subscriptions',
+          where: [{ field: 'transactionId', op: 'EQUAL', value: cleanTrxId }],
+          limit: 1
+        })
+        .catch(() => [] as Array<Record<string, unknown> & { id: string }>)
     ]);
 
     if (!pkgDoc) {
@@ -267,8 +424,9 @@ export async function handlePaymentsAndAdminRoutes(
       );
     }
 
-    if (dupPayDocs.length > 0) {
-      const existingStatus = String(dupPayDocs[0].status || '');
+    const existingDupPay = d1DupPay || (fsDupPayDocs[0] as unknown as PaymentRequest | undefined);
+    if (existingDupPay) {
+      const existingStatus = String(existingDupPay.status || '');
       throw new WorkerHttpError(
         409,
         'DUPLICATE_TRX_ID',
@@ -277,7 +435,7 @@ export async function handlePaymentsAndAdminRoutes(
           : 'এই ট্রানজাকশন আইডিটি (TrxID) ইতিপূর্বে ব্যবহার করা হয়েছে। একই TrxID পুনরায় গ্রহণযোগ্য নয়।'
       );
     }
-    if (dupSubDocs.length > 0) {
+    if (d1DupSub || fsDupSubDocs.length > 0) {
       throw new WorkerHttpError(
         409,
         'DUPLICATE_TRX_ID',
@@ -331,52 +489,8 @@ export async function handlePaymentsAndAdminRoutes(
       timestamp: nowIso
     };
 
-    try {
-      // Atomic create precondition (currentDocument.exists = false) on trx_${cleanTrxId}
-      await firestoreClient.commitWrites([
-        {
-          type: 'create',
-          collection: 'paymentRequests',
-          docId,
-          data: {
-            userId: newReq.userId,
-            studentName: newReq.studentName,
-            studentPhone: newReq.studentPhone,
-            method: newReq.method,
-            senderNumber: newReq.senderNumber,
-            transactionId: newReq.transactionId,
-            amount: newReq.amount,
-            packageId: newReq.packageId,
-            packageNameBn: newReq.packageNameBn,
-            packageNameEn: newReq.packageNameEn,
-            packageTitle: newReq.packageTitle,
-            durationDays: newReq.durationDays,
-            validityType: newReq.validityType,
-            status: 'pending',
-            requestedAt: newReq.requestedAt,
-            verifiedAt: null,
-            verifiedBy: null,
-            rejectionReason: null,
-            subscriptionId: null
-          }
-        },
-        {
-          type: 'set',
-          collection: 'auditLogs',
-          docId: auditEntry.id,
-          data: { ...auditEntry }
-        }
-      ]);
-    } catch (err) {
-      if (err instanceof WorkerHttpError && err.code === 'ALREADY_EXISTS') {
-        throw new WorkerHttpError(
-          409,
-          'DUPLICATE_TRX_ID',
-          'এই ট্রানজাকশন আইডিটি (TrxID) ইতিপূর্বে সিস্টেমে নিবন্ধিত হয়েছে। পুনরায় জমা দেওয়া সম্ভব নয়।'
-        );
-      }
-      throw err;
-    }
+    // Race-proof atomic insert on D1 UNIQUE(transaction_id)
+    await insertPaymentRequestAtomicD1(db, newReq, auditEntry, false);
 
     return {
       status: 200,
@@ -404,26 +518,30 @@ export async function handlePaymentsAndAdminRoutes(
     });
 
     const isOwner = isOwnerUser(authUser, env);
-    const list =
-      pathname === '/api/payments' && isOwner
-        ? await firestoreClient.listDocuments<Record<string, unknown>>('paymentRequests', {
+    const userClient = firestoreClient.withToken(authUser.idToken);
+    const scopeAll = pathname === '/api/payments' && isOwner;
+
+    const [d1List, fsList] = await Promise.all([
+      listPaymentRequestsD1(db, scopeAll ? undefined : authUser.uid),
+      (scopeAll
+        ? userClient.listDocuments<Record<string, unknown>>('paymentRequests', {
             pageSize: 500,
             maxPages: 10
           })
-        : await firestoreClient.runQuery<Record<string, unknown>>({
+        : userClient.runQuery<Record<string, unknown>>({
             collection: 'paymentRequests',
             where: [{ field: 'userId', op: 'EQUAL', value: authUser.uid }]
-          });
+          })
+      ).catch(() => [] as Array<Record<string, unknown> & { id: string }>)
+    ]);
 
-    list.sort(
-      (a, b) =>
-        new Date(String(b.requestedAt || 0)).getTime() - new Date(String(a.requestedAt || 0)).getTime()
-    );
-    return { status: 200, payload: { paymentRequests: list } };
+    const merged = mergePaymentRecords(fsList, d1List);
+    return { status: 200, payload: { paymentRequests: merged } };
   }
 
   // ---------------------------------------------------------
   // 2. OWNER ADMIN PAYMENTS LIST, ATOMIC APPROVE & REJECT
+  //    (Verified Owner Admin ID Token passes Firestore `isOwnerAccount()`)
   // ---------------------------------------------------------
   if (pathname === '/api/admin/payments' && method === 'GET') {
     const authUser = await authenticateFirebaseRequest(ctx.request, {
@@ -435,15 +553,21 @@ export async function handlePaymentsAndAdminRoutes(
     });
     assertOwnerAdmin(authUser, env);
 
-    const list = await firestoreClient.listDocuments<Record<string, unknown>>('paymentRequests', {
-      pageSize: 500,
-      maxPages: 10
-    });
-    list.sort(
-      (a, b) =>
-        new Date(String(b.requestedAt || 0)).getTime() - new Date(String(a.requestedAt || 0)).getTime()
-    );
-    return { status: 200, payload: { paymentRequests: list } };
+    const ownerClient = firestoreClient.withToken(authUser.idToken);
+    await syncEdgeRecordsWithOwnerFirestore(db, ownerClient).catch(() => undefined);
+
+    const [fsList, d1List] = await Promise.all([
+      ownerClient
+        .listDocuments<Record<string, unknown>>('paymentRequests', {
+          pageSize: 500,
+          maxPages: 10
+        })
+        .catch(() => [] as Array<Record<string, unknown> & { id: string }>),
+      listPaymentRequestsD1(db)
+    ]);
+
+    const merged = mergePaymentRecords(fsList, d1List);
+    return { status: 200, payload: { paymentRequests: merged } };
   }
 
   const approveMatch = pathname.match(/^\/api\/admin\/payments\/([^/]+)\/approve$/);
@@ -467,12 +591,16 @@ export async function handlePaymentsAndAdminRoutes(
         ? body.verifierName.trim().slice(0, 100)
         : authUser.email || 'Owner Admin';
 
-    const { updatedPay, newSubscription } = await firestoreClient.runTransaction(async tx => {
-      const payDoc = await tx.get<Record<string, unknown>>('paymentRequests', id);
-      if (!payDoc) {
+    const ownerClient = firestoreClient.withToken(authUser.idToken);
+    const d1Pay = await getPaymentRequestD1(db, id);
+
+    const { updatedPay, newSubscription, auditEntry } = await ownerClient.runTransaction(async tx => {
+      const fsPayDoc = await tx.get<Record<string, unknown>>('paymentRequests', id);
+      const sourcePay = fsPayDoc || (d1Pay as unknown as Record<string, unknown> | null);
+      if (!sourcePay) {
         throw new WorkerHttpError(404, 'NOT_FOUND', 'Payment request not found.');
       }
-      const reqItem = payDoc as unknown as PaymentRequest;
+      const reqItem = sourcePay as unknown as PaymentRequest;
 
       if (reqItem.status === 'approved') {
         throw new WorkerHttpError(409, 'ALREADY_APPROVED', 'Payment already approved.');
@@ -481,23 +609,27 @@ export async function handlePaymentsAndAdminRoutes(
         throw new WorkerHttpError(400, 'ALREADY_REJECTED', 'Rejected payment request cannot be approved.');
       }
 
-      const [sameTrxPayDocs, sameTrxSubDocs, pkgDoc, configDoc] = await Promise.all([
-        firestoreClient.runQuery<Record<string, unknown>>({
+      const [sameTrxPayDocs, sameTrxSubDocs, d1TrxPay, d1TrxSub, pkgDoc, configDoc] = await Promise.all([
+        ownerClient.runQuery<Record<string, unknown>>({
           collection: 'paymentRequests',
           where: [{ field: 'transactionId', op: 'EQUAL', value: reqItem.transactionId }],
           transactionId: tx.transactionId
         }),
-        firestoreClient.runQuery<Record<string, unknown>>({
+        ownerClient.runQuery<Record<string, unknown>>({
           collection: 'subscriptions',
           where: [{ field: 'transactionId', op: 'EQUAL', value: reqItem.transactionId }],
           transactionId: tx.transactionId
         }),
+        findPaymentRequestByTrxIdD1(db, reqItem.transactionId),
+        findSubscriptionByTrxIdD1(db, reqItem.transactionId),
         tx.get<Record<string, unknown>>('packages', reqItem.packageId),
         tx.get<Record<string, unknown>>('config', 'examDate')
       ]);
 
-      const hasDuplicateApprovedPay = sameTrxPayDocs.some(d => d.id !== id && d.status === 'approved');
-      if (hasDuplicateApprovedPay || sameTrxSubDocs.length > 0) {
+      const hasDuplicateApprovedPay =
+        sameTrxPayDocs.some(d => d.id !== id && d.status === 'approved') ||
+        Boolean(d1TrxPay && d1TrxPay.id !== id && d1TrxPay.status === 'approved');
+      if (hasDuplicateApprovedPay || sameTrxSubDocs.length > 0 || Boolean(d1TrxSub)) {
         throw new WorkerHttpError(
           409,
           'TRX_ALREADY_APPROVED',
@@ -550,13 +682,36 @@ export async function handlePaymentsAndAdminRoutes(
       };
 
       const auditId = makeAuditId(nowMs);
+      const auditRecord: AuditLog = {
+        id: auditId,
+        userId: authUser.uid,
+        userName: verifier,
+        action: 'PAYMENT_APPROVED',
+        details: `Approved ${reqItem.method} TrxID: ${reqItem.transactionId} (৳${reqItem.amount}) for UID ${reqItem.userId}.`,
+        timestamp: activatedAt
+      };
 
-      tx.update('paymentRequests', id, {
+      const nextPayRecord: PaymentRequest = {
+        ...reqItem,
         status: 'approved',
         verifiedAt: activatedAt,
         verifiedBy: verifier,
         subscriptionId: subId
-      });
+      };
+
+      if (fsPayDoc) {
+        tx.update('paymentRequests', id, {
+          status: 'approved',
+          verifiedAt: activatedAt,
+          verifiedBy: verifier,
+          subscriptionId: subId
+        });
+      } else {
+        tx.set('paymentRequests', id, {
+          ...(nextPayRecord as unknown as Record<string, unknown>),
+          rejectionReason: null
+        });
+      }
 
       // Use atomic create so concurrent replay can never overwrite an existing subscription
       tx.create('subscriptions', subId, {
@@ -591,26 +746,20 @@ export async function handlePaymentsAndAdminRoutes(
         { merge: true }
       );
 
-      tx.set('auditLogs', auditId, {
-        id: auditId,
-        userId: authUser.uid,
-        userName: verifier,
-        action: 'PAYMENT_APPROVED',
-        details: `Approved ${reqItem.method} TrxID: ${reqItem.transactionId} (৳${reqItem.amount}) for UID ${reqItem.userId}.`,
-        timestamp: activatedAt
-      });
+      tx.set('auditLogs', auditId, { ...auditRecord });
 
       return {
-        updatedPay: {
-          ...reqItem,
-          status: 'approved' as const,
-          verifiedAt: activatedAt,
-          verifiedBy: verifier,
-          subscriptionId: subId
-        },
-        newSubscription: createdSub
+        updatedPay: nextPayRecord,
+        newSubscription: createdSub,
+        auditEntry: auditRecord
       };
     });
+
+    await Promise.all([
+      upsertPaymentRequestD1(db, updatedPay, true, updatedPay.verifiedAt || nowIso),
+      upsertSubscriptionD1(db, newSubscription, true),
+      writeAuditLogD1(db, auditEntry, true)
+    ]);
 
     return {
       status: 200,
@@ -647,12 +796,16 @@ export async function handlePaymentsAndAdminRoutes(
         ? body.reason.trim().slice(0, 300)
         : 'Unverified Transaction ID or Amount Mismatch';
 
-    const updatedPay = await firestoreClient.runTransaction(async tx => {
-      const payDoc = await tx.get<Record<string, unknown>>('paymentRequests', id);
-      if (!payDoc) {
+    const ownerClient = firestoreClient.withToken(authUser.idToken);
+    const d1Pay = await getPaymentRequestD1(db, id);
+
+    const { updatedPay, auditEntry } = await ownerClient.runTransaction(async tx => {
+      const fsPayDoc = await tx.get<Record<string, unknown>>('paymentRequests', id);
+      const sourcePay = fsPayDoc || (d1Pay as unknown as Record<string, unknown> | null);
+      if (!sourcePay) {
         throw new WorkerHttpError(404, 'NOT_FOUND', 'Payment request not found.');
       }
-      const reqItem = payDoc as unknown as PaymentRequest;
+      const reqItem = sourcePay as unknown as PaymentRequest;
       if (reqItem.status === 'approved') {
         throw new WorkerHttpError(400, 'ALREADY_APPROVED', 'Approved payment request cannot be rejected.');
       }
@@ -661,29 +814,45 @@ export async function handlePaymentsAndAdminRoutes(
       }
 
       const auditId = makeAuditId(nowMs);
-      tx.update('paymentRequests', id, {
-        status: 'rejected',
-        rejectionReason,
-        verifiedAt: nowIso,
-        verifiedBy: verifier
-      });
-      tx.set('auditLogs', auditId, {
+      const auditRecord: AuditLog = {
         id: auditId,
         userId: authUser.uid,
         userName: verifier,
         action: 'PAYMENT_REJECTED',
         details: `Rejected ${reqItem.method} TrxID: ${reqItem.transactionId}. Reason: ${rejectionReason}`,
         timestamp: nowIso
-      });
+      };
 
-      return {
+      const nextPayRecord: PaymentRequest = {
         ...reqItem,
-        status: 'rejected' as const,
+        status: 'rejected',
         rejectionReason,
         verifiedAt: nowIso,
         verifiedBy: verifier
       };
+
+      if (fsPayDoc) {
+        tx.update('paymentRequests', id, {
+          status: 'rejected',
+          rejectionReason,
+          verifiedAt: nowIso,
+          verifiedBy: verifier
+        });
+      } else {
+        tx.set('paymentRequests', id, {
+          ...(nextPayRecord as unknown as Record<string, unknown>),
+          subscriptionId: null
+        });
+      }
+      tx.set('auditLogs', auditId, { ...auditRecord });
+
+      return { updatedPay: nextPayRecord, auditEntry: auditRecord };
     });
+
+    await Promise.all([
+      upsertPaymentRequestD1(db, updatedPay, true, nowIso),
+      writeAuditLogD1(db, auditEntry, true)
+    ]);
 
     return { status: 200, payload: { success: true, paymentRequest: updatedPay } };
   }
@@ -711,7 +880,8 @@ export async function handlePaymentsAndAdminRoutes(
       throw new WorkerHttpError(403, 'FORBIDDEN', 'Cannot access another user subscription.');
     }
 
-    const subStatus = await checkUserHasActiveSubscriptionRest(firestoreClient, requestedUserId, nowMs);
+    const userClient = firestoreClient.withToken(authUser.idToken);
+    const subStatus = await checkUserHasActiveSubscriptionKeyless(db, userClient, requestedUserId, nowMs);
     if (!subStatus.active || !subStatus.activeSubscription) {
       return {
         status: 200,
@@ -749,10 +919,25 @@ export async function handlePaymentsAndAdminRoutes(
     });
     assertOwnerAdmin(authUser, env);
 
-    const docs = await firestoreClient.listDocuments<Record<string, unknown>>('subscriptions', {
-      pageSize: 500,
-      maxPages: 10
-    });
+    const ownerClient = firestoreClient.withToken(authUser.idToken);
+    const [fsDocs, d1Docs] = await Promise.all([
+      ownerClient
+        .listDocuments<Record<string, unknown>>('subscriptions', {
+          pageSize: 500,
+          maxPages: 10
+        })
+        .catch(() => [] as Array<Record<string, unknown> & { id: string }>),
+      listSubscriptionsD1(db)
+    ]);
+
+    const subMap = new Map<string, Record<string, unknown> & { id: string }>();
+    for (const d of d1Docs) {
+      subMap.set(d.id, d as unknown as Record<string, unknown> & { id: string });
+    }
+    for (const d of fsDocs) {
+      subMap.set(d.id, d);
+    }
+    const docs = Array.from(subMap.values());
 
     const uniqueUids = Array.from(
       new Set(
@@ -763,7 +948,7 @@ export async function handlePaymentsAndAdminRoutes(
     );
     const userDocsMap =
       uniqueUids.length > 0
-        ? await firestoreClient
+        ? await ownerClient
             .batchGetDocuments<Record<string, unknown>>(
               uniqueUids.map(uid => ({ collection: 'users', docId: uid }))
             )
@@ -815,9 +1000,10 @@ export async function handlePaymentsAndAdminRoutes(
     });
     assertOwnerAdmin(authUser, env);
 
+    const ownerClient = firestoreClient.withToken(authUser.idToken);
     const [pkgDocs, configDoc] = await Promise.all([
-      firestoreClient.listDocuments<Record<string, unknown>>('packages', { pageSize: 50, maxPages: 2 }),
-      firestoreClient.getDocument<Record<string, unknown>>('config', 'examDate')
+      ownerClient.listDocuments<Record<string, unknown>>('packages', { pageSize: 50, maxPages: 2 }),
+      ownerClient.getDocument<Record<string, unknown>>('config', 'examDate')
     ]);
     const examDateConfig = configDoc
       ? { ...INITIAL_EXAM_DATE_CONFIG, ...configDoc }
@@ -842,7 +1028,8 @@ export async function handlePaymentsAndAdminRoutes(
       throw new WorkerHttpError(400, 'INVALID_PACKAGE_ID', 'Package id is required.');
     }
 
-    const pkgDoc = await firestoreClient.getDocument<Record<string, unknown>>('packages', id);
+    const ownerClient = firestoreClient.withToken(authUser.idToken);
+    const pkgDoc = await ownerClient.getDocument<Record<string, unknown>>('packages', id);
     if (!pkgDoc) {
       throw new WorkerHttpError(404, 'PACKAGE_NOT_FOUND', 'Package not found in Firestore.');
     }
@@ -904,7 +1091,8 @@ export async function handlePaymentsAndAdminRoutes(
       });
     }
 
-    await firestoreClient.commitWrites(writes);
+    await ownerClient.commitWrites(writes);
+    await writeAuditLogD1(db, auditEntry, true);
     return { status: 200, payload: { success: true, package: updatedPkg } };
   }
 
@@ -941,7 +1129,8 @@ export async function handlePaymentsAndAdminRoutes(
       }
     }
 
-    const configDoc = await firestoreClient.getDocument<Record<string, unknown>>('config', 'examDate');
+    const ownerClient = firestoreClient.withToken(authUser.idToken);
+    const configDoc = await ownerClient.getDocument<Record<string, unknown>>('config', 'examDate');
     const currentConfig: ExamDateConfig = {
       ...INITIAL_EXAM_DATE_CONFIG,
       ...(configDoc ? (configDoc as Partial<ExamDateConfig>) : {})
@@ -957,15 +1146,19 @@ export async function handlePaymentsAndAdminRoutes(
       lastUpdated: nowIso
     };
 
-    const pendingUpdates: Array<{ subId: string; userId: string }> = [];
+    const pendingUpdates: Array<{ subId: string; userId: string; raw?: UserSubscription }> = [];
     if (nextConfig.examDatePolicy === 'extend_all' && targetExamDate) {
-      const examPassSubs = await firestoreClient.runQuery<Record<string, unknown>>({
+      const examPassSubs = await ownerClient.runQuery<Record<string, unknown>>({
         collection: 'subscriptions',
         where: [{ field: 'packageId', op: 'EQUAL', value: 'pkg_exam_pass' }]
       });
       for (const s of examPassSubs) {
         if (s.status === 'active') {
-          pendingUpdates.push({ subId: s.id, userId: String(s.userId) });
+          pendingUpdates.push({
+            subId: s.id,
+            userId: String(s.userId),
+            raw: s as unknown as UserSubscription
+          });
         }
       }
     }
@@ -981,7 +1174,7 @@ export async function handlePaymentsAndAdminRoutes(
     ];
 
     if (examPassPrice !== undefined) {
-      const epDoc = await firestoreClient.getDocument<Record<string, unknown>>('packages', 'pkg_exam_pass');
+      const epDoc = await ownerClient.getDocument<Record<string, unknown>>('packages', 'pkg_exam_pass');
       if (epDoc) {
         writes.push({
           type: 'update',
@@ -993,7 +1186,8 @@ export async function handlePaymentsAndAdminRoutes(
     }
 
     if (targetExamDate) {
-      const nextTs = new FirestoreTimestampValue(new Date(targetExamDate).toISOString());
+      const nextIso = new Date(targetExamDate).toISOString();
+      const nextTs = new FirestoreTimestampValue(nextIso);
       for (const item of pendingUpdates) {
         writes.push({
           type: 'update',
@@ -1029,7 +1223,26 @@ export async function handlePaymentsAndAdminRoutes(
       data: { ...auditEntry }
     });
 
-    await commitWritesChunked(firestoreClient, writes);
+    await commitWritesChunked(ownerClient, writes);
+    await writeAuditLogD1(db, auditEntry, true);
+
+    if (targetExamDate && pendingUpdates.length > 0) {
+      const nextIso = new Date(targetExamDate).toISOString();
+      for (const item of pendingUpdates) {
+        if (item.raw) {
+          await upsertSubscriptionD1(
+            db,
+            {
+              ...item.raw,
+              expiresAt: nextIso,
+              targetExamDateSnapshot: targetExamDate
+            },
+            true
+          ).catch(() => undefined);
+        }
+      }
+    }
+
     return {
       status: 200,
       payload: {
@@ -1093,9 +1306,10 @@ export async function handlePaymentsAndAdminRoutes(
       }
     }
 
+    const ownerClient = firestoreClient.withToken(authUser.idToken);
     const [payDoc, supDoc] = await Promise.all([
-      firestoreClient.getDocument<Record<string, unknown>>('config', 'paymentSettings'),
-      firestoreClient.getDocument<Record<string, unknown>>('config', 'supportSettings')
+      ownerClient.getDocument<Record<string, unknown>>('config', 'paymentSettings'),
+      ownerClient.getDocument<Record<string, unknown>>('config', 'supportSettings')
     ]);
 
     const currentPay: PaymentSettings = {
@@ -1133,7 +1347,7 @@ export async function handlePaymentsAndAdminRoutes(
       timestamp: nowIso
     };
 
-    await firestoreClient.commitWrites([
+    await ownerClient.commitWrites([
       {
         type: 'set',
         collection: 'config',
@@ -1155,6 +1369,7 @@ export async function handlePaymentsAndAdminRoutes(
         data: { ...auditEntry }
       }
     ]);
+    await writeAuditLogD1(db, auditEntry, true);
 
     return {
       status: 200,
@@ -1190,9 +1405,10 @@ export async function handlePaymentsAndAdminRoutes(
       }
     }
 
+    const ownerClient = firestoreClient.withToken(authUser.idToken);
     const [supDoc, payDoc] = await Promise.all([
-      firestoreClient.getDocument<Record<string, unknown>>('config', 'supportSettings'),
-      firestoreClient.getDocument<Record<string, unknown>>('config', 'paymentSettings')
+      ownerClient.getDocument<Record<string, unknown>>('config', 'supportSettings'),
+      ownerClient.getDocument<Record<string, unknown>>('config', 'paymentSettings')
     ]);
 
     const currentSup: SupportContactSettings = {
@@ -1219,7 +1435,7 @@ export async function handlePaymentsAndAdminRoutes(
       timestamp: nowIso
     };
 
-    await firestoreClient.commitWrites([
+    await ownerClient.commitWrites([
       {
         type: 'set',
         collection: 'config',
@@ -1246,6 +1462,7 @@ export async function handlePaymentsAndAdminRoutes(
         data: { ...auditEntry }
       }
     ]);
+    await writeAuditLogD1(db, auditEntry, true);
 
     return { status: 200, payload: { success: true, supportSettings: nextSup } };
   }
@@ -1318,19 +1535,32 @@ export async function handlePaymentsAndAdminRoutes(
 
     const cleanPhone = typeof phone === 'string' ? phone.trim().slice(0, 20) : '';
     const cleanSubId = typeof subscriptionId === 'string' && subscriptionId.trim() ? subscriptionId.trim() : '';
+    const requestedPkgIdHint =
+      typeof packageId === 'string' && packageId.trim() ? packageId.trim() : '';
 
-    const [existingUserDoc, queriedUserSubs, explicitSubDoc] = await Promise.all([
-      firestoreClient.getDocument<Record<string, unknown>>('users', targetUid),
-      firestoreClient.runQuery<Record<string, unknown>>({
+    const ownerClient = firestoreClient.withToken(authUser.idToken);
+
+    const [existingUserDoc, queriedUserSubs, d1AllSubs, explicitSubDoc, firestorePkgHintDoc] = await Promise.all([
+      ownerClient.getDocument<Record<string, unknown>>('users', targetUid),
+      ownerClient.runQuery<Record<string, unknown>>({
         collection: 'subscriptions',
         where: [{ field: 'userId', op: 'EQUAL', value: targetUid }]
       }),
+      listSubscriptionsD1(db),
       cleanSubId
-        ? firestoreClient.getDocument<Record<string, unknown>>('subscriptions', cleanSubId)
+        ? ownerClient.getDocument<Record<string, unknown>>('subscriptions', cleanSubId)
+        : Promise.resolve(null),
+      requestedPkgIdHint
+        ? ownerClient.getDocument<Record<string, unknown>>('packages', requestedPkgIdHint).catch(() => null)
         : Promise.resolve(null)
     ]);
 
     const targetSubMap = new Map<string, Record<string, unknown> & { id: string }>();
+    for (const d1Sub of d1AllSubs) {
+      if (String(d1Sub.userId || '') === targetUid) {
+        targetSubMap.set(d1Sub.id, d1Sub as unknown as Record<string, unknown> & { id: string });
+      }
+    }
     for (const subDoc of queriedUserSubs) {
       if (String(subDoc.userId || '') === targetUid) {
         targetSubMap.set(subDoc.id, subDoc);
@@ -1414,10 +1644,29 @@ export async function handlePaymentsAndAdminRoutes(
       const resolvedSubDoc =
         (cleanSubId ? targetSubMap.get(cleanSubId) : undefined) || allUserSubDocs[0] || null;
       const targetSubId = cleanSubId || resolvedSubDoc?.id || `sub_admin_${targetUid}`;
-      const pkgMatch =
-        INITIAL_PACKAGES.find(
-          p => p.id === (packageId || resolvedSubDoc?.packageId)
-        ) || INITIAL_PACKAGES[0];
+      const effectivePkgId =
+        (typeof packageId === 'string' && packageId.trim()) ||
+        (resolvedSubDoc?.packageId as string | undefined) ||
+        INITIAL_PACKAGES[0].id;
+      const livePkgDoc =
+        firestorePkgHintDoc && (!requestedPkgIdHint || requestedPkgIdHint === effectivePkgId)
+          ? firestorePkgHintDoc
+          : await ownerClient.getDocument<Record<string, unknown>>('packages', effectivePkgId).catch(() => null);
+      const staticPkgFallback =
+        INITIAL_PACKAGES.find(p => p.id === effectivePkgId) || INITIAL_PACKAGES[0];
+      const pkgMatch = {
+        id: effectivePkgId,
+        nameBn: (typeof livePkgDoc?.nameBn === 'string' && livePkgDoc.nameBn) || staticPkgFallback.nameBn,
+        nameEn: (typeof livePkgDoc?.nameEn === 'string' && livePkgDoc.nameEn) || staticPkgFallback.nameEn,
+        price:
+          typeof livePkgDoc?.price === 'number' && Number.isFinite(livePkgDoc.price)
+            ? livePkgDoc.price
+            : staticPkgFallback.price,
+        validityType:
+          livePkgDoc?.validityType === 'exam_date' || livePkgDoc?.validityType === 'days'
+            ? livePkgDoc.validityType
+            : staticPkgFallback.validityType
+      };
       const effectiveExpiresIso =
         cleanExpiresIso ||
         timestampToIso(resolvedSubDoc?.expiresAt) ||
@@ -1547,7 +1796,21 @@ export async function handlePaymentsAndAdminRoutes(
       data: { ...auditEntry }
     });
 
-    await commitWritesChunked(firestoreClient, writes);
+    await commitWritesChunked(ownerClient, writes);
+    await writeAuditLogD1(db, auditEntry, true);
+
+    if (safeSubStatus === 'pro' && persistedSubscription) {
+      await upsertSubscriptionD1(db, persistedSubscription, true);
+    } else {
+      for (const updatedSub of updatedSubscriptions) {
+        await upsertSubscriptionD1(db, updatedSub, true);
+      }
+      await expireOrCancelUserSubscriptionsD1(
+        db,
+        targetUid,
+        safeSubStatus === 'expired' ? 'expired' : 'cancelled'
+      );
+    }
 
     if (isSessionRevoked) {
       // Authoritative Worker sessions live in D1 — revoke immediately so active student session is blocked
@@ -1601,7 +1864,8 @@ export async function handlePaymentsAndAdminRoutes(
       timestamp: nowIso
     };
 
-    await firestoreClient.commitWrites([
+    const ownerClient = firestoreClient.withToken(authUser.idToken);
+    await ownerClient.commitWrites([
       {
         type: 'set',
         collection: 'exams',
@@ -1621,6 +1885,9 @@ export async function handlePaymentsAndAdminRoutes(
       }
     ]);
 
+    await upsertExamCacheD1(db, normalized, nowIso);
+    await writeAuditLogD1(db, auditEntry, true);
+
     return { status: 200, payload: { success: true, exam: normalized } };
   }
 
@@ -1634,26 +1901,52 @@ export async function handlePaymentsAndAdminRoutes(
     });
     assertOwnerAdmin(authUser, env);
 
-    const [userDocs, payDocs, subDocs, resDocs] = await Promise.all([
-      firestoreClient.listDocuments<Record<string, unknown>>('users', { pageSize: 500, maxPages: 10 }),
-      firestoreClient.listDocuments<Record<string, unknown>>('paymentRequests', { pageSize: 500, maxPages: 10 }),
-      firestoreClient.listDocuments<Record<string, unknown>>('subscriptions', { pageSize: 500, maxPages: 10 }),
-      firestoreClient.listDocuments<Record<string, unknown>>('examResults', { pageSize: 500, maxPages: 10 })
+    const ownerClient = firestoreClient.withToken(authUser.idToken);
+    const [userDocs, fsPayDocs, fsSubDocs, fsResDocs, d1PayDocs, d1SubDocs, d1ResDocs] = await Promise.all([
+      ownerClient
+        .listDocuments<Record<string, unknown>>('users', { pageSize: 500, maxPages: 10 })
+        .catch(() => [] as Array<Record<string, unknown> & { id: string }>),
+      ownerClient
+        .listDocuments<Record<string, unknown>>('paymentRequests', { pageSize: 500, maxPages: 10 })
+        .catch(() => [] as Array<Record<string, unknown> & { id: string }>),
+      ownerClient
+        .listDocuments<Record<string, unknown>>('subscriptions', { pageSize: 500, maxPages: 10 })
+        .catch(() => [] as Array<Record<string, unknown> & { id: string }>),
+      ownerClient
+        .listDocuments<Record<string, unknown>>('examResults', { pageSize: 500, maxPages: 10 })
+        .catch(() => [] as Array<Record<string, unknown> & { id: string }>),
+      listPaymentRequestsD1(db),
+      listSubscriptionsD1(db),
+      listAllExamResultsD1(db)
     ]);
+
+    const mergedPayments = mergePaymentRecords(fsPayDocs, d1PayDocs) as unknown as PaymentRequest[];
+
+    const subMap = new Map<string, UserSubscription>();
+    for (const s of d1SubDocs) subMap.set(s.id, s);
+    for (const raw of fsSubDocs) {
+      subMap.set(raw.id, {
+        ...(raw as unknown as Omit<UserSubscription, 'id'>),
+        id: raw.id,
+        expiresAt: timestampToIso(raw.expiresAt) || new Date(0).toISOString()
+      });
+    }
+    const subs = Array.from(subMap.values());
+
+    const resMap = new Map<string, ExamResult>();
+    for (const r of fsResDocs) {
+      resMap.set(r.id, r as unknown as ExamResult);
+    }
+    for (const r of d1ResDocs) {
+      resMap.set(r.id, r);
+    }
+    const results = Array.from(resMap.values());
 
     const studentUserIds = new Set<string>();
     for (const u of userDocs) studentUserIds.add(u.id);
-    for (const p of payDocs) if (p.userId) studentUserIds.add(String(p.userId));
-    for (const s of subDocs) if (s.userId) studentUserIds.add(String(s.userId));
-    for (const r of resDocs) if (r.userId) studentUserIds.add(String(r.userId));
-
-    const payments = payDocs as unknown as PaymentRequest[];
-    const subs = subDocs.map(raw => ({
-      ...(raw as unknown as Omit<UserSubscription, 'id'>),
-      id: raw.id,
-      expiresAt: timestampToIso(raw.expiresAt) || new Date(0).toISOString()
-    }));
-    const results = resDocs as unknown as ExamResult[];
+    for (const p of mergedPayments) if (p.userId) studentUserIds.add(String(p.userId));
+    for (const s of subs) if (s.userId) studentUserIds.add(String(s.userId));
+    for (const r of results) if (r.userId) studentUserIds.add(String(r.userId));
 
     const activeSubscribers = subs.filter(
       s => s.status === 'active' && new Date(s.expiresAt).getTime() > nowMs
@@ -1662,10 +1955,10 @@ export async function handlePaymentsAndAdminRoutes(
       s => s.status === 'expired' || new Date(s.expiresAt).getTime() <= nowMs
     ).length;
 
-    const pendingPayments = payments.filter(p => p.status === 'pending').length;
-    const approvedPayments = payments.filter(p => p.status === 'approved').length;
-    const rejectedPayments = payments.filter(p => p.status === 'rejected').length;
-    const totalVerifiedRevenue = payments
+    const pendingPayments = mergedPayments.filter(p => p.status === 'pending').length;
+    const approvedPayments = mergedPayments.filter(p => p.status === 'approved').length;
+    const rejectedPayments = mergedPayments.filter(p => p.status === 'rejected').length;
+    const totalVerifiedRevenue = mergedPayments
       .filter(p => p.status === 'approved')
       .reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
 
@@ -1695,16 +1988,72 @@ export async function handlePaymentsAndAdminRoutes(
     });
     assertOwnerAdmin(authUser, env);
 
-    const logs = await firestoreClient.listDocuments<Record<string, unknown>>('auditLogs', {
-      pageSize: 500,
-      maxPages: 5
-    });
-    const sorted = logs
-      .map(d => d as unknown as AuditLog)
+    const ownerClient = firestoreClient.withToken(authUser.idToken);
+    const [fsLogs, d1Logs] = await Promise.all([
+      ownerClient
+        .listDocuments<Record<string, unknown>>('auditLogs', {
+          pageSize: 500,
+          maxPages: 5
+        })
+        .catch(() => [] as Array<Record<string, unknown> & { id: string }>),
+      listAuditLogsD1(db, 200)
+    ]);
+
+    const logMap = new Map<string, AuditLog>();
+    for (const d of fsLogs) {
+      logMap.set(d.id, d as unknown as AuditLog);
+    }
+    for (const d of d1Logs) {
+      logMap.set(d.id, d);
+    }
+
+    const sorted = Array.from(logMap.values())
       .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
       .slice(0, 200);
 
     return { status: 200, payload: { auditLogs: sorted } };
+  }
+
+  if (pathname === '/api/admin/sync-edge-cache' && method === 'POST') {
+    const authUser = await authenticateFirebaseRequest(ctx.request, {
+      projectId,
+      environment: env.ENVIRONMENT,
+      jwksFetcher: ctx.jwksFetcher,
+      tokenVerifier: ctx.tokenVerifier,
+      nowMs
+    });
+    assertOwnerAdmin(authUser, env);
+
+    const ownerClient = firestoreClient.withToken(authUser.idToken);
+    const [qSync, edgeSync, examDocs] = await Promise.all([
+      syncQuestionsAndKeysToD1(db, ownerClient, { nowMs }),
+      syncEdgeRecordsWithOwnerFirestore(db, ownerClient),
+      ownerClient
+        .listDocuments<Record<string, unknown>>('exams', { pageSize: 200, maxPages: 5 })
+        .catch(() => [] as Array<Record<string, unknown> & { id: string }>)
+    ]);
+
+    if (examDocs.length > 0) {
+      await upsertExamsBatchD1(
+        db,
+        examDocs.map(d => ({
+          ...(d as unknown as Omit<Exam, 'id'>),
+          id: d.id,
+          isActive: d.isActive !== undefined ? Boolean(d.isActive) : !d.isPaid || d.id === 'exam_model_test_01'
+        })),
+        nowIso
+      );
+    }
+
+    return {
+      status: 200,
+      payload: {
+        success: true,
+        ...qSync,
+        examsCount: examDocs.length,
+        ...edgeSync
+      }
+    };
   }
 
   if (

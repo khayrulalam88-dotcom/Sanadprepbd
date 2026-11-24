@@ -8,17 +8,6 @@ import {
   type AuditLog,
   type UserSubscription
 } from './types.ts';
-import { base64UrlEncodeBytes } from './firebaseAuth.ts';
-
-export const GOOGLE_OAUTH_TOKEN_URL = 'https://oauth2.googleapis.com/token';
-export const FIRESTORE_SCOPE = 'https://www.googleapis.com/auth/datastore';
-
-export interface ServiceAccountCredentials {
-  project_id: string;
-  client_email: string;
-  private_key: string;
-  token_uri?: string;
-}
 
 export function getSafeDiagnosticError(err: unknown): { code?: string | number; message: string } {
   const code = (err as { code?: number | string })?.code;
@@ -127,172 +116,6 @@ export function assertExpectedNamedDatabase(params?: {
     };
   }
   return { valid: true, projectId, databaseId };
-}
-
-export function parseServiceAccountJson(
-  rawJson?: string,
-  expectedProjectId: string = EXPECTED_FIREBASE_PROJECT_ID
-): ServiceAccountCredentials {
-  if (!rawJson || !rawJson.trim()) {
-    throw new WorkerHttpError(
-      503,
-      'FIRESTORE_UNAVAILABLE',
-      'FIREBASE_SERVICE_ACCOUNT_JSON secret is not configured.'
-    );
-  }
-  let parsed: Partial<ServiceAccountCredentials>;
-  try {
-    parsed = JSON.parse(rawJson) as Partial<ServiceAccountCredentials>;
-  } catch {
-    throw new WorkerHttpError(503, 'FIRESTORE_UNAVAILABLE', 'Invalid FIREBASE_SERVICE_ACCOUNT_JSON format.');
-  }
-  if (!parsed.client_email || !parsed.private_key) {
-    throw new WorkerHttpError(
-      503,
-      'FIRESTORE_UNAVAILABLE',
-      'FIREBASE_SERVICE_ACCOUNT_JSON missing client_email or private_key.'
-    );
-  }
-  const targetProjectId = (expectedProjectId || '').trim() || EXPECTED_FIREBASE_PROJECT_ID;
-  if (targetProjectId !== EXPECTED_FIREBASE_PROJECT_ID && !parsed.project_id) {
-    throw new WorkerHttpError(
-      503,
-      'FIREBASE_PROJECT_MISMATCH',
-      `Service account JSON must specify project_id "${targetProjectId}".`
-    );
-  }
-  if (parsed.project_id && parsed.project_id !== targetProjectId) {
-    throw new WorkerHttpError(
-      503,
-      'FIREBASE_PROJECT_MISMATCH',
-      `Service account project_id "${parsed.project_id}" does not match expected "${targetProjectId}".`
-    );
-  }
-  return {
-    project_id: parsed.project_id || targetProjectId,
-    client_email: parsed.client_email,
-    private_key: parsed.private_key.replace(/\\n/g, '\n'),
-    token_uri: parsed.token_uri || GOOGLE_OAUTH_TOKEN_URL
-  };
-}
-
-function pemPrivateKeyToArrayBuffer(pem: string): ArrayBuffer {
-  const cleaned = pem
-    .replace(/-----BEGIN PRIVATE KEY-----/g, '')
-    .replace(/-----END PRIVATE KEY-----/g, '')
-    .replace(/\s+/g, '');
-  if (!cleaned) {
-    throw new WorkerHttpError(503, 'FIRESTORE_UNAVAILABLE', 'Empty service account private key.');
-  }
-  const binary = atob(cleaned);
-  const buffer = new ArrayBuffer(binary.length);
-  const bytes = new Uint8Array(buffer);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return buffer;
-}
-
-interface CachedAccessToken {
-  accessToken: string;
-  expiresAtMs: number;
-}
-
-const accessTokenCache = new Map<string, CachedAccessToken>();
-const inFlightAccessTokens = new Map<string, Promise<string>>();
-
-export function clearServiceAccountTokenCacheForTests(): void {
-  accessTokenCache.clear();
-  inFlightAccessTokens.clear();
-}
-
-export async function getGoogleAccessToken(
-  creds: ServiceAccountCredentials,
-  options?: { fetchImpl?: typeof fetch; nowMs?: number }
-): Promise<string> {
-  const fetchFn = options?.fetchImpl || fetch;
-  const nowMs = options?.nowMs ?? Date.now();
-  const cacheKey = `${creds.client_email}:${creds.project_id}`;
-  const existing = accessTokenCache.get(cacheKey);
-  if (existing && nowMs < existing.expiresAtMs - 60_000) {
-    return existing.accessToken;
-  }
-
-  const inflight = inFlightAccessTokens.get(cacheKey);
-  if (inflight) {
-    return inflight;
-  }
-
-  const tokenPromise = (async () => {
-    const iatSec = Math.floor(nowMs / 1000);
-    const expSec = iatSec + 3600;
-    const tokenUri = creds.token_uri || GOOGLE_OAUTH_TOKEN_URL;
-
-    const header = { alg: 'RS256', typ: 'JWT' };
-    const payload = {
-      iss: creds.client_email,
-      sub: creds.client_email,
-      aud: tokenUri,
-      scope: FIRESTORE_SCOPE,
-      iat: iatSec,
-      exp: expSec
-    };
-
-    const encoder = new TextEncoder();
-    const headerSeg = base64UrlEncodeBytes(encoder.encode(JSON.stringify(header)));
-    const payloadSeg = base64UrlEncodeBytes(encoder.encode(JSON.stringify(payload)));
-    const signingInput = encoder.encode(`${headerSeg}.${payloadSeg}`);
-    const signingBuffer = signingInput.buffer.slice(
-      signingInput.byteOffset,
-      signingInput.byteOffset + signingInput.byteLength
-    ) as ArrayBuffer;
-
-    const keyBuffer = pemPrivateKeyToArrayBuffer(creds.private_key);
-    const privateKey = await crypto.subtle.importKey(
-      'pkcs8',
-      keyBuffer,
-      { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
-      false,
-      ['sign']
-    );
-
-    const signature = await crypto.subtle.sign({ name: 'RSASSA-PKCS1-v1_5' }, privateKey, signingBuffer);
-    const assertion = `${headerSeg}.${payloadSeg}.${base64UrlEncodeBytes(new Uint8Array(signature))}`;
-
-    const res = await fetchFn(tokenUri, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-        assertion
-      }).toString()
-    });
-
-    if (!res.ok) {
-      throw new WorkerHttpError(
-        503,
-        'FIRESTORE_AUTH_FAILED',
-        `Service account OAuth2 token exchange failed (HTTP ${res.status}).`
-      );
-    }
-
-    const tokenJson = (await res.json()) as { access_token?: string; expires_in?: number };
-    if (!tokenJson.access_token) {
-      throw new WorkerHttpError(503, 'FIRESTORE_AUTH_FAILED', 'OAuth2 response missing access_token.');
-    }
-
-    const expiresInSec = typeof tokenJson.expires_in === 'number' && tokenJson.expires_in > 0 ? tokenJson.expires_in : 3600;
-    accessTokenCache.set(cacheKey, {
-      accessToken: tokenJson.access_token,
-      expiresAtMs: nowMs + expiresInSec * 1000
-    });
-    return tokenJson.access_token;
-  })().finally(() => {
-    inFlightAccessTokens.delete(cacheKey);
-  });
-
-  inFlightAccessTokens.set(cacheKey, tokenPromise);
-  return tokenPromise;
 }
 
 // ---------------------------------------------------------
@@ -452,22 +275,29 @@ export interface StructuredQueryWhere {
   value: unknown;
 }
 
+/**
+ * Keyless Firestore REST v1 client.
+ * Uses either anonymous public access (for `allow read: if true` collections/config)
+ * or the caller's verified Firebase ID token via `.withToken(idToken)` so Firestore
+ * Security Rules evaluate `request.auth` directly without any service-account private key.
+ */
 export class FirestoreRestClient {
   readonly projectId: string;
   readonly databaseId: string;
   readonly databaseRoot: string;
   readonly documentsRoot: string;
   readonly baseUrl: string;
-  private readonly credentials: ServiceAccountCredentials;
+  readonly hasBearerToken: boolean;
+  private readonly environment?: string;
+  private readonly bearerToken?: string;
   private readonly fetchImpl: typeof fetch;
   private readonly nowMsFn: () => number;
 
   constructor(options: {
-    serviceAccountJson?: string;
-    credentials?: ServiceAccountCredentials;
     projectId?: string;
     databaseId?: string;
     environment?: string;
+    bearerToken?: string;
     fetchImpl?: typeof fetch;
     nowMsFn?: () => number;
   }) {
@@ -482,21 +312,28 @@ export class FirestoreRestClient {
 
     this.projectId = dbCheck.projectId;
     this.databaseId = dbCheck.databaseId;
-    this.credentials =
-      options.credentials || parseServiceAccountJson(options.serviceAccountJson, this.projectId);
-    if (this.credentials.project_id !== this.projectId) {
-      throw new WorkerHttpError(
-        503,
-        'FIREBASE_PROJECT_MISMATCH',
-        `Service account project "${this.credentials.project_id}" does not match "${this.projectId}".`
-      );
-    }
-
+    this.environment = options.environment;
+    this.bearerToken = options.bearerToken?.trim() || undefined;
+    this.hasBearerToken = Boolean(this.bearerToken);
     this.databaseRoot = `projects/${this.projectId}/databases/${this.databaseId}`;
     this.documentsRoot = `${this.databaseRoot}/documents`;
     this.baseUrl = `https://firestore.googleapis.com/v1/${this.documentsRoot}`;
     this.fetchImpl = options.fetchImpl || fetch;
     this.nowMsFn = options.nowMsFn || (() => Date.now());
+  }
+
+  /**
+   * Returns a shallow copy scoped to a verified caller's Firebase ID token (or public if omitted).
+   */
+  withToken(bearerToken?: string): FirestoreRestClient {
+    return new FirestoreRestClient({
+      projectId: this.projectId,
+      databaseId: this.databaseId,
+      environment: this.environment,
+      bearerToken,
+      fetchImpl: this.fetchImpl,
+      nowMsFn: this.nowMsFn
+    });
   }
 
   documentResourceName(collectionPath: string, docId: string): string {
@@ -510,13 +347,15 @@ export class FirestoreRestClient {
     return `${this.baseUrl}/${cleanCollection}/${encodeURIComponent(docId)}`;
   }
 
+  private applyAuthHeader(headers: Headers): void {
+    if (this.bearerToken) {
+      headers.set('Authorization', `Bearer ${this.bearerToken}`);
+    }
+  }
+
   private async requestJson<T>(url: string, init: RequestInit): Promise<{ status: number; data: T }> {
-    const token = await getGoogleAccessToken(this.credentials, {
-      fetchImpl: this.fetchImpl,
-      nowMs: this.nowMsFn()
-    });
     const headers = new Headers(init.headers);
-    headers.set('Authorization', `Bearer ${token}`);
+    this.applyAuthHeader(headers);
     if (init.body && !headers.has('Content-Type')) {
       headers.set('Content-Type', 'application/json');
     }
@@ -545,6 +384,9 @@ export class FirestoreRestClient {
       if (res.status === 404) {
         throw new WorkerHttpError(404, 'NOT_FOUND', message);
       }
+      if (res.status === 403 || statusText === 'PERMISSION_DENIED') {
+        throw new WorkerHttpError(403, 'PERMISSION_DENIED', message);
+      }
       throw new WorkerHttpError(res.status >= 500 ? 503 : res.status, statusText, message);
     }
 
@@ -557,19 +399,20 @@ export class FirestoreRestClient {
     options?: { transactionId?: string }
   ): Promise<(T & { id: string }) | null> {
     const qs = options?.transactionId ? `?transaction=${encodeURIComponent(options.transactionId)}` : '';
-    const token = await getGoogleAccessToken(this.credentials, {
-      fetchImpl: this.fetchImpl,
-      nowMs: this.nowMsFn()
-    });
+    const headers = new Headers();
+    this.applyAuthHeader(headers);
     const res = await this.fetchImpl(`${this.documentUrl(collectionPath, docId)}${qs}`, {
       method: 'GET',
-      headers: { Authorization: `Bearer ${token}` }
+      headers
     });
     if (res.status === 404) {
       return null;
     }
     if (!res.ok) {
       const text = await res.text();
+      if (res.status === 403) {
+        throw new WorkerHttpError(403, 'PERMISSION_DENIED', text.slice(0, 200) || 'Firestore GET permission denied.');
+      }
       throw new WorkerHttpError(
         res.status >= 500 ? 503 : res.status,
         `FIRESTORE_GET_${res.status}`,
@@ -592,10 +435,8 @@ export class FirestoreRestClient {
 
     for (let i = 0; i < refs.length; i += 100) {
       const chunk = refs.slice(i, i + 100);
-      const token = await getGoogleAccessToken(this.credentials, {
-        fetchImpl: this.fetchImpl,
-        nowMs: this.nowMsFn()
-      });
+      const headers = new Headers({ 'Content-Type': 'application/json' });
+      this.applyAuthHeader(headers);
       const body: Record<string, unknown> = {
         documents: chunk.map(r => this.documentResourceName(r.collection, r.docId))
       };
@@ -604,13 +445,13 @@ export class FirestoreRestClient {
       }
       const res = await this.fetchImpl(`${this.baseUrl}:batchGet`, {
         method: 'POST',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json'
-        },
+        headers,
         body: JSON.stringify(body)
       });
       if (!res.ok) {
+        if (res.status === 403) {
+          throw new WorkerHttpError(403, 'PERMISSION_DENIED', 'Firestore batchGet permission denied.');
+        }
         throw new WorkerHttpError(503, 'FIRESTORE_BATCH_GET_FAILED', `Firestore batchGet failed (${res.status})`);
       }
       const items = (await res.json()) as Array<{ found?: FirestoreRestDocument; missing?: string }>;
@@ -943,14 +784,30 @@ export async function checkUserHasActiveSubscriptionRest(
   client: FirestoreRestClient,
   uid: string,
   nowMs: number = Date.now()
-): Promise<{ active: boolean; activeSubscription: UserSubscription | null; reason?: string }> {
+): Promise<{
+  active: boolean;
+  activeSubscription: UserSubscription | null;
+  reason?: string;
+  firestoreReachable?: boolean;
+}> {
+  let userErr: unknown = null;
+  let subErr: unknown = null;
   const [userDoc, subDocs] = await Promise.all([
-    client.getDocument<Record<string, unknown>>('users', uid),
-    client.runQuery<Record<string, unknown>>({
-      collection: 'subscriptions',
-      where: [{ field: 'userId', op: 'EQUAL', value: uid }]
-    })
+    client.getDocument<Record<string, unknown>>('users', uid).catch(err => {
+      userErr = err;
+      return null;
+    }),
+    client
+      .runQuery<Record<string, unknown>>({
+        collection: 'subscriptions',
+        where: [{ field: 'userId', op: 'EQUAL', value: uid }]
+      })
+      .catch(err => {
+        subErr = err;
+        return [] as Array<Record<string, unknown> & { id: string }>;
+      })
   ]);
+  const firestoreReachable = !userErr && !subErr;
 
   let matchedSub: UserSubscription | null = null;
   for (const raw of subDocs) {
@@ -968,17 +825,22 @@ export async function checkUserHasActiveSubscriptionRest(
   }
 
   if (matchedSub) {
-    return { active: true, activeSubscription: matchedSub };
+    return { active: true, activeSubscription: matchedSub, firestoreReachable };
   }
 
   if (userDoc) {
     const expiryIso = timestampToIso(userDoc.subscriptionExpiresAt);
     if (userDoc.subscriptionStatus === 'pro' && expiryIso && new Date(expiryIso).getTime() > nowMs) {
-      return { active: true, activeSubscription: null };
+      return { active: true, activeSubscription: null, firestoreReachable };
     }
   }
 
-  return { active: false, activeSubscription: null, reason: 'NO_ACTIVE_SUBSCRIPTION' };
+  return {
+    active: false,
+    activeSubscription: null,
+    reason: firestoreReachable ? 'NO_ACTIVE_SUBSCRIPTION' : 'FIRESTORE_UNAVAILABLE',
+    firestoreReachable
+  };
 }
 
 export async function writeAuditLogRest(client: FirestoreRestClient, entry: AuditLog): Promise<void> {

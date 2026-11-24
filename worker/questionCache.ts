@@ -1,9 +1,10 @@
-import type {
-  D1Database,
-  D1PreparedStatement,
-  QuestionKeyRecord,
-  SanitizedQuestion,
-  ServerQuestion
+import {
+  WorkerHttpError,
+  type D1Database,
+  type D1PreparedStatement,
+  type QuestionKeyRecord,
+  type SanitizedQuestion,
+  type ServerQuestion
 } from './types.ts';
 import type { FirestoreRestClient } from './firestoreRest.ts';
 
@@ -146,14 +147,20 @@ function firestoreDocToSanitizedQuestion(raw: Record<string, unknown> & { id: st
   };
 }
 
+function isFirestoreForbiddenError(err: unknown): boolean {
+  return err instanceof WorkerHttpError && (err.status === 403 || err.code === 'PERMISSION_DENIED');
+}
+
 export async function getRemoteQuestionBankVersion(
   firestoreClient: FirestoreRestClient
 ): Promise<{ version: number; versionToken: string; updatedAt?: string }> {
-  const versionDoc = await firestoreClient.getDocument<{
-    versionToken?: string;
-    version?: number;
-    updatedAt?: string;
-  }>('config', META_ROW_ID);
+  const versionDoc = await firestoreClient
+    .getDocument<{
+      versionToken?: string;
+      version?: number;
+      updatedAt?: string;
+    }>('config', META_ROW_ID)
+    .catch(() => null);
 
   const versionToken = versionDoc?.versionToken
     ? String(versionDoc.versionToken)
@@ -168,6 +175,13 @@ export async function getRemoteQuestionBankVersion(
   };
 }
 
+export async function getD1QuestionBankMeta(db: D1Database): Promise<MetaRow | null> {
+  return db
+    .prepare(`SELECT id, version, version_token, synced_at, question_count FROM question_bank_meta WHERE id = ?1`)
+    .bind(META_ROW_ID)
+    .first<MetaRow>();
+}
+
 /**
  * Checks whether the D1 question_bank_cache matches Firestore's authoritative config/questionBankVersion.
  * Does NOT fetch keys into student cache paths.
@@ -180,10 +194,7 @@ export async function checkD1QuestionCacheFreshness(
   const ttlMs = options?.ttlMs ?? DEFAULT_QUESTION_BANK_CACHE_TTL_MS;
   const nowMs = options?.nowMs ?? Date.now();
 
-  const localMeta = await db
-    .prepare(`SELECT id, version, version_token, synced_at, question_count FROM question_bank_meta WHERE id = ?1`)
-    .bind(META_ROW_ID)
-    .first<MetaRow>();
+  const localMeta = await getD1QuestionBankMeta(db);
 
   if (localMeta && ttlMs > 0) {
     const syncedAtMs = new Date(localMeta.synced_at).getTime();
@@ -192,7 +203,7 @@ export async function checkD1QuestionCacheFreshness(
     }
   }
 
-  // Single Firestore document read to check authoritative version
+  // Single public Firestore document read to check authoritative version
   const remote = await getRemoteQuestionBankVersion(firestoreClient);
 
   if (localMeta && localMeta.version_token === remote.versionToken && localMeta.question_count > 0) {
@@ -208,21 +219,240 @@ export async function checkD1QuestionCacheFreshness(
 
 export async function invalidateLocalD1QuestionCache(db: D1Database): Promise<void> {
   await db.batch([
-    db.prepare(`UPDATE question_bank_meta SET synced_at = '1970-01-01T00:00:00.000Z', version_token = '__invalidated__' WHERE id = ?1`).bind(META_ROW_ID)
+    db
+      .prepare(
+        `UPDATE question_bank_meta
+         SET synced_at = '1970-01-01T00:00:00.000Z',
+             version_token = '__invalidated__'
+         WHERE id = ?1`
+      )
+      .bind(META_ROW_ID)
   ]);
 }
 
-const inFlightSanitizedSync = new WeakMap<D1Database, Promise<{ synced: boolean; versionToken: string; count: number }>>();
+async function writeSanitizedQuestionsBatchD1(
+  db: D1Database,
+  sanitizedList: SanitizedQuestion[],
+  versionToken: string,
+  syncedIso: string
+): Promise<void> {
+  const rowsPerStmt = 5;
+  const stmtsPerBatch = 40;
+  const allStmts: D1PreparedStatement[] = [];
+
+  for (let i = 0; i < sanitizedList.length; i += rowsPerStmt) {
+    const chunk = sanitizedList.slice(i, i + rowsPerStmt);
+    const placeholders = chunk
+      .map((_, idx) => {
+        const b = idx * 14;
+        return `(?${b + 1}, ?${b + 2}, ?${b + 3}, ?${b + 4}, ?${b + 5}, ?${b + 6}, ?${b + 7}, ?${b + 8}, ?${b + 9}, ?${b + 10}, ?${b + 11}, ?${b + 12}, ?${b + 13}, ?${b + 14})`;
+      })
+      .join(', ');
+    const values: unknown[] = [];
+    for (const q of chunk) {
+      values.push(
+        q.id,
+        q.subjectId,
+        q.topicId || null,
+        q.questionBn,
+        q.questionEn || '',
+        JSON.stringify(q.optionsBn || []),
+        JSON.stringify(q.optionsEn || []),
+        q.legalReference || '',
+        q.difficulty,
+        q.status,
+        q.isDemoSample ? 1 : 0,
+        q.createdAt || syncedIso,
+        q.updatedAt || syncedIso,
+        versionToken
+      );
+    }
+
+    allStmts.push(
+      db
+        .prepare(
+          `INSERT INTO question_bank_cache (
+             id, subject_id, topic_id, question_bn, question_en,
+             options_bn_json, options_en_json, legal_reference,
+             difficulty, status, is_demo_sample, created_at, updated_at, synced_version
+           ) VALUES ${placeholders}
+           ON CONFLICT(id) DO UPDATE SET
+             subject_id = excluded.subject_id,
+             topic_id = excluded.topic_id,
+             question_bn = excluded.question_bn,
+             question_en = excluded.question_en,
+             options_bn_json = excluded.options_bn_json,
+             options_en_json = excluded.options_en_json,
+             legal_reference = excluded.legal_reference,
+             difficulty = excluded.difficulty,
+             status = excluded.status,
+             is_demo_sample = excluded.is_demo_sample,
+             updated_at = excluded.updated_at,
+             synced_version = excluded.synced_version`
+        )
+        .bind(...values)
+    );
+  }
+
+  for (let j = 0; j < allStmts.length; j += stmtsPerBatch) {
+    await db.batch(allStmts.slice(j, j + stmtsPerBatch));
+  }
+}
+
+async function writeQuestionKeysBatchD1(
+  db: D1Database,
+  keys: QuestionKeyRecord[],
+  versionToken: string
+): Promise<void> {
+  if (keys.length === 0) return;
+  const rowsPerStmt = 10;
+  const stmtsPerBatch = 40;
+  const allStmts: D1PreparedStatement[] = [];
+
+  for (let i = 0; i < keys.length; i += rowsPerStmt) {
+    const chunk = keys.slice(i, i + rowsPerStmt);
+    const placeholders = chunk
+      .map((_, idx) => {
+        const b = idx * 7;
+        return `(?${b + 1}, ?${b + 2}, ?${b + 3}, ?${b + 4}, ?${b + 5}, ?${b + 6}, ?${b + 7})`;
+      })
+      .join(', ');
+    const values: unknown[] = [];
+    for (const k of chunk) {
+      values.push(
+        k.id,
+        k.correctOptionIndex,
+        k.explanationBn || '',
+        k.explanationEn || '',
+        k.legalReference || '',
+        k.updatedAt || '',
+        versionToken
+      );
+    }
+
+    allStmts.push(
+      db
+        .prepare(
+          `INSERT INTO question_keys_cache (
+             question_id, correct_option_index, explanation_bn, explanation_en,
+             legal_reference, updated_at, synced_version
+           ) VALUES ${placeholders}
+           ON CONFLICT(question_id) DO UPDATE SET
+             correct_option_index = excluded.correct_option_index,
+             explanation_bn = excluded.explanation_bn,
+             explanation_en = excluded.explanation_en,
+             legal_reference = excluded.legal_reference,
+             updated_at = excluded.updated_at,
+             synced_version = excluded.synced_version`
+        )
+        .bind(...values)
+    );
+  }
+
+  for (let j = 0; j < allStmts.length; j += stmtsPerBatch) {
+    await db.batch(allStmts.slice(j, j + stmtsPerBatch));
+  }
+}
+
+const inFlightSanitizedSync = new WeakMap<
+  D1Database,
+  Promise<{ synced: boolean; versionToken: string; count: number }>
+>();
 
 /**
- * Ensures D1 question_bank_cache holds the latest sanitized questions from authoritative Firestore /questions.
- * NEVER reads or writes /questionKeys in this function!
+ * Owner-only full sync of BOTH sanitized questions AND answer keys from Firestore into D1
+ * using the Owner Admin's verified Firebase ID token.
+ */
+export async function syncQuestionsAndKeysToD1(
+  db: D1Database,
+  ownerClient: FirestoreRestClient,
+  options?: { nowMs?: number }
+): Promise<{ versionToken: string; questionCount: number; keyCount: number }> {
+  const nowMs = options?.nowMs ?? Date.now();
+  const syncedIso = new Date(nowMs).toISOString();
+
+  const [remote, questionDocs, keyDocs] = await Promise.all([
+    getRemoteQuestionBankVersion(ownerClient),
+    ownerClient.listDocuments<Record<string, unknown>>('questions', { pageSize: 500, maxPages: 20 }),
+    ownerClient.listDocuments<Record<string, unknown>>('questionKeys', { pageSize: 500, maxPages: 20 })
+  ]);
+
+  const sanitizedList = questionDocs.map(d => sanitizeQuestion(firestoreDocToSanitizedQuestion(d)));
+  const keyMap = new Map<string, Record<string, unknown>>();
+  for (const k of keyDocs) {
+    keyMap.set(k.id, k);
+  }
+
+  const keyRecords: QuestionKeyRecord[] = questionDocs.map(d => {
+    const k = keyMap.get(d.id);
+    return {
+      id: d.id,
+      correctOptionIndex: Number(k?.correctOptionIndex ?? d.correctOptionIndex ?? 0),
+      explanationBn: String(k?.explanationBn ?? d.explanationBn ?? ''),
+      explanationEn: String(k?.explanationEn ?? d.explanationEn ?? ''),
+      legalReference: String(k?.legalReference ?? d.legalReference ?? ''),
+      updatedAt: String(k?.updatedAt ?? d.updatedAt ?? syncedIso)
+    };
+  });
+
+  for (const k of keyDocs) {
+    if (!questionDocs.some(q => q.id === k.id)) {
+      keyRecords.push({
+        id: k.id,
+        correctOptionIndex: Number(k.correctOptionIndex ?? 0),
+        explanationBn: String(k.explanationBn ?? ''),
+        explanationEn: String(k.explanationEn ?? ''),
+        legalReference: String(k.legalReference ?? ''),
+        updatedAt: String(k.updatedAt ?? syncedIso)
+      });
+    }
+  }
+
+  await db.batch([
+    db.prepare(`DELETE FROM question_bank_cache`),
+    db.prepare(`DELETE FROM question_keys_cache`)
+  ]);
+
+  await writeSanitizedQuestionsBatchD1(db, sanitizedList, remote.versionToken, syncedIso);
+  await writeQuestionKeysBatchD1(db, keyRecords, remote.versionToken);
+
+  await db
+    .prepare(
+      `INSERT INTO question_bank_meta (id, version, version_token, synced_at, question_count)
+       VALUES (?1, ?2, ?3, ?4, ?5)
+       ON CONFLICT(id) DO UPDATE SET
+         version = excluded.version,
+         version_token = excluded.version_token,
+         synced_at = excluded.synced_at,
+         question_count = excluded.question_count`
+    )
+    .bind(META_ROW_ID, remote.version, remote.versionToken, syncedIso, sanitizedList.length)
+    .run();
+
+  return {
+    versionToken: remote.versionToken,
+    questionCount: sanitizedList.length,
+    keyCount: keyRecords.length
+  };
+}
+
+/**
+ * Ensures D1 question_bank_cache holds the latest sanitized questions.
+ * In keyless production mode, Firestore `/questions` restricts reads to `isOwnerAccount()`,
+ * so non-owner calls safely serve the D1 edge cache if Firestore returns 403 PERMISSION_DENIED.
+ * NEVER reads or writes `/questionKeys` in this function!
  */
 export async function ensureSanitizedQuestionsSyncedD1(
   db: D1Database,
   firestoreClient: FirestoreRestClient,
-  options?: { ttlMs?: number; nowMs?: number; bypassCache?: boolean }
-): Promise<{ versionToken: string; fromCache: boolean }> {
+  options?: {
+    ttlMs?: number;
+    nowMs?: number;
+    bypassCache?: boolean;
+    isOwner?: boolean;
+    allowEmptyOnForbidden?: boolean;
+  }
+): Promise<{ versionToken: string; fromCache: boolean; staleFallback?: boolean }> {
   const nowMs = options?.nowMs ?? Date.now();
   const ttlMs = options?.ttlMs ?? DEFAULT_QUESTION_BANK_CACHE_TTL_MS;
 
@@ -241,82 +471,43 @@ export async function ensureSanitizedQuestionsSyncedD1(
 
   const syncPromise = (async () => {
     const remote = await getRemoteQuestionBankVersion(firestoreClient);
-    const docs = await firestoreClient.listDocuments<Record<string, unknown>>('questions', {
-      pageSize: 500,
-      maxPages: 20
-    });
+
+    let docs: Array<Record<string, unknown> & { id: string }>;
+    try {
+      docs = await firestoreClient.listDocuments<Record<string, unknown>>('questions', {
+        pageSize: 500,
+        maxPages: 20
+      });
+    } catch (err) {
+      if (isFirestoreForbiddenError(err)) {
+        const countRow = await db
+          .prepare(`SELECT COUNT(*) AS cnt FROM question_bank_cache`)
+          .first<{ cnt: number }>();
+        const existingCount = Number(countRow?.cnt ?? 0);
+        if (existingCount > 0 || options?.allowEmptyOnForbidden) {
+          return {
+            synced: false,
+            versionToken: remote.versionToken,
+            count: existingCount
+          };
+        }
+        throw new WorkerHttpError(
+          503,
+          'QUESTION_CACHE_WARMING_REQUIRED',
+          'প্রশ্নভাণ্ডার এজ ক্যাশ এখনো প্রস্তুত নয়। অনুগ্রহ করে অ্যাডমিন লগইন করে প্রশ্ন সিঙ্ক করুন।'
+        );
+      }
+      throw err;
+    }
 
     const sanitizedList = docs.map(d => sanitizeQuestion(firestoreDocToSanitizedQuestion(d)));
     const syncedIso = new Date(nowMs).toISOString();
 
-    // Clear outdated sanitized questions + any stale keys if version changed so keys revalidate cleanly too
-    await db.batch([
-      db.prepare(`DELETE FROM question_bank_cache`),
-      db.prepare(`DELETE FROM question_keys_cache`)
-    ]);
+    // Only refresh sanitized questions here; preserve edge question_keys_cache
+    // so sanitized question refreshes never wipe authoritative grading keys.
+    await db.prepare(`DELETE FROM question_bank_cache`).run();
 
-    // Multi-row insert keeping <= 70 bound params per SQL statement (5 rows * 14 cols = 70 < D1 100 param limit)
-    const rowsPerStmt = 5;
-    const stmtsPerBatch = 40;
-    const allStmts: D1PreparedStatement[] = [];
-
-    for (let i = 0; i < sanitizedList.length; i += rowsPerStmt) {
-      const chunk = sanitizedList.slice(i, i + rowsPerStmt);
-      const placeholders = chunk
-        .map((_, idx) => {
-          const b = idx * 14;
-          return `(?${b + 1}, ?${b + 2}, ?${b + 3}, ?${b + 4}, ?${b + 5}, ?${b + 6}, ?${b + 7}, ?${b + 8}, ?${b + 9}, ?${b + 10}, ?${b + 11}, ?${b + 12}, ?${b + 13}, ?${b + 14})`;
-        })
-        .join(', ');
-      const values: unknown[] = [];
-      for (const q of chunk) {
-        values.push(
-          q.id,
-          q.subjectId,
-          q.topicId || null,
-          q.questionBn,
-          q.questionEn || '',
-          JSON.stringify(q.optionsBn || []),
-          JSON.stringify(q.optionsEn || []),
-          q.legalReference || '',
-          q.difficulty,
-          q.status,
-          q.isDemoSample ? 1 : 0,
-          q.createdAt || syncedIso,
-          q.updatedAt || syncedIso,
-          remote.versionToken
-        );
-      }
-
-      allStmts.push(
-        db
-          .prepare(
-            `INSERT INTO question_bank_cache (
-               id, subject_id, topic_id, question_bn, question_en,
-               options_bn_json, options_en_json, legal_reference,
-               difficulty, status, is_demo_sample, created_at, updated_at, synced_version
-             ) VALUES ${placeholders}
-             ON CONFLICT(id) DO UPDATE SET
-               subject_id = excluded.subject_id,
-               topic_id = excluded.topic_id,
-               question_bn = excluded.question_bn,
-               question_en = excluded.question_en,
-               options_bn_json = excluded.options_bn_json,
-               options_en_json = excluded.options_en_json,
-               legal_reference = excluded.legal_reference,
-               difficulty = excluded.difficulty,
-               status = excluded.status,
-               is_demo_sample = excluded.is_demo_sample,
-               updated_at = excluded.updated_at,
-               synced_version = excluded.synced_version`
-          )
-          .bind(...values)
-      );
-    }
-
-    for (let j = 0; j < allStmts.length; j += stmtsPerBatch) {
-      await db.batch(allStmts.slice(j, j + stmtsPerBatch));
-    }
+    await writeSanitizedQuestionsBatchD1(db, sanitizedList, remote.versionToken, syncedIso);
 
     await db
       .prepare(
@@ -338,7 +529,11 @@ export async function ensureSanitizedQuestionsSyncedD1(
 
   inFlightSanitizedSync.set(db, syncPromise);
   const done = await syncPromise;
-  return { versionToken: done.versionToken, fromCache: false };
+  return {
+    versionToken: done.versionToken,
+    fromCache: !done.synced,
+    ...(done.synced ? {} : { staleFallback: true })
+  };
 }
 
 export interface SanitizedQuestionFilter {
@@ -431,15 +626,38 @@ export async function querySanitizedQuestionsFromD1(
   };
 }
 
-/**
- * Legacy/simple reader helper (sanitized only, never touches question_keys_cache).
- */
 export async function readSanitizedQuestionsFromD1(
   db: D1Database,
   options?: { subjectId?: string }
 ): Promise<SanitizedQuestion[]> {
   const { questions } = await querySanitizedQuestionsFromD1(db, { subjectId: options?.subjectId });
   return questions;
+}
+
+export async function querySanitizedQuestionsByIdsFromD1(
+  db: D1Database,
+  questionIds: string[]
+): Promise<Map<string, SanitizedQuestion>> {
+  const out = new Map<string, SanitizedQuestion>();
+  const uniqueIds = Array.from(new Set(questionIds.map(id => String(id).trim()).filter(Boolean)));
+  for (let i = 0; i < uniqueIds.length; i += 90) {
+    const chunk = uniqueIds.slice(i, i + 90);
+    const placeholders = chunk.map((_, idx) => `?${idx + 1}`).join(', ');
+    const res = await db
+      .prepare(
+        `SELECT id, subject_id, topic_id, question_bn, question_en,
+                options_bn_json, options_en_json, legal_reference,
+                difficulty, status, is_demo_sample, created_at, updated_at
+         FROM question_bank_cache
+         WHERE id IN (${placeholders})`
+      )
+      .bind(...chunk)
+      .all<QuestionCacheRow>();
+    for (const row of res.results) {
+      out.set(row.id, rowToSanitizedQuestion(row));
+    }
+  }
+  return out;
 }
 
 export async function getSubjectQuestionCountsFromD1(
@@ -466,7 +684,7 @@ export async function getSubjectQuestionCountsFromD1(
 }
 
 /**
- * Looks up a single sanitized question (for practice subscription gating) from D1 or authoritative Firestore.
+ * Looks up a single sanitized question (for practice subscription gating) from D1 or Firestore if permitted.
  */
 export async function getSanitizedQuestionMeta(
   db: D1Database,
@@ -486,20 +704,27 @@ export async function getSanitizedQuestionMeta(
     return rowToSanitizedQuestion(row);
   }
 
-  const remoteDoc = await firestoreClient.getDocument<Record<string, unknown>>('questions', questionId);
-  if (!remoteDoc) return null;
-  return sanitizeQuestion(firestoreDocToSanitizedQuestion(remoteDoc));
+  try {
+    const remoteDoc = await firestoreClient.getDocument<Record<string, unknown>>('questions', questionId);
+    if (!remoteDoc) return null;
+    return sanitizeQuestion(firestoreDocToSanitizedQuestion(remoteDoc));
+  } catch (err) {
+    if (isFirestoreForbiddenError(err)) {
+      return null;
+    }
+    throw err;
+  }
 }
 
 /**
  * Server-internal helper for scoring, practice verification, and Owner Admin CRUD ONLY.
- * Revalidates cache version against Firestore so stale keys are never served after remote admin edits.
+ * Reads from D1 `question_keys_cache` and falls back to Firestore `questionKeys` when permitted.
  */
 export async function getAuthoritativeQuestionKeys(
   db: D1Database,
   firestoreClient: FirestoreRestClient,
   questionIds: string[],
-  options?: { ttlMs?: number; nowMs?: number }
+  options?: { ttlMs?: number; nowMs?: number; allowRemoteFetch?: boolean }
 ): Promise<Map<string, QuestionKeyRecord>> {
   const out = new Map<string, QuestionKeyRecord>();
   const uniqueIds = Array.from(new Set(questionIds.map(id => String(id).trim()).filter(Boolean)));
@@ -510,7 +735,8 @@ export async function getAuthoritativeQuestionKeys(
     nowMs: options?.nowMs
   });
 
-  if (freshness.fresh) {
+  // Always check D1 keys cache first when fresh OR when remote fetch is disallowed/restricted
+  if (freshness.fresh || options?.allowRemoteFetch === false) {
     for (let i = 0; i < uniqueIds.length; i += 90) {
       const chunk = uniqueIds.slice(i, i + 90);
       const placeholders = chunk.map((_, idx) => `?${idx + 1}`).join(', ');
@@ -537,10 +763,43 @@ export async function getAuthoritativeQuestionKeys(
   }
 
   const missingIds = uniqueIds.filter(id => !out.has(id));
-  if (missingIds.length > 0) {
-    const fetched = await firestoreClient.batchGetDocuments<Record<string, unknown>>(
-      missingIds.map(docId => ({ collection: 'questionKeys', docId }))
-    );
+  if (missingIds.length > 0 && options?.allowRemoteFetch !== false) {
+    let fetched: Map<string, Record<string, unknown> & { id: string }>;
+    try {
+      fetched = await firestoreClient.batchGetDocuments<Record<string, unknown>>(
+        missingIds.map(docId => ({ collection: 'questionKeys', docId }))
+      );
+    } catch (err) {
+      if (isFirestoreForbiddenError(err)) {
+        // Real Firestore Security Rules block non-owner reads of /questionKeys;
+        // fallback cleanly to any warmed keys in D1 question_keys_cache.
+        for (let i = 0; i < missingIds.length; i += 90) {
+          const chunk = missingIds.slice(i, i + 90);
+          const placeholders = chunk.map((_, idx) => `?${idx + 1}`).join(', ');
+          const res = await db
+            .prepare(
+              `SELECT question_id, correct_option_index, explanation_bn, explanation_en, legal_reference, updated_at
+               FROM question_keys_cache
+               WHERE question_id IN (${placeholders})`
+            )
+            .bind(...chunk)
+            .all<QuestionKeyRow>();
+          for (const row of res.results) {
+            out.set(row.question_id, {
+              id: row.question_id,
+              correctOptionIndex: row.correct_option_index,
+              explanationBn: row.explanation_bn,
+              explanationEn: row.explanation_en,
+              legalReference: row.legal_reference,
+              updatedAt: row.updated_at
+            });
+          }
+        }
+        return out;
+      }
+      throw err;
+    }
+
     const cacheWrites: D1PreparedStatement[] = [];
     for (const [docId, data] of fetched.entries()) {
       const rec: QuestionKeyRecord = {
@@ -588,14 +847,14 @@ export async function getAuthoritativeQuestionKeys(
 
 /**
  * Authoritative full question + answer key list for VERIFIED OWNER ADMIN ONLY (/api/admin/questions).
- * Reads directly from authoritative Firestore /questions + /questionKeys.
+ * Reads directly from authoritative Firestore /questions + /questionKeys using Owner's ID token.
  */
 export async function fetchAllQuestionsWithKeysAuthoritative(
-  firestoreClient: FirestoreRestClient
+  ownerClient: FirestoreRestClient
 ): Promise<ServerQuestion[]> {
   const [questionDocs, keyDocs] = await Promise.all([
-    firestoreClient.listDocuments<Record<string, unknown>>('questions', { pageSize: 500, maxPages: 20 }),
-    firestoreClient.listDocuments<Record<string, unknown>>('questionKeys', { pageSize: 500, maxPages: 20 })
+    ownerClient.listDocuments<Record<string, unknown>>('questions', { pageSize: 500, maxPages: 20 }),
+    ownerClient.listDocuments<Record<string, unknown>>('questionKeys', { pageSize: 500, maxPages: 20 })
   ]);
 
   const keyMap = new Map<string, Record<string, unknown>>();
@@ -615,10 +874,6 @@ export async function fetchAllQuestionsWithKeysAuthoritative(
   });
 }
 
-/**
- * Upserts a single question + key into D1 cache (after Owner Admin save)
- * and updates local version token metadata so cached reads stay consistent.
- */
 export async function upsertSingleQuestionCacheD1(
   db: D1Database,
   question: ServerQuestion,

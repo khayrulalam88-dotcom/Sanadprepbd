@@ -7,18 +7,25 @@ import {
 } from './firebaseAuth.ts';
 import {
   assertExpectedNamedDatabase,
-  checkUserHasActiveSubscriptionRest,
   FirestoreRestClient,
-  getSafeDiagnosticError,
-  writeAuditLogRest
+  getSafeDiagnosticError
 } from './firestoreRest.ts';
 import {
+  checkUserHasActiveSubscriptionKeyless,
   consumeRateLimitD1,
   createOrReplaceSessionD1,
   revokeSessionOnLogoutD1,
+  upsertExamsBatchD1,
   validateAndTouchSessionD1,
+  writeAuditLogD1,
   type RateLimitResult
 } from './d1Store.ts';
+import {
+  getD1QuestionBankMeta,
+  getRemoteQuestionBankVersion,
+  syncQuestionsAndKeysToD1
+} from './questionCache.ts';
+import type { Exam } from '../src/types/index.ts';
 import {
   WorkerHttpError,
   type DecodedAuthUser,
@@ -27,7 +34,10 @@ import {
   type WorkerEnv
 } from './types.ts';
 import { handlePhase2Routes } from './catalogAndPractice.ts';
-import { handlePaymentsAndAdminRoutes } from './paymentsAndAdmin.ts';
+import {
+  handlePaymentsAndAdminRoutes,
+  syncEdgeRecordsWithOwnerFirestore
+} from './paymentsAndAdmin.ts';
 import { handleExamsAndResultsRoutes } from './examsAndResults.ts';
 
 export { assertOwnerAdmin, isOwnerUser };
@@ -303,16 +313,12 @@ export function createWorkerHandler(deps?: WorkerDependencies) {
       environment: env.ENVIRONMENT
     });
     const d1Configured = Boolean(env.DB);
-    const firestoreCredentialsConfigured = Boolean(
-      deps?.firestoreClientFactory || (env.FIREBASE_SERVICE_ACCOUNT_JSON && env.FIREBASE_SERVICE_ACCOUNT_JSON.trim())
-    );
 
     const buildFirestoreClient = (): FirestoreRestClient => {
       if (deps?.firestoreClientFactory) {
         return deps.firestoreClientFactory(env);
       }
       return new FirestoreRestClient({
-        serviceAccountJson: env.FIREBASE_SERVICE_ACCOUNT_JSON,
         projectId: env.FIREBASE_PROJECT_ID,
         databaseId: env.FIREBASE_DATABASE_ID,
         environment: env.ENVIRONMENT,
@@ -329,7 +335,7 @@ export function createWorkerHandler(deps?: WorkerDependencies) {
       let probeReason: string | undefined;
       const shouldProbe = url.searchParams.get('probe') === '1';
 
-      if (shouldProbe && dbCheck.valid && firestoreCredentialsConfigured) {
+      if (shouldProbe && dbCheck.valid) {
         try {
           const client = buildFirestoreClient();
           const probeRes = await client.probeConnectivity();
@@ -342,13 +348,8 @@ export function createWorkerHandler(deps?: WorkerDependencies) {
       }
 
       const persistenceMode =
-        dbCheck.valid && firestoreCredentialsConfigured && probeOk !== false
-          ? 'firestore-rest'
-          : 'unavailable';
-      const healthy =
-        dbCheck.valid &&
-        d1Configured &&
-        (isProduction ? firestoreCredentialsConfigured && probeOk !== false : probeOk !== false);
+        dbCheck.valid && probeOk !== false ? 'keyless-firestore-and-d1' : 'unavailable';
+      const healthy = dbCheck.valid && d1Configured && probeOk !== false;
 
       return withStandardHeaders(
         jsonResponse(healthy ? 200 : 503, {
@@ -356,13 +357,13 @@ export function createWorkerHandler(deps?: WorkerDependencies) {
           runtime: 'cloudflare-worker',
           phase: 3,
           service: 'Sanad Prep BD Subscription & Examination Engine',
+          authMode: 'keyless-firebase-id-token-and-d1',
           persistenceMode,
           environment,
           projectId: dbCheck.projectId,
           databaseId: dbCheck.databaseId,
           expectedDatabaseMatched: dbCheck.valid,
           d1Configured,
-          firestoreCredentialsConfigured,
           ...(probeOk !== undefined ? { firestoreProbeOk: probeOk } : {}),
           ...(probeReason && !isProduction ? { diagnosticNotice: probeReason } : {}),
           serverTime: new Date(nowMs).toISOString(),
@@ -498,7 +499,7 @@ export function createWorkerHandler(deps?: WorkerDependencies) {
         const { previousSessionId } = await createOrReplaceSessionD1(env.DB, newSession);
 
         if (previousSessionId) {
-          await writeAuditLogRest(firestoreClient, {
+          await writeAuditLogD1(env.DB, {
             id: `log_${nowMs}_${Math.random().toString(36).slice(2, 6)}`,
             userId: authUser.uid,
             userName: newSession.userName,
@@ -508,7 +509,48 @@ export function createWorkerHandler(deps?: WorkerDependencies) {
           });
         }
 
-        const subStatus = await checkUserHasActiveSubscriptionRest(firestoreClient, authUser.uid, nowMs);
+        const userClient = firestoreClient.withToken(authUser.idToken);
+
+        // When Owner Admin signs in, best-effort warm cold D1 question/key/exam cache & replicate pending edge records
+        if (isOwnerUser(authUser, env)) {
+          try {
+            const [localMeta, remoteVersion] = await Promise.all([
+              getD1QuestionBankMeta(env.DB),
+              getRemoteQuestionBankVersion(userClient)
+            ]);
+            if (
+              !localMeta ||
+              localMeta.question_count === 0 ||
+              localMeta.version_token !== remoteVersion.versionToken
+            ) {
+              await syncQuestionsAndKeysToD1(env.DB, userClient, { nowMs }).catch(() => undefined);
+              const examDocs = await userClient
+                .listDocuments<Record<string, unknown>>('exams', { pageSize: 200, maxPages: 5 })
+                .catch(() => [] as Array<Record<string, unknown> & { id: string }>);
+              if (examDocs.length > 0) {
+                await upsertExamsBatchD1(
+                  env.DB,
+                  examDocs.map(d => ({
+                    ...(d as unknown as Omit<Exam, 'id'>),
+                    id: d.id,
+                    isActive: d.isActive !== undefined ? Boolean(d.isActive) : !d.isPaid || d.id === 'exam_model_test_01'
+                  })),
+                  nowIso
+                ).catch(() => undefined);
+              }
+            }
+            await syncEdgeRecordsWithOwnerFirestore(env.DB, userClient).catch(() => undefined);
+          } catch {
+            // Best-effort warmup; never block Owner Admin login
+          }
+        }
+
+        const subStatus = await checkUserHasActiveSubscriptionKeyless(
+          env.DB,
+          userClient,
+          authUser.uid,
+          nowMs
+        );
 
         return withStandardHeaders(
           jsonResponse(
@@ -544,7 +586,13 @@ export function createWorkerHandler(deps?: WorkerDependencies) {
           nowIso: new Date(nowMs).toISOString()
         });
 
-        const subStatus = await checkUserHasActiveSubscriptionRest(firestoreClient, authUser.uid, nowMs);
+        const userClient = firestoreClient.withToken(authUser.idToken);
+        const subStatus = await checkUserHasActiveSubscriptionKeyless(
+          env.DB,
+          userClient,
+          authUser.uid,
+          nowMs
+        );
         return withStandardHeaders(
           jsonResponse(
             200,

@@ -26,20 +26,18 @@ import {
 } from '../worker/firebaseAuth.ts';
 import {
   assertExpectedNamedDatabase,
-  checkUserHasActiveSubscriptionRest,
-  clearServiceAccountTokenCacheForTests,
   decodeDocumentFields,
   encodeDocumentFields,
   FirestoreRestClient,
   FirestoreTimestampValue,
-  getGoogleAccessToken,
   getSafeDiagnosticError,
-  parseServiceAccountJson,
   resolveEffectiveDatabaseId
 } from '../worker/firestoreRest.ts';
 import {
+  checkUserHasActiveSubscriptionKeyless,
   consumeRateLimitD1,
   createOrReplaceSessionD1,
+  listAuditLogsD1,
   revokeSessionOnLogoutD1,
   validateAndTouchSessionD1
 } from '../worker/d1Store.ts';
@@ -148,8 +146,10 @@ async function createMigratedTestD1(): Promise<SqliteD1Adapter> {
   const db = new SqliteD1Adapter();
   const mig1 = fs.readFileSync(path.resolve('worker/migrations/0001_initial_edge_state.sql'), 'utf-8');
   const mig2 = fs.readFileSync(path.resolve('worker/migrations/0002_question_bank_cache.sql'), 'utf-8');
+  const mig3 = fs.readFileSync(path.resolve('worker/migrations/0003_keyless_edge_collections.sql'), 'utf-8');
   await db.exec(mig1);
   await db.exec(mig2);
+  await db.exec(mig3);
   return db;
 }
 
@@ -210,12 +210,12 @@ async function signJwt(
 // ---------------------------------------------------------------------------
 // In-Memory Firestore REST API Stub (Verifies exact REST URLs + Transactions)
 // ---------------------------------------------------------------------------
-function createFirestoreRestStub(serviceAccountEmail: string) {
+function createFirestoreRestStub() {
   const expectedPrefix = `https://firestore.googleapis.com/v1/projects/${EXPECTED_FIREBASE_PROJECT_ID}/databases/${EXPECTED_FIREBASE_DATABASE_ID}/documents`;
   const collections = new Map<string, Map<string, Record<string, unknown>>>();
   const activeTransactions = new Map<string, boolean>();
+  const seenAuthHeaders: Array<string | null> = [];
   let txCounter = 0;
-  let oauthCalls = 0;
   let firestoreHttpCalls = 0;
   let failNextCommitWithAborted = false;
 
@@ -241,20 +241,11 @@ function createFirestoreRestStub(serviceAccountEmail: string) {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
     const method = (init?.method || 'GET').toUpperCase();
 
-    if (url === 'https://oauth2.googleapis.com/token') {
-      oauthCalls++;
-      const bodyStr = String(init?.body || '');
-      const params = new URLSearchParams(bodyStr);
-      const assertion = params.get('assertion') || '';
-      const [, payloadSeg] = assertion.split('.');
-      const claims = JSON.parse(Buffer.from(payloadSeg, 'base64url').toString('utf-8')) as Record<string, unknown>;
-      assert.equal(claims.iss, serviceAccountEmail);
-      assert.equal(claims.scope, 'https://www.googleapis.com/auth/datastore');
-      return new Response(
-        JSON.stringify({ access_token: `mock_access_token_${oauthCalls}`, expires_in: 3600 }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } }
-      );
-    }
+    assert.equal(
+      url.startsWith('https://oauth2.googleapis.com'),
+      false,
+      `Keyless Worker must NEVER call OAuth2 service-account token endpoint: ${url}`
+    );
 
     assert.ok(
       url.startsWith(expectedPrefix),
@@ -263,7 +254,7 @@ function createFirestoreRestStub(serviceAccountEmail: string) {
     firestoreHttpCalls++;
 
     const authHeader = new Headers(init?.headers).get('authorization');
-    assert.ok(authHeader && authHeader.startsWith('Bearer mock_access_token_'), 'Missing OAuth2 Bearer token');
+    seenAuthHeaders.push(authHeader);
 
     const restPath = url.slice(expectedPrefix.length);
 
@@ -448,7 +439,7 @@ function createFirestoreRestStub(serviceAccountEmail: string) {
     setFailNextCommitWithAborted: () => {
       failNextCommitWithAborted = true;
     },
-    getMetrics: () => ({ oauthCalls, firestoreHttpCalls })
+    getMetrics: () => ({ firestoreHttpCalls, seenAuthHeaders })
   };
 }
 
@@ -458,21 +449,12 @@ function createFirestoreRestStub(serviceAccountEmail: string) {
 describe('Sanad Prep BD — Cloudflare Worker Phase 1 Test Suite', async () => {
   const keyPrimary = await generateRs256Keypair('kid_primary_v1');
   const keyRotated = await generateRs256Keypair('kid_rotated_v2');
-  const saKey = await generateRs256Keypair('sa_key_1');
-
-  const saJsonString = JSON.stringify({
-    type: 'service_account',
-    project_id: EXPECTED_FIREBASE_PROJECT_ID,
-    client_email: 'sanad-worker-sa@galvanic-aviary-tzp2g.iam.gserviceaccount.com',
-    private_key: saKey.pkcs8Pem
-  });
 
   beforeEach(() => {
     clearFirebaseJwksCacheForTests();
-    clearServiceAccountTokenCacheForTests();
   });
 
-  test('1. D1 Migrations 0001 & 0002 execute cleanly and keep question keys strictly separated', async () => {
+  test('1. D1 Migrations 0001, 0002 & 0003 execute cleanly and keep question keys strictly separated', async () => {
     const db = await createMigratedTestD1();
     const tablesRes = await db
       .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name`)
@@ -485,6 +467,12 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 1 Test Suite', async () => {
     assert.ok(names.includes('question_bank_meta'));
     assert.ok(names.includes('question_bank_cache'));
     assert.ok(names.includes('question_keys_cache'));
+    assert.ok(names.includes('edge_payment_requests'));
+    assert.ok(names.includes('edge_subscriptions'));
+    assert.ok(names.includes('edge_exam_attempts'));
+    assert.ok(names.includes('edge_exam_results'));
+    assert.ok(names.includes('edge_leaderboard'));
+    assert.ok(names.includes('edge_audit_logs'));
 
     // Ensure sanitized cache table has NO answer key or explanation columns
     const colsRes = await db.prepare(`PRAGMA table_info(question_bank_cache)`).all<{ name: string }>();
@@ -652,7 +640,7 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 1 Test Suite', async () => {
     );
   });
 
-  test('4. Named database guards & Service Account OAuth2 + Firestore REST transactions', async () => {
+  test('4. Named database guards & keyless Firebase ID-token Firestore REST transactions', async () => {
     // Database naming safeguards
     assert.equal(resolveEffectiveDatabaseId(''), EXPECTED_FIREBASE_DATABASE_ID);
     assert.equal(resolveEffectiveDatabaseId(EXPECTED_FIREBASE_PROJECT_ID), EXPECTED_FIREBASE_DATABASE_ID);
@@ -661,23 +649,16 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 1 Test Suite', async () => {
     assert.equal(assertExpectedNamedDatabase({ projectId: 'wrong-proj' }).valid, false);
     assert.equal(assertExpectedNamedDatabase().valid, true);
 
-    assert.throws(
-      () => parseServiceAccountJson(JSON.stringify({ project_id: 'evil-proj', client_email: 'a', private_key: 'b' })),
-      /does not match expected/
-    );
+    const db = await createMigratedTestD1();
+    const stub = createFirestoreRestStub();
+    const publicClient = new FirestoreRestClient({ fetchImpl: stub.fetchImpl });
+    const scopedClient = publicClient.withToken('firebase_id_token_abc');
 
-    const stub = createFirestoreRestStub('sanad-worker-sa@galvanic-aviary-tzp2g.iam.gserviceaccount.com');
-    const client = new FirestoreRestClient({
-      serviceAccountJson: saJsonString,
-      fetchImpl: stub.fetchImpl
-    });
-
-    // Access token caching test
-    const creds = parseServiceAccountJson(saJsonString);
-    const t1 = await getGoogleAccessToken(creds, { fetchImpl: stub.fetchImpl });
-    const t2 = await getGoogleAccessToken(creds, { fetchImpl: stub.fetchImpl });
-    assert.equal(t1, t2);
-    assert.equal(stub.getMetrics().oauthCalls, 1);
+    // Public client omits Authorization header; .withToken(...) forwards caller Firebase ID token
+    await publicClient.getDocument('packages', 'missing_doc').catch(() => null);
+    await scopedClient.getDocument('packages', 'missing_doc').catch(() => null);
+    assert.equal(stub.getMetrics().seenAuthHeaders[0], null);
+    assert.equal(stub.getMetrics().seenAuthHeaders[1], 'Bearer firebase_id_token_abc');
 
     // Encode/Decode REST values including FirestoreTimestampValue & nested maps/arrays
     const encoded = encodeDocumentFields({
@@ -704,7 +685,7 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 1 Test Suite', async () => {
     stub.setDoc('packages', 'pkg_long_course', { price: 999, isActive: true });
     stub.setFailNextCommitWithAborted();
     let txAttempts = 0;
-    const txOut = await client.runTransaction(async tx => {
+    const txOut = await scopedClient.runTransaction(async tx => {
       txAttempts++;
       const pkg = await tx.get<{ price: number }>('packages', 'pkg_long_course');
       assert.equal(pkg?.price, 999);
@@ -721,7 +702,7 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 1 Test Suite', async () => {
 
     // Duplicate createDocument returns 409 ALREADY_EXISTS
     await assert.rejects(
-      () => client.createDocument('paymentRequests', 'trx_TXN12345', { transactionId: 'TXN12345' }),
+      () => scopedClient.createDocument('paymentRequests', 'trx_TXN12345', { transactionId: 'TXN12345' }),
       (err: any) => err.status === 409 && err.code === 'ALREADY_EXISTS'
     );
 
@@ -733,7 +714,7 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 1 Test Suite', async () => {
       status: 'active',
       expiresAt: pastIso
     });
-    const expCheck = await checkUserHasActiveSubscriptionRest(client, 'uid_sub_test');
+    const expCheck = await checkUserHasActiveSubscriptionKeyless(db, scopedClient, 'uid_sub_test');
     assert.equal(expCheck.active, false);
 
     stub.setDoc('subscriptions', 'sub_valid', {
@@ -742,7 +723,7 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 1 Test Suite', async () => {
       status: 'active',
       expiresAt: futureIso
     });
-    const okCheck = await checkUserHasActiveSubscriptionRest(client, 'uid_sub_test');
+    const okCheck = await checkUserHasActiveSubscriptionKeyless(db, scopedClient, 'uid_sub_test');
     assert.equal(okCheck.active, true);
     assert.equal(okCheck.activeSubscription?.id, 'sub_valid');
 
@@ -789,9 +770,8 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 1 Test Suite', async () => {
     assert.equal(nextWindow.remaining, 2);
 
     // Safe Question Bank D1 cache
-    const stub = createFirestoreRestStub('sanad-worker-sa@galvanic-aviary-tzp2g.iam.gserviceaccount.com');
+    const stub = createFirestoreRestStub();
     const client = new FirestoreRestClient({
-      serviceAccountJson: saJsonString,
       fetchImpl: stub.fetchImpl
     });
 
@@ -838,7 +818,7 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 1 Test Suite', async () => {
 
   test('6. Worker HTTP endpoints: /health, CORS, /api/auth/session single-device revocation & /api/auth/logout', async () => {
     const db = await createMigratedTestD1();
-    const stub = createFirestoreRestStub('sanad-worker-sa@galvanic-aviary-tzp2g.iam.gserviceaccount.com');
+    const stub = createFirestoreRestStub();
     const futureExp = new Date(Date.now() + 30 * 86400 * 1000).toISOString();
     stub.setDoc('subscriptions', 'sub_alpha', {
       userId: 'student_uid_alpha',
@@ -879,7 +859,6 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 1 Test Suite', async () => {
       ENVIRONMENT: 'staging',
       FIREBASE_PROJECT_ID: EXPECTED_FIREBASE_PROJECT_ID,
       FIREBASE_DATABASE_ID: EXPECTED_FIREBASE_DATABASE_ID,
-      FIREBASE_SERVICE_ACCOUNT_JSON: saJsonString,
       ALLOWED_ORIGIN: 'https://s--khayrul-alam.khayrulalam88.workers.dev'
     };
 
@@ -889,10 +868,12 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 1 Test Suite', async () => {
     assert.equal(healthRes.headers.get('X-Frame-Options'), 'DENY');
     const healthText = await healthRes.text();
     assert.ok(!healthText.includes('PRIVATE KEY'));
+    assert.equal(healthText.includes('FIREBASE_SERVICE_ACCOUNT_JSON'), false);
     const healthJson = JSON.parse(healthText) as Record<string, unknown>;
     assert.equal(healthJson.status, 'ok');
     assert.equal(healthJson.runtime, 'cloudflare-worker');
-    assert.equal(healthJson.persistenceMode, 'firestore-rest');
+    assert.equal(healthJson.persistenceMode, 'keyless-firestore-and-d1');
+    assert.equal(healthJson.authMode, 'keyless-firebase-id-token-and-d1');
     assert.equal(healthJson.projectId, EXPECTED_FIREBASE_PROJECT_ID);
     assert.equal(healthJson.databaseId, EXPECTED_FIREBASE_DATABASE_ID);
     assert.equal(healthJson.expectedDatabaseMatched, true);
@@ -978,8 +959,11 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 1 Test Suite', async () => {
     const sess2 = ((await login2Res.json()) as { sessionId: string }).sessionId;
     assert.notEqual(sess1, sess2);
 
-    const auditDocs = Array.from(stub.getCol('auditLogs').values());
-    assert.equal(auditDocs.some(a => a.action === 'SESSION_REVOKED_CONCURRENT' && a.userId === 'student_uid_alpha'), true);
+    const d1AuditLogs = await listAuditLogsD1(db, 20);
+    assert.equal(
+      d1AuditLogs.some(a => a.action === 'SESSION_REVOKED_CONCURRENT' && a.userId === 'student_uid_alpha'),
+      true
+    );
 
     // Device 1 status check -> 401 SESSION_REVOKED
     const status1Res = await handler(
@@ -1090,17 +1074,25 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 1 Test Suite', async () => {
     );
   });
 
-  test('8. Architecture boundary checks: no firebase-admin/gRPC in worker/, no embedded private keys, root config & rules preserved', () => {
+  test('8. Keyless architecture boundary checks: no SA JSON, no OAuth JWT-bearer, no firebase-admin/gRPC in worker/', () => {
     const embeddedPrivateKeyPattern = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]{40,}-----END [A-Z ]*PRIVATE KEY-----/;
     const workerFiles = fs
       .readdirSync(path.resolve('worker'))
       .filter(f => f.endsWith('.ts') || f.endsWith('.jsonc'))
-      .map(f => ({ name: f, content: fs.readFileSync(path.resolve('worker', f), 'utf-8') }));
+      .map(f => ({ name: `worker/${f}`, content: fs.readFileSync(path.resolve('worker', f), 'utf-8') }));
 
     for (const { name, content } of workerFiles) {
       assert.equal(content.includes('firebase-admin'), false, `${name} must NEVER import firebase-admin`);
       assert.equal(content.includes('@grpc/grpc-js'), false, `${name} must NEVER import gRPC`);
+      assert.equal(content.includes('FIREBASE_SERVICE_ACCOUNT_JSON'), false, `${name} must NEVER require FIREBASE_SERVICE_ACCOUNT_JSON`);
+      assert.equal(content.includes('oauth2.googleapis.com/token'), false, `${name} must NEVER mint SA OAuth tokens`);
+      assert.equal(content.includes('jwt-bearer'), false, `${name} must NEVER sign SA jwt-bearer assertions`);
       assert.equal(embeddedPrivateKeyPattern.test(content), false, `${name} must NEVER hardcode private keys`);
+    }
+
+    for (const relPath of ['server.ts', 'server/services/firestoreBackend.ts', 'wrangler.jsonc', 'wrangler.production.jsonc', '.env.example', 'worker/.dev.vars.example']) {
+      const content = fs.readFileSync(path.resolve(relPath), 'utf-8');
+      assert.equal(content.includes('FIREBASE_SERVICE_ACCOUNT_JSON'), false, `${relPath} must not reference FIREBASE_SERVICE_ACCOUNT_JSON`);
     }
 
     assert.equal(fs.existsSync(path.resolve('server.ts')), true);

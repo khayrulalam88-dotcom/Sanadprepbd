@@ -103,7 +103,7 @@ async function main() {
         'Reason: ' +
         (state.reason || persistenceState.reason || 'Missing credentials') +
         '\n\nTo inspect or execute this migration safely against production Firestore:\n' +
-        '  1. Attach Cloud Run / ADC credentials or export FIREBASE_SERVICE_ACCOUNT_JSON securely\n' +
+        '  1. Authenticate via Google Application Default Credentials (gcloud auth application-default login or Cloud Run attached IAM)\n' +
         '  2. Inspect first (read-only): npx tsx scripts/migrateFirestoreData.ts --dry-run\n' +
         '  3. Take a verified Firestore export backup before running --execute\n' +
         '  4. Execute only when dry-run reports safeToExecute=true: npx tsx scripts/migrateFirestoreData.ts --execute\n'

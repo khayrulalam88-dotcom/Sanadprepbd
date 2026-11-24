@@ -34,7 +34,6 @@ import {
   type FirebaseJwk
 } from '../worker/firebaseAuth.ts';
 import {
-  clearServiceAccountTokenCacheForTests,
   decodeDocumentFields,
   encodeDocumentFields,
   type FirestoreRestValue
@@ -128,6 +127,7 @@ async function createMigratedTestD1(): Promise<SqliteD1Adapter> {
   const db = new SqliteD1Adapter();
   await db.exec(fs.readFileSync(path.resolve('worker/migrations/0001_initial_edge_state.sql'), 'utf-8'));
   await db.exec(fs.readFileSync(path.resolve('worker/migrations/0002_question_bank_cache.sql'), 'utf-8'));
+  await db.exec(fs.readFileSync(path.resolve('worker/migrations/0003_keyless_edge_collections.sql'), 'utf-8'));
   return db;
 }
 
@@ -168,7 +168,7 @@ async function signJwt(
   return `${headerSeg}.${payloadSeg}.${base64UrlEncodeBytes(new Uint8Array(sig))}`;
 }
 
-function createPhase46FirestoreStub(serviceAccountEmail: string) {
+function createPhase46FirestoreStub() {
   const expectedPrefix = `https://firestore.googleapis.com/v1/projects/${EXPECTED_FIREBASE_PROJECT_ID}/databases/${EXPECTED_FIREBASE_DATABASE_ID}/documents`;
   const collections = new Map<string, Map<string, Record<string, unknown>>>();
 
@@ -192,12 +192,7 @@ function createPhase46FirestoreStub(serviceAccountEmail: string) {
     const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
     const method = (init?.method || 'GET').toUpperCase();
 
-    if (urlStr === 'https://oauth2.googleapis.com/token') {
-      return new Response(
-        JSON.stringify({ access_token: `sa_token_${serviceAccountEmail}`, expires_in: 3600 }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } }
-      );
-    }
+    assert.equal(urlStr.startsWith('https://oauth2.googleapis.com'), false, 'Keyless Worker must never call oauth2 token API');
 
     if (urlStr === `${expectedPrefix}:batchGet`) {
       const body = JSON.parse(String(init?.body || '{}')) as { documents?: string[] };
@@ -380,7 +375,6 @@ function makeSampleServerQuestion(overrides: Partial<ServerQuestion> & { id: str
 describe('Phase 4.6 Targeted Bug Fixes & Regression Suite', () => {
   beforeEach(() => {
     clearFirebaseJwksCacheForTests();
-    clearServiceAccountTokenCacheForTests();
   });
 
   // =========================================================================
@@ -389,8 +383,7 @@ describe('Phase 4.6 Targeted Bug Fixes & Regression Suite', () => {
   test('Task 1: GET /api/admin/subscriptions returns studentEmail and POST /api/admin/users/update never erases email', async () => {
     const db = await createMigratedTestD1();
     const authKeys = await generateRs256Keypair('kid_p46_t1');
-    const saKeys = await generateRs256Keypair('sa_p46_t1');
-    const stub = createPhase46FirestoreStub('sa@galvanic-aviary-tzp2g.iam.gserviceaccount.com');
+    const stub = createPhase46FirestoreStub();
     const fixedNowMs = Date.UTC(2026, 10, 17, 10, 0, 0);
 
     const existingEmail = 'rahim.advocate@example.com';
@@ -433,11 +426,6 @@ describe('Phase 4.6 Targeted Bug Fixes & Regression Suite', () => {
       DB: db,
       FIREBASE_PROJECT_ID: EXPECTED_FIREBASE_PROJECT_ID,
       FIREBASE_DATABASE_ID: EXPECTED_FIREBASE_DATABASE_ID,
-      FIREBASE_SERVICE_ACCOUNT_JSON: JSON.stringify({
-        project_id: EXPECTED_FIREBASE_PROJECT_ID,
-        client_email: 'sa@galvanic-aviary-tzp2g.iam.gserviceaccount.com',
-        private_key: saKeys.pkcs8Pem
-      }),
       ENVIRONMENT: 'production'
     };
 
@@ -687,8 +675,7 @@ describe('Phase 4.6 Targeted Bug Fixes & Regression Suite', () => {
     // 2. Verify end-to-end Worker API behavior
     const db = await createMigratedTestD1();
     const authKeys = await generateRs256Keypair('kid_p46_t3');
-    const saKeys = await generateRs256Keypair('sa_p46_t3');
-    const stub = createPhase46FirestoreStub('sa@galvanic-aviary-tzp2g.iam.gserviceaccount.com');
+    const stub = createPhase46FirestoreStub();
     const fixedNowMs = Date.UTC(2026, 10, 17, 10, 0, 0);
 
     stub.seedDoc('config', 'questionBankVersion', {
@@ -701,11 +688,6 @@ describe('Phase 4.6 Targeted Bug Fixes & Regression Suite', () => {
       DB: db,
       FIREBASE_PROJECT_ID: EXPECTED_FIREBASE_PROJECT_ID,
       FIREBASE_DATABASE_ID: EXPECTED_FIREBASE_DATABASE_ID,
-      FIREBASE_SERVICE_ACCOUNT_JSON: JSON.stringify({
-        project_id: EXPECTED_FIREBASE_PROJECT_ID,
-        client_email: 'sa@galvanic-aviary-tzp2g.iam.gserviceaccount.com',
-        private_key: saKeys.pkcs8Pem
-      }),
       ENVIRONMENT: 'production'
     };
 
@@ -829,8 +811,7 @@ describe('Phase 4.6 Targeted Bug Fixes & Regression Suite', () => {
   test('Task 4: Changing student to free/expired revokes ALL active subscriptions while preserving history & other users', async () => {
     const db = await createMigratedTestD1();
     const authKeys = await generateRs256Keypair('kid_p46_t4');
-    const saKeys = await generateRs256Keypair('sa_p46_t4');
-    const stub = createPhase46FirestoreStub('sa@galvanic-aviary-tzp2g.iam.gserviceaccount.com');
+    const stub = createPhase46FirestoreStub();
     const fixedNowMs = Date.UTC(2026, 10, 17, 10, 0, 0);
 
     stub.seedDoc('users', 'student_multi', {
@@ -933,11 +914,6 @@ describe('Phase 4.6 Targeted Bug Fixes & Regression Suite', () => {
       DB: db,
       FIREBASE_PROJECT_ID: EXPECTED_FIREBASE_PROJECT_ID,
       FIREBASE_DATABASE_ID: EXPECTED_FIREBASE_DATABASE_ID,
-      FIREBASE_SERVICE_ACCOUNT_JSON: JSON.stringify({
-        project_id: EXPECTED_FIREBASE_PROJECT_ID,
-        client_email: 'sa@galvanic-aviary-tzp2g.iam.gserviceaccount.com',
-        private_key: saKeys.pkcs8Pem
-      }),
       ENVIRONMENT: 'production'
     };
 
@@ -1154,19 +1130,13 @@ describe('Phase 4.6 Targeted Bug Fixes & Regression Suite', () => {
   test('Task 6: All /api/admin/* endpoints enforce strict Owner Auth while remaining compatible with Owner session flows', async () => {
     const db = await createMigratedTestD1();
     const authKeys = await generateRs256Keypair('kid_p46_t6');
-    const saKeys = await generateRs256Keypair('sa_p46_t6');
-    const stub = createPhase46FirestoreStub('sa@galvanic-aviary-tzp2g.iam.gserviceaccount.com');
+    const stub = createPhase46FirestoreStub();
     const fixedNowMs = Date.UTC(2026, 10, 17, 10, 0, 0);
 
     const env: WorkerEnv = {
       DB: db,
       FIREBASE_PROJECT_ID: EXPECTED_FIREBASE_PROJECT_ID,
       FIREBASE_DATABASE_ID: EXPECTED_FIREBASE_DATABASE_ID,
-      FIREBASE_SERVICE_ACCOUNT_JSON: JSON.stringify({
-        project_id: EXPECTED_FIREBASE_PROJECT_ID,
-        client_email: 'sa@galvanic-aviary-tzp2g.iam.gserviceaccount.com',
-        private_key: saKeys.pkcs8Pem
-      }),
       ENVIRONMENT: 'production'
     };
 

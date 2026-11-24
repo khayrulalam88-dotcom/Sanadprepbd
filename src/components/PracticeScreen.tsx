@@ -14,7 +14,6 @@ import {
   X,
   RotateCcw,
   Lock,
-  Crown,
   Sparkles,
   AlertTriangle
 } from 'lucide-react';
@@ -308,104 +307,8 @@ export const PracticeScreen: React.FC = () => {
         </div>
       )}
 
-      {/* Free Demo Preview Notice for Unsubscribed / Expired Users */}
-      {!isSubscriptionActive && (
-        <div className="p-3.5 rounded-2xl bg-gradient-to-r from-amber-50 to-orange-50 border border-amber-200 text-amber-900 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-xs">
-          <div className="flex items-center gap-2.5">
-            <div className="w-8 h-8 rounded-xl bg-[#102A43] text-[#D4AF37] flex items-center justify-center shrink-0">
-              <Crown className="w-4 h-4" />
-            </div>
-            <div>
-              <span className="font-bold text-xs sm:text-sm block text-[#102A43]">
-                {currentUser.subscriptionStatus === 'expired'
-                  ? t('সাবস্ক্রিপশনের মেয়াদ শেষ হয়েছে (Expired)', 'Subscription Expired')
-                  : t('ফ্রি প্রিভিউ মোড (১০টি ডেমো প্রশ্ন)', 'Free Preview Mode (10 Demo Questions)')}
-              </span>
-              <span className="text-[11px] text-amber-900">
-                {currentUser.subscriptionStatus === 'expired'
-                  ? t('পেইড MCQ ও লাইভ মডেল টেস্ট পুনরায় চালু করতে অনুগ্রহ করে সাবস্ক্রিপশন রিনিউ করুন।', 'Please renew your subscription to access all 3,000+ MCQs and model tests.')
-                  : t('আপনি এই বিষয়ের ১০টি ফ্রি ডেমো প্রশ্ন অনুশীলন করতে পারবেন। সম্পূর্ণ ৩,০০০+ পেইড MCQ আনলক করতে সাবস্ক্রাইব করুন।', 'You can practice 10 sample questions. Subscribe to unlock all 3,000+ statutory questions.')}
-              </span>
-            </div>
-          </div>
-          <button
-            onClick={() => openSubscriptionModal()}
-            className="px-4 py-2 rounded-xl bg-[#102A43] hover:bg-[#243B53] text-[#D4AF37] border border-[#D4AF37] text-xs font-bold transition flex items-center justify-center gap-1.5 shrink-0 cursor-pointer shadow-xs"
-          >
-            <Crown className="w-3.5 h-3.5 text-[#D4AF37]" />
-            <span>{currentUser.subscriptionStatus === 'expired' ? t('পুনরায় রিনিউ করুন', 'Renew Now') : t('প্রো আনলক করুন', 'Unlock Pro')}</span>
-          </button>
-        </div>
-      )}
-
-      {/* Question Card OR Premium Subscription Lock Screen */}
-      {(!isSubscriptionActive && currentIndex >= 10) ? (
-        <div className="bg-white rounded-3xl border-2 border-amber-300 shadow-md p-8 sm:p-12 text-center max-w-2xl mx-auto space-y-5 animate-in fade-in">
-          <div className="w-16 h-16 rounded-3xl bg-amber-50 border-2 border-amber-300 text-amber-600 flex items-center justify-center mx-auto">
-            <Lock className="w-8 h-8" />
-          </div>
-
-          <div className="space-y-2">
-            <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-[#102A43] text-[#D4AF37] text-xs font-bold border border-[#D4AF37]/30">
-              <Crown className="w-3.5 h-3.5 text-[#D4AF37]" />
-              <span>{t('প্রিমিয়াম পেইড প্রশ্নাবলী', 'Premium Statutory Question')}</span>
-            </div>
-            <h2 className="text-xl sm:text-2xl font-black text-[#102A43]">
-              {currentUser.subscriptionStatus === 'expired'
-                ? t('সাবস্ক্রিপশনের মেয়াদ শেষ হয়েছে', 'Your Subscription Has Expired')
-                : t('এই পেইড প্রশ্ন ও বিস্তারিত ব্যাখ্যা দেখতে সাবস্ক্রিপশন প্রয়োজন', 'Subscribe to Access This Paid Question & Analysis')}
-            </h2>
-            <p className="text-xs sm:text-sm text-slate-600 max-w-md mx-auto leading-relaxed">
-              {currentUser.subscriptionStatus === 'expired'
-                ? t(
-                    'আপনার পূর্ববর্তী সাবস্ক্রিপশনের মেয়াদ উত্তীর্ণ হয়েছে। ৩,০০০+ পেইড MCQ ও ৬০ মিনিটের লাইভ মডেল টেস্ট পুনরায় আনলক করতে বিকাশ বা নগদে ফি পরিশোধ করে সাবস্ক্রিপশন রিনিউ করুন।',
-                    'Your previous pass has expired. Please renew your subscription to access all statutory questions and live mock tests.'
-                  )
-                : t(
-                    `আপনি ১০টি ফ্রি ডেমো প্রশ্ন সম্পন্ন করেছেন। এই বিষয়ের বাকি ${Math.max(0, displayTotal - 10)}টি পেইড প্রশ্ন, বিস্তারিত আইনি ব্যাখ্যা ও গেজেট রেফারেন্স আনলক করতে মাসিক সাবস্ক্রিপশন বা এককালীন প্যাকেজ বেছে নিন।`,
-                    `You have completed 10 free demo questions. Select a monthly or one-time pass to unlock all remaining questions and statutory references.`
-                  )}
-            </p>
-          </div>
-
-          {/* Quick Pricing Preview Pill */}
-          <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200 text-xs text-slate-700 flex flex-wrap items-center justify-around gap-2 max-w-md mx-auto">
-            <div>
-              <span className="text-slate-400 block text-[10px] uppercase font-bold">{t('মাসিক সাবস্ক্রিপশন', 'Monthly')}</span>
-              <strong className="text-[#102A43] text-sm">৳১৫০ / ৩০ দিন</strong>
-            </div>
-            <div className="h-6 w-px bg-slate-200" />
-            <div>
-              <span className="text-slate-400 block text-[10px] uppercase font-bold">{t('প্রো মডেল টেস্ট পাস', 'Pro Pass')}</span>
-              <strong className="text-[#102A43] text-sm">৳৩০০ / ৯০ দিন</strong>
-            </div>
-            <div className="h-6 w-px bg-slate-200" />
-            <div>
-              <span className="text-slate-400 block text-[10px] uppercase font-bold">{t('এক্সাম পাস', 'Exam Pass')}</span>
-              <strong className="text-[#102A43] text-sm">৳৬৫০ / পরীক্ষার দিন</strong>
-            </div>
-          </div>
-
-          <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-2">
-            <button
-              onClick={() => openSubscriptionModal()}
-              className="w-full sm:w-auto px-6 py-3 rounded-2xl bg-[#102A43] hover:bg-[#243B53] text-[#D4AF37] border border-[#D4AF37] font-bold text-xs sm:text-sm transition flex items-center justify-center gap-2 cursor-pointer shadow-md"
-            >
-              <Crown className="w-4 h-4 text-[#D4AF37]" />
-              <span>{currentUser.subscriptionStatus === 'expired' ? t('এখনই রিনিউ করুন (bKash/Nagad)', 'Renew Now (bKash/Nagad)') : t('প্যাকেজ বেছে নিন ও আনলক করুন', 'Select Package & Unlock')}</span>
-            </button>
-
-            <button
-              onClick={() => setCurrentIndex(0)}
-              className="w-full sm:w-auto px-5 py-3 rounded-2xl border border-slate-300 text-slate-700 hover:bg-slate-50 font-bold text-xs sm:text-sm transition cursor-pointer"
-            >
-              {t('ফ্রি ডেমো প্রশ্নে ফিরে যান', 'Back to Free Questions')}
-            </button>
-          </div>
-        </div>
-      ) : (
-        /* Regular Question Card */
-        <div className="bg-white rounded-3xl border border-slate-200 shadow-sm p-6 sm:p-8">
+      {/* Regular Question Card */}
+      <div className="bg-white rounded-3xl border border-slate-200 shadow-sm p-6 sm:p-8">
           
           {/* Top Info */}
           <div className="flex items-center justify-between pb-4 border-b border-slate-100 mb-6">
@@ -543,8 +446,7 @@ export const PracticeScreen: React.FC = () => {
             </button>
           </div>
 
-        </div>
-      )}
+      </div>
 
     </div>
   );

@@ -467,10 +467,27 @@ export function createSanadPrepApp(options?: {
     }
     next();
   });
-  app.use(
-    cors({
+  app.use(['/api', '/health'], (req, res, next) => {
+    const reqOrigin = req.headers.origin;
+    const forwardedHost = String(req.headers['x-forwarded-host'] || '')
+      .split(',')[0]
+      .trim()
+      .toLowerCase();
+    let isSameAiStudioPreviewOrigin = false;
+    if (reqOrigin && forwardedHost && /^ais-(dev|pre)-[a-z0-9-]+\.[a-z0-9.-]+\.run\.app(?::\d+)?$/.test(forwardedHost)) {
+      try {
+        const parsed = new URL(reqOrigin);
+        isSameAiStudioPreviewOrigin =
+          parsed.protocol === 'https:' && parsed.host.toLowerCase() === forwardedHost;
+      } catch {
+        isSameAiStudioPreviewOrigin = false;
+      }
+    }
+
+    return cors({
       origin: (origin, callback) => {
         if (
+          isSameAiStudioPreviewOrigin ||
           isOriginAllowed(origin, {
             isProduction: isProductionMode,
             allowedOriginEnv: options?.allowedOriginEnv
@@ -483,8 +500,8 @@ export function createSanadPrepApp(options?: {
       },
       allowedHeaders: ['Content-Type', 'Authorization', 'X-Session-Id'],
       credentials: true
-    })
-  );
+    })(req, res, next);
+  });
   app.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
     if (err instanceof HttpError && err.code === 'CORS_ORIGIN_NOT_ALLOWED') {
       return res.status(403).json({ error: err.code, message: err.message });
@@ -2139,11 +2156,14 @@ export function createSanadPrepApp(options?: {
 
       if (useFirestore()) {
         const userRef = db.collection('users').doc(targetUid);
-        const [userSnap, userSessSnap, queriedSubsSnap, explicitSubSnap] = await Promise.all([
+        const requestedPkgIdHint =
+          typeof packageId === 'string' && packageId.trim() ? packageId.trim() : '';
+        const [userSnap, userSessSnap, queriedSubsSnap, explicitSubSnap, firestorePkgHintSnap] = await Promise.all([
           userRef.get(),
           isSessionRevoked ? db.collection('userSessions').doc(targetUid).get() : Promise.resolve(null),
           db.collection('subscriptions').where('userId', '==', targetUid).get(),
-          cleanSubId ? db.collection('subscriptions').doc(cleanSubId).get() : Promise.resolve(null)
+          cleanSubId ? db.collection('subscriptions').doc(cleanSubId).get() : Promise.resolve(null),
+          requestedPkgIdHint ? db.collection('packages').doc(requestedPkgIdHint).get().catch(() => null) : Promise.resolve(null)
         ]);
 
         const targetSubMap = new Map<string, Record<string, unknown> & { id: string }>();
@@ -2224,8 +2244,29 @@ export function createSanadPrepApp(options?: {
           const resolvedSubDoc =
             (cleanSubId ? targetSubMap.get(cleanSubId) : undefined) || allUserSubDocs[0] || null;
           const targetSubId = cleanSubId || resolvedSubDoc?.id || `sub_admin_${targetUid}`;
-          const pkgMatch =
-            mirror.packages.find(p => p.id === (packageId || resolvedSubDoc?.packageId)) || mirror.packages[0];
+          const effectivePkgId =
+            (typeof packageId === 'string' && packageId.trim()) ||
+            (resolvedSubDoc?.packageId as string | undefined) ||
+            mirror.packages[0].id;
+          const livePkgSnap =
+            firestorePkgHintSnap && (!requestedPkgIdHint || requestedPkgIdHint === effectivePkgId)
+              ? firestorePkgHintSnap
+              : await db.collection('packages').doc(effectivePkgId).get().catch(() => null);
+          const livePkgData = livePkgSnap?.exists ? (livePkgSnap.data() as Record<string, unknown>) : null;
+          const mirrorFallback = mirror.packages.find(p => p.id === effectivePkgId) || mirror.packages[0];
+          const pkgMatch = {
+            id: effectivePkgId,
+            nameBn: (typeof livePkgData?.nameBn === 'string' && livePkgData.nameBn) || mirrorFallback.nameBn,
+            nameEn: (typeof livePkgData?.nameEn === 'string' && livePkgData.nameEn) || mirrorFallback.nameEn,
+            price:
+              typeof livePkgData?.price === 'number' && Number.isFinite(livePkgData.price)
+                ? livePkgData.price
+                : mirrorFallback.price,
+            validityType:
+              livePkgData?.validityType === 'exam_date' || livePkgData?.validityType === 'days'
+                ? livePkgData.validityType
+                : mirrorFallback.validityType
+          };
           const effectiveExpiresIso =
             cleanExpiresIso ||
             timestampToIso(resolvedSubDoc?.expiresAt) ||
@@ -3330,10 +3371,23 @@ export function createSanadPrepApp(options?: {
               if (!qS.exists) continue;
               const qBase = qS.data() as Partial<ServerQuestion>;
               const kData = kS.exists ? (kS.data() as Partial<ServerQuestion>) : undefined;
+              const rawCorrectIdx = kData?.correctOptionIndex ?? qBase.correctOptionIndex;
+              if (
+                typeof rawCorrectIdx !== 'number' ||
+                !Number.isInteger(rawCorrectIdx) ||
+                rawCorrectIdx < 0 ||
+                rawCorrectIdx > 3
+              ) {
+                throw new HttpError(
+                  503,
+                  'QUESTION_KEYS_UNAVAILABLE',
+                  'Authoritative exam answer keys could not be loaded.'
+                );
+              }
               authoritativeQuestions.push({
                 ...(qBase as ServerQuestion),
                 id: qS.id,
-                correctOptionIndex: kData?.correctOptionIndex ?? qBase.correctOptionIndex ?? 0,
+                correctOptionIndex: rawCorrectIdx,
                 explanationBn: kData?.explanationBn ?? qBase.explanationBn ?? '',
                 explanationEn: kData?.explanationEn ?? qBase.explanationEn ?? ''
               });
@@ -3355,7 +3409,22 @@ export function createSanadPrepApp(options?: {
               allowMemoryFallback,
               true
             );
-            authoritativeQuestions = examQuestions.map(q => qMap.get(q.id) || q);
+            authoritativeQuestions = examQuestions.map(q => {
+              const resolved = qMap.get(q.id) || q;
+              if (
+                typeof resolved.correctOptionIndex !== 'number' ||
+                !Number.isInteger(resolved.correctOptionIndex) ||
+                resolved.correctOptionIndex < 0 ||
+                resolved.correctOptionIndex > 3
+              ) {
+                throw new HttpError(
+                  503,
+                  'QUESTION_KEYS_UNAVAILABLE',
+                  'Authoritative exam answer keys could not be loaded.'
+                );
+              }
+              return resolved;
+            });
           }
 
           if (authoritativeQuestions.length === 0) {
@@ -3497,11 +3566,21 @@ async function startServer() {
   const distIndex = path.resolve(distDir, 'index.html');
   const isProduction = process.env.NODE_ENV === 'production';
 
+  const isStaticModuleOrAssetRequest = (reqPath: string) =>
+    reqPath.startsWith('/assets/') ||
+    reqPath.startsWith('/src/') ||
+    reqPath.startsWith('/node_modules/') ||
+    reqPath.startsWith('/@') ||
+    /\.(?:js|mjs|cjs|ts|tsx|jsx|css|map|json|png|jpg|jpeg|gif|svg|ico|woff2?|ttf|eot)$/i.test(reqPath);
+
   if (isProduction && fs.existsSync(distIndex)) {
     app.use(express.static(distDir));
     app.get('*', (req, res, next) => {
       if (req.path.startsWith('/api')) {
         return next();
+      }
+      if (isStaticModuleOrAssetRequest(req.path)) {
+        return res.status(404).type('text/plain').send('Asset not found');
       }
       res.sendFile(distIndex);
     });
@@ -3519,6 +3598,9 @@ async function startServer() {
     app.get('*', async (req, res, next) => {
       if (req.path.startsWith('/api')) {
         return next();
+      }
+      if (isStaticModuleOrAssetRequest(req.path)) {
+        return res.status(404).type('text/plain').send('Module or asset not found');
       }
       try {
         const indexPath = resolveWorkspacePath('index.html');
