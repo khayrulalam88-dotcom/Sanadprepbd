@@ -318,7 +318,8 @@ export class FirestoreRestClient {
     this.databaseRoot = `projects/${this.projectId}/databases/${this.databaseId}`;
     this.documentsRoot = `${this.databaseRoot}/documents`;
     this.baseUrl = `https://firestore.googleapis.com/v1/${this.documentsRoot}`;
-    this.fetchImpl = options.fetchImpl || fetch;
+    this.fetchImpl =
+      options.fetchImpl || ((input, init) => fetch(input, init));
     this.nowMsFn = options.nowMsFn || (() => Date.now());
   }
 
