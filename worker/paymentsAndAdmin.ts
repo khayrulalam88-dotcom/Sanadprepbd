@@ -1030,10 +1030,17 @@ export async function handlePaymentsAndAdminRoutes(
 
     const ownerClient = firestoreClient.withToken(authUser.idToken);
     const pkgDoc = await ownerClient.getDocument<Record<string, unknown>>('packages', id);
-    if (!pkgDoc) {
+    const baselinePkg = !pkgDoc ? INITIAL_PACKAGES.find(p => p.id === id) : undefined;
+    if (!pkgDoc && !baselinePkg) {
       throw new WorkerHttpError(404, 'PACKAGE_NOT_FOUND', 'Package not found in Firestore.');
     }
-    const existing = pkgDoc as unknown as SubscriptionPackage;
+    const existing: SubscriptionPackage = pkgDoc
+      ? (pkgDoc as unknown as SubscriptionPackage)
+      : {
+          ...baselinePkg!,
+          featuresBn: [...baselinePkg!.featuresBn],
+          featuresEn: [...baselinePkg!.featuresEn]
+        };
 
     if (body.price !== undefined) {
       const parsedPrice = Number(body.price);
@@ -1061,7 +1068,7 @@ export async function handlePaymentsAndAdminRoutes(
       userId: authUser.uid,
       userName: authUser.email || 'Owner Admin',
       action: 'UPDATE_PACKAGE',
-      details: `Updated package ${updatedPkg.nameEn}: Price=${updatedPkg.price}, Duration=${updatedPkg.durationDays}d, Active=${updatedPkg.isActive}`,
+      details: `${pkgDoc ? 'Updated' : 'Created'} package ${updatedPkg.nameEn}: Price=${updatedPkg.price}, Duration=${updatedPkg.durationDays}d, Active=${updatedPkg.isActive}`,
       timestamp: nowIso
     };
 
@@ -1071,7 +1078,7 @@ export async function handlePaymentsAndAdminRoutes(
         collection: 'packages',
         docId: id,
         data: updatedPkg as unknown as Record<string, unknown>,
-        merge: true
+        merge: Boolean(pkgDoc)
       },
       {
         type: 'set',

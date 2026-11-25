@@ -1283,4 +1283,157 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 3 Test Suite', async () => {
     const auditLogsJson = (await auditRes.json()) as { auditLogs: Array<{ action: string }> };
     assert.ok(auditLogsJson.auditLogs.some(l => l.action === 'USER_EDITED_BY_ADMIN'));
   });
+
+  test('5. Owner Admin /api/admin/packages/update: seeds missing predefined package, updates existing package, rejects unknown ID (404), and rejects unauthorized requests (401/403)', async () => {
+    const db = await createMigratedTestD1();
+    const stub = createPhase3FirestoreStub();
+    // Intentionally leave Firestore `packages` collection empty (production scenario)
+    stub.setDoc('config', 'examDate', { ...INITIAL_EXAM_DATE_CONFIG });
+    stub.setDoc('users', 'fake_admin_uid', {
+      uid: 'fake_admin_uid',
+      name: 'Fake Admin',
+      email: 'fake@example.com',
+      role: 'admin',
+      subscriptionStatus: 'free',
+      createdAt: '2026-10-01T00:00:00.000Z'
+    });
+
+    const ownerToken = await makeToken(OWNER_ADMIN_UID, OWNER_ADMIN_EMAIL, 'Khayrul Alam');
+    const studentToken = await makeToken('student_1', 's1@example.com', 'Student One');
+    const fakeAdminToken = await makeToken('fake_admin_uid', 'fake@example.com', 'Fake Admin');
+
+    const handler = createWorkerHandler({
+      jwksFetcher: async () => ({ keys: [keyPair.jwk], maxAgeSeconds: 3600 }),
+      fetchImpl: stub.fetchImpl,
+      nowMsFn: () => baseNowMs
+    });
+    const env: WorkerEnv = {
+      DB: db,
+      ENVIRONMENT: 'production',
+      FIREBASE_PROJECT_ID: EXPECTED_FIREBASE_PROJECT_ID,
+      FIREBASE_DATABASE_ID: EXPECTED_FIREBASE_DATABASE_ID
+    };
+
+    // 1. Unauthorized callers rejected (401 unauthenticated, 403 student & secondary admin)
+    const unauthRes = await handler(
+      new Request('https://s--khayrul-alam.khayrulalam88.workers.dev/api/admin/packages/update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: 'pkg_monthly', price: 200 })
+      }),
+      env
+    );
+    assert.equal(unauthRes.status, 401);
+
+    const studentRes = await handler(
+      new Request('https://s--khayrul-alam.khayrulalam88.workers.dev/api/admin/packages/update', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${studentToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: 'pkg_monthly', price: 200 })
+      }),
+      env
+    );
+    assert.equal(studentRes.status, 403);
+
+    const fakeAdminRes = await handler(
+      new Request('https://s--khayrul-alam.khayrulalam88.workers.dev/api/admin/packages/update', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${fakeAdminToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: 'pkg_monthly', price: 200 })
+      }),
+      env
+    );
+    assert.equal(fakeAdminRes.status, 403);
+    assert.equal(stub.getCol('packages').size, 0);
+
+    // 2. Unknown package ID rejected with HTTP 404 even for Owner Admin
+    const unknownRes = await handler(
+      new Request('https://s--khayrul-alam.khayrulalam88.workers.dev/api/admin/packages/update', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${ownerToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: 'pkg_nonexistent_custom', price: 500 })
+      }),
+      env
+    );
+    assert.equal(unknownRes.status, 404);
+    assert.equal(((await unknownRes.json()) as { error: string }).error, 'PACKAGE_NOT_FOUND');
+    assert.equal(stub.getCol('packages').size, 0);
+
+    // 3. Missing predefined package (`pkg_monthly`) created from baseline + Owner updates
+    const createMonthlyRes = await handler(
+      new Request('https://s--khayrul-alam.khayrulalam88.workers.dev/api/admin/packages/update', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${ownerToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: 'pkg_monthly',
+          price: 200,
+          durationDays: 45,
+          nameEn: 'Attempted Overwrite Ignored'
+        })
+      }),
+      env
+    );
+    assert.equal(createMonthlyRes.status, 200);
+    const createMonthlyJson = (await createMonthlyRes.json()) as {
+      success: boolean;
+      package: {
+        id: string;
+        nameEn: string;
+        price: number;
+        durationDays?: number;
+        isActive: boolean;
+        featuresEn: string[];
+        updatedAt: string;
+      };
+    };
+    assert.equal(createMonthlyJson.success, true);
+    assert.equal(createMonthlyJson.package.id, 'pkg_monthly');
+    assert.equal(createMonthlyJson.package.nameEn, 'Monthly Subscription');
+    assert.equal(createMonthlyJson.package.price, 200);
+    assert.equal(createMonthlyJson.package.durationDays, 45);
+    assert.equal(createMonthlyJson.package.isActive, true);
+    assert.ok(createMonthlyJson.package.featuresEn.length > 0);
+    assert.equal(stub.getCol('packages').get('pkg_monthly')?.price, 200);
+    assert.equal(stub.getCol('packages').get('pkg_monthly')?.durationDays, 45);
+
+    // Also verify missing `pkg_exam_pass` creation syncs config/examDate.examPassPrice
+    const createExamPassRes = await handler(
+      new Request('https://s--khayrul-alam.khayrulalam88.workers.dev/api/admin/packages/update', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${ownerToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: 'pkg_exam_pass', price: 750 })
+      }),
+      env
+    );
+    assert.equal(createExamPassRes.status, 200);
+    assert.equal(stub.getCol('packages').get('pkg_exam_pass')?.price, 750);
+    assert.equal(stub.getCol('config').get('examDate')?.examPassPrice, 750);
+
+    // 4. Updating an existing package preserves existing Firestore fields while applying updates
+    const existingMonthly = stub.getCol('packages').get('pkg_monthly')!;
+    stub.setDoc('packages', 'pkg_monthly', {
+      ...existingMonthly,
+      nameEn: 'Custom Stored Monthly Title'
+    });
+
+    const updateExistingRes = await handler(
+      new Request('https://s--khayrul-alam.khayrulalam88.workers.dev/api/admin/packages/update', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${ownerToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: 'pkg_monthly', price: 250, durationDays: 60 })
+      }),
+      env
+    );
+    assert.equal(updateExistingRes.status, 200);
+    const updateExistingJson = (await updateExistingRes.json()) as {
+      success: boolean;
+      package: { id: string; nameEn: string; price: number; durationDays?: number };
+    };
+    assert.equal(updateExistingJson.package.nameEn, 'Custom Stored Monthly Title');
+    assert.equal(updateExistingJson.package.price, 250);
+    assert.equal(updateExistingJson.package.durationDays, 60);
+    assert.equal(stub.getCol('packages').get('pkg_monthly')?.price, 250);
+    assert.equal(stub.getCol('packages').get('pkg_monthly')?.durationDays, 60);
+  });
 });
+
