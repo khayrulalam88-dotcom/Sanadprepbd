@@ -1,4 +1,3 @@
-import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -7,11 +6,10 @@ export const FIREBASE_PROJECT_ID = 'galvanic-aviary-tzp2g';
 export const FIRESTORE_DATABASE_ID = 'ai-studio-barcouncilmcqpre-9a5aecc8-3819-4aeb-b7e2-c6066b637cab';
 export const OWNER_ADMIN_UID = 'PjBRV7LAQ8cIwOdM3z474A16dWg2';
 export const OWNER_ADMIN_EMAIL = 'khayrulalam88@gmail.com';
-export const MAX_COMMIT_BATCH_SIZE = 200;
-
-export const FIRESTORE_DATABASE_ROOT = `projects/${FIREBASE_PROJECT_ID}/databases/${FIRESTORE_DATABASE_ID}`;
-export const FIRESTORE_DOCUMENTS_ROOT = `${FIRESTORE_DATABASE_ROOT}/documents`;
-export const FIRESTORE_REST_BASE_URL = `https://firestore.googleapis.com/v1/${FIRESTORE_DOCUMENTS_ROOT}`;
+export const DEFAULT_WORKER_BASE_URL = 'https://s--khayrul-alam.khayrulalam88.workers.dev';
+export const MAX_QUESTION_BATCH_COUNT = 75;
+export const MAX_EXAM_BATCH_COUNT = 20;
+export const MAX_BATCH_PAYLOAD_BYTES = 380_000;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -37,24 +35,78 @@ export class SeederError extends Error {
   }
 }
 
+export function normalizeWorkerBaseUrl(rawUrl) {
+  const candidate = String(rawUrl || DEFAULT_WORKER_BASE_URL).trim();
+  let parsed;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    throw new SeederError('INVALID_WORKER_URL', `Invalid Worker URL: "${candidate}".`);
+  }
+  const isLocal = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1';
+  if (parsed.protocol !== 'https:' && !(isLocal && parsed.protocol === 'http:')) {
+    throw new SeederError(
+      'INVALID_WORKER_URL',
+      'Worker URL must use https:// (or http://localhost / http://127.0.0.1 for local tests).'
+    );
+  }
+  return `${parsed.origin}${parsed.pathname.replace(/\/+$/, '')}`;
+}
+
 export function parseCliArgs(argv) {
   const args = argv.filter(Boolean);
-  const dryRun = args.includes('--dry-run');
-  const execute = args.includes('--execute');
-  const help = args.includes('--help') || args.includes('-h');
-  const unknown = args.filter(a => a !== '--dry-run' && a !== '--execute' && a !== '--help' && a !== '-h');
+  let dryRun = false;
+  let execute = false;
+  let help = false;
+  let skipD1Sync = false;
+  let workerUrl;
+  let batchSize;
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--dry-run') {
+      dryRun = true;
+    } else if (arg === '--execute') {
+      execute = true;
+    } else if (arg === '--help' || arg === '-h') {
+      help = true;
+    } else if (arg === '--skip-d1-sync') {
+      skipD1Sync = true;
+    } else if (arg === '--worker-url') {
+      const val = args[i + 1];
+      if (!val || val.startsWith('--')) {
+        return { valid: false, help: false, dryRun: false, execute: false, error: 'Missing value for --worker-url.' };
+      }
+      workerUrl = val;
+      i += 1;
+    } else if (arg.startsWith('--worker-url=')) {
+      workerUrl = arg.slice('--worker-url='.length);
+    } else if (arg === '--batch-size') {
+      const val = Number(args[i + 1]);
+      if (!Number.isInteger(val) || val < 1 || val > 100) {
+        return { valid: false, help: false, dryRun: false, execute: false, error: 'Invalid --batch-size (must be 1..100).' };
+      }
+      batchSize = val;
+      i += 1;
+    } else if (arg.startsWith('--batch-size=')) {
+      const val = Number(arg.slice('--batch-size='.length));
+      if (!Number.isInteger(val) || val < 1 || val > 100) {
+        return { valid: false, help: false, dryRun: false, execute: false, error: 'Invalid --batch-size (must be 1..100).' };
+      }
+      batchSize = val;
+    } else {
+      return {
+        valid: false,
+        help: false,
+        dryRun: false,
+        execute: false,
+        error: `Unknown argument "${arg}". Allowed: --dry-run (default), --execute, --worker-url <url>, --batch-size <1-100>, --skip-d1-sync, --help`
+      };
+    }
+  }
 
   if (help) {
-    return { valid: true, help: true, dryRun: true, execute: false };
-  }
-  if (unknown.length > 0) {
-    return {
-      valid: false,
-      help: false,
-      dryRun: false,
-      execute: false,
-      error: `Unknown argument(s): ${unknown.join(', ')}. Allowed flags: --dry-run (default), --execute, --help`
-    };
+    return { valid: true, help: true, dryRun: true, execute: false, skipD1Sync };
   }
   if (dryRun && execute) {
     return {
@@ -69,7 +121,10 @@ export function parseCliArgs(argv) {
     valid: true,
     help: false,
     dryRun: !execute,
-    execute
+    execute,
+    skipD1Sync,
+    ...(workerUrl ? { workerUrl } : {}),
+    ...(batchSize !== undefined ? { batchSize } : {})
   };
 }
 
@@ -88,6 +143,18 @@ export function validateOwnerIdToken(rawToken, nowMs = Date.now()) {
     throw new SeederError(
       'MISSING_TOKEN',
       'Missing OWNER_FIREBASE_ID_TOKEN environment variable. Set OWNER_FIREBASE_ID_TOKEN before running.'
+    );
+  }
+  if (/^Bearer\s+/i.test(token)) {
+    throw new SeederError(
+      'INVALID_TOKEN',
+      'OWNER_FIREBASE_ID_TOKEN must be the raw Firebase ID token JWT without a "Bearer " prefix.'
+    );
+  }
+  if ((token.startsWith('"') && token.endsWith('"')) || (token.startsWith("'") && token.endsWith("'"))) {
+    throw new SeederError(
+      'INVALID_TOKEN',
+      'OWNER_FIREBASE_ID_TOKEN contains surrounding quotes. Pass the raw JWT without quotes.'
     );
   }
 
@@ -111,12 +178,19 @@ export function validateOwnerIdToken(rawToken, nowMs = Date.now()) {
   const email = String(claims.email || '').trim().toLowerCase();
   const emailVerified = claims.email_verified === true;
   const aud = typeof claims.aud === 'string' ? claims.aud.trim() : '';
+  const iss = typeof claims.iss === 'string' ? claims.iss.trim() : '';
   const expSec = typeof claims.exp === 'number' ? claims.exp : Number(claims.exp);
 
   if (aud && aud !== FIREBASE_PROJECT_ID) {
     throw new SeederError(
       'TOKEN_PROJECT_MISMATCH',
       `Token audience "${aud}" does not match project "${FIREBASE_PROJECT_ID}".`
+    );
+  }
+  if (iss && iss !== `https://securetoken.google.com/${FIREBASE_PROJECT_ID}`) {
+    throw new SeederError(
+      'TOKEN_ISSUER_MISMATCH',
+      `Token issuer "${iss}" does not match Firebase project "${FIREBASE_PROJECT_ID}".`
     );
   }
   if (!Number.isFinite(expSec) || expSec * 1000 <= nowMs) {
@@ -146,171 +220,6 @@ export function validateOwnerIdToken(rawToken, nowMs = Date.now()) {
 
   return { token, uid, email };
 }
-
-// ---------------------------------------------------------
-// Firestore REST v1 Value Codec (mirrors worker/firestoreRest.ts)
-// ---------------------------------------------------------
-
-export function encodeFirestoreValue(value) {
-  if (value === null || value === undefined) {
-    return { nullValue: null };
-  }
-  if (typeof value === 'boolean') {
-    return { booleanValue: value };
-  }
-  if (typeof value === 'number') {
-    if (!Number.isFinite(value)) {
-      return { nullValue: null };
-    }
-    if (Number.isInteger(value) && Number.isSafeInteger(value)) {
-      return { integerValue: String(value) };
-    }
-    return { doubleValue: value };
-  }
-  if (typeof value === 'string') {
-    return { stringValue: value };
-  }
-  if (Array.isArray(value)) {
-    return {
-      arrayValue: {
-        values: value.map(item => encodeFirestoreValue(item))
-      }
-    };
-  }
-  if (typeof value === 'object') {
-    return {
-      mapValue: {
-        fields: encodeDocumentFields(value)
-      }
-    };
-  }
-  return { stringValue: String(value) };
-}
-
-export function encodeDocumentFields(obj) {
-  const fields = {};
-  for (const [k, v] of Object.entries(obj)) {
-    if (v === undefined) continue;
-    fields[k] = encodeFirestoreValue(v);
-  }
-  return fields;
-}
-
-export function decodeFirestoreValue(value) {
-  if (!value || typeof value !== 'object') return undefined;
-  if ('nullValue' in value) return null;
-  if ('booleanValue' in value) return value.booleanValue;
-  if ('integerValue' in value) return Number(value.integerValue);
-  if ('doubleValue' in value) return value.doubleValue;
-  if ('timestampValue' in value) return value.timestampValue;
-  if ('stringValue' in value) return value.stringValue;
-  if ('arrayValue' in value) {
-    return (value.arrayValue.values || []).map(item => decodeFirestoreValue(item));
-  }
-  if ('mapValue' in value) {
-    return decodeDocumentFields(value.mapValue.fields || {});
-  }
-  return undefined;
-}
-
-export function decodeDocumentFields(fields) {
-  if (!fields || typeof fields !== 'object') return {};
-  const result = {};
-  for (const [k, v] of Object.entries(fields)) {
-    result[k] = decodeFirestoreValue(v);
-  }
-  return result;
-}
-
-export function extractDocumentId(resourceName) {
-  const parts = String(resourceName || '').split('/');
-  return parts[parts.length - 1] || '';
-}
-
-// ---------------------------------------------------------
-// Canonical Document Schemas (mirrors worker/questionCache.ts & catalogAndPractice.ts)
-// ---------------------------------------------------------
-
-export function buildSanitizedQuestionDoc(q, fallbackIso) {
-  const difficulty = q.difficulty === 'easy' || q.difficulty === 'hard' ? q.difficulty : 'medium';
-  const status = q.status === 'draft' || q.status === 'reviewed' ? q.status : 'published';
-  const optionsBn = Array.isArray(q.optionsBn) ? q.optionsBn.map(o => String(o ?? '')) : [];
-  const optionsEn =
-    Array.isArray(q.optionsEn) && q.optionsEn.length > 0
-      ? q.optionsEn.map(o => String(o ?? ''))
-      : [...optionsBn];
-
-  return {
-    id: String(q.id).trim(),
-    subjectId: String(q.subjectId).trim(),
-    ...(typeof q.topicId === 'string' && q.topicId.trim() ? { topicId: q.topicId.trim() } : {}),
-    questionBn: String(q.questionBn),
-    questionEn: String(q.questionEn || q.questionBn),
-    optionsBn,
-    optionsEn,
-    legalReference: String(q.legalReference || ''),
-    difficulty,
-    status,
-    isDemoSample: Boolean(q.isDemoSample),
-    createdAt: String(q.createdAt || fallbackIso),
-    updatedAt: String(q.updatedAt || fallbackIso),
-    ...(typeof q.createdBy === 'string' && q.createdBy.trim() ? { createdBy: q.createdBy.trim() } : {})
-  };
-}
-
-export function buildQuestionKeyDoc(q, fallbackIso) {
-  return {
-    correctOptionIndex: Number(q.correctOptionIndex),
-    explanationBn: String(q.explanationBn || ''),
-    explanationEn: String(q.explanationEn || ''),
-    legalReference: String(q.legalReference || ''),
-    updatedAt: String(q.updatedAt || fallbackIso)
-  };
-}
-
-export function buildExamDoc(exam, fallbackIso) {
-  return {
-    id: String(exam.id).trim(),
-    titleBn: String(exam.titleBn),
-    titleEn: String(exam.titleEn || exam.titleBn),
-    descriptionBn: String(exam.descriptionBn || ''),
-    descriptionEn: String(exam.descriptionEn || ''),
-    type: String(exam.type || 'full_mock'),
-    durationMinutes: Number(exam.durationMinutes || 60),
-    totalMarks: Number(exam.totalMarks || 100),
-    passThresholdPercentage: Number(exam.passThresholdPercentage ?? 50),
-    questionIds: Array.isArray(exam.questionIds) ? exam.questionIds.map(String) : [],
-    isPaid: Boolean(exam.isPaid),
-    isActive:
-      exam.isActive !== undefined
-        ? Boolean(exam.isActive)
-        : !exam.isPaid || String(exam.id).trim() === 'exam_model_test_01',
-    published: Boolean(exam.published),
-    releaseExplanationsImmediately: exam.releaseExplanationsImmediately ?? true,
-    subjectId: exam.subjectId ?? null,
-    negativeMarkRatio: Number(exam.negativeMarkRatio ?? 0.25),
-    positiveMarkRatio: Number(exam.positiveMarkRatio ?? 1.0),
-    createdAt: String(exam.createdAt || fallbackIso),
-    updatedAt: String(exam.updatedAt || fallbackIso),
-    scheduledDate: exam.scheduledDate ?? null
-  };
-}
-
-export function createQuestionBankVersionPayload(nowMs = Date.now(), updatedAt = new Date(nowMs).toISOString()) {
-  const randomSuffix =
-    typeof crypto.randomUUID === 'function'
-      ? crypto.randomUUID().slice(0, 6)
-      : Math.random().toString(36).slice(2, 8);
-  return {
-    version: nowMs * 1000 + 1,
-    versionToken: `${nowMs}_1_${randomSuffix}`,
-    updatedAt
-  };
-}
-
-// ---------------------------------------------------------
-// Source Loading & Validation
-// ---------------------------------------------------------
 
 export function loadAndValidateSources(options = {}) {
   const questionsPath =
@@ -397,243 +306,117 @@ export function loadAndValidateSources(options = {}) {
   return { questions: rawQuestions, exams: rawExams };
 }
 
-// ---------------------------------------------------------
-// Firestore REST Client Operations (Read & Create-Only Commit)
-// ---------------------------------------------------------
+export function buildBoundedPayloadChunks(items, fieldName, dryRun, maxCount, maxBytes = MAX_BATCH_PAYLOAD_BYTES) {
+  const chunks = [];
+  let current = [];
 
-function parseFirestoreErrorPayload(rawText, status) {
-  try {
-    const parsed = JSON.parse(rawText);
-    const err = parsed?.error;
-    if (err) {
-      return {
-        statusText: String(err.status || `HTTP_${status}`),
-        message: sanitizeDiagnosticMessage(err.message || `Firestore REST failed (${status})`)
-      };
+  for (const item of items) {
+    const candidate = [...current, item];
+    const candidateJson = JSON.stringify({ dryRun, [fieldName]: candidate });
+    const exceedsCount = candidate.length > maxCount;
+    const exceedsBytes = Buffer.byteLength(candidateJson, 'utf8') > maxBytes;
+
+    if (current.length > 0 && (exceedsCount || exceedsBytes)) {
+      chunks.push(current);
+      current = [item];
+    } else {
+      current = candidate;
     }
-  } catch {
-    // Non-JSON body
   }
-  return {
-    statusText: `HTTP_${status}`,
-    message: sanitizeDiagnosticMessage(rawText || `Firestore REST failed (${status})`)
-  };
+
+  if (current.length > 0) {
+    chunks.push(current);
+  }
+  return chunks;
 }
 
-export async function listCollectionDocumentsRest(fetchImpl, token, collectionName, options = {}) {
-  const cleanCollection = collectionName.replace(/^\/+|\/+$/g, '');
-  const pageSize = Math.min(500, Math.max(1, Math.floor(options.pageSize ?? 500)));
-  const maxPages = Math.min(200, Math.max(1, Math.floor(options.maxPages ?? 100)));
-  const docs = [];
-  let pageToken = '';
-  let pagesFetched = 0;
+async function callWorkerSeedApi(fetchImpl, url, token, body, options = {}) {
+  const sleepFn = options.sleepFn || (ms => new Promise(resolve => setTimeout(resolve, ms)));
+  const maxRetries = options.maxRetries ?? 3;
 
-  for (let page = 0; page < maxPages; page++) {
-    const params = new URLSearchParams({ pageSize: String(pageSize) });
-    if (pageToken) {
-      params.set('pageToken', pageToken);
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    let res;
+    try {
+      res = await fetchImpl(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json'
+        },
+        body: JSON.stringify(body)
+      });
+    } catch (err) {
+      throw new SeederError(
+        'WORKER_NETWORK_ERROR',
+        `Network error calling Worker endpoint ${url}: ${err instanceof Error ? err.message : String(err)}`
+      );
     }
-    const url = `${FIRESTORE_REST_BASE_URL}/${cleanCollection}?${params.toString()}`;
-    const res = await fetchImpl(url, {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: 'application/json'
-      }
-    });
 
-    const text = await res.text();
-    if (!res.ok) {
-      const { statusText, message } = parseFirestoreErrorPayload(text, res.status);
-      if (res.status === 401 || res.status === 403 || statusText === 'PERMISSION_DENIED') {
+    const rawText = await res.text();
+    let parsed = {};
+    if (rawText) {
+      try {
+        parsed = JSON.parse(rawText);
+      } catch {
         throw new SeederError(
-          'OWNER_AUTH_REJECTED',
-          `Firestore rejected Owner authorization reading /${cleanCollection} (${res.status} ${statusText}): ${message}`
+          'WORKER_NON_JSON',
+          `Worker endpoint returned non-JSON HTTP ${res.status}.`
         );
       }
-      throw new SeederError(
-        'FIRESTORE_READ_FAILED',
-        `Failed reading /${cleanCollection} (${res.status} ${statusText}): ${message}`
-      );
     }
 
-    const data = text ? JSON.parse(text) : {};
-    pagesFetched += 1;
-    for (const doc of data.documents || []) {
-      docs.push({
-        id: extractDocumentId(doc.name),
-        ...decodeDocumentFields(doc.fields)
-      });
+    if (res.status === 429 && attempt < maxRetries) {
+      const retryAfterHdr = Number(res.headers?.get?.('retry-after') || parsed.retryAfterSeconds || '5');
+      const waitMs = Math.min(65_000, Math.max(1000, (Number.isFinite(retryAfterHdr) ? retryAfterHdr : 5) * 1000 + 250));
+      await sleepFn(waitMs);
+      continue;
     }
 
-    if (!data.nextPageToken) {
-      return { docs, pagesFetched };
-    }
-    pageToken = String(data.nextPageToken);
-  }
-
-  throw new SeederError(
-    'PAGINATION_LIMIT_EXCEEDED',
-    `Collection /${cleanCollection} exceeded maxPages=${maxPages} pagination limit.`
-  );
-}
-
-export async function getDocumentRest(fetchImpl, token, collectionName, docId) {
-  const cleanCollection = collectionName.replace(/^\/+|\/+$/g, '');
-  const url = `${FIRESTORE_REST_BASE_URL}/${cleanCollection}/${encodeURIComponent(docId)}`;
-  const res = await fetchImpl(url, {
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: 'application/json'
-    }
-  });
-
-  if (res.status === 404) {
-    return null;
-  }
-
-  const text = await res.text();
-  if (!res.ok) {
-    const { statusText, message } = parseFirestoreErrorPayload(text, res.status);
-    if (res.status === 401 || res.status === 403 || statusText === 'PERMISSION_DENIED') {
+    if (res.status === 401 || res.status === 403 || parsed.error === 'PERMISSION_DENIED') {
       throw new SeederError(
         'OWNER_AUTH_REJECTED',
-        `Firestore rejected Owner authorization reading /${cleanCollection}/${docId} (${res.status} ${statusText}): ${message}`
+        `Worker/Firestore rejected Owner authorization (${res.status} ${parsed.error || ''}): ${parsed.message || 'Forbidden'}`
       );
     }
-    throw new SeederError(
-      'FIRESTORE_READ_FAILED',
-      `Failed reading /${cleanCollection}/${docId} (${res.status} ${statusText}): ${message}`
-    );
-  }
 
-  const doc = text ? JSON.parse(text) : {};
-  return {
-    id: extractDocumentId(doc.name || docId),
-    ...decodeDocumentFields(doc.fields)
-  };
-}
-
-export function buildCreateOnlyWriteOp(collection, docId, data) {
-  const cleanCollection = collection.replace(/^\/+|\/+$/g, '');
-  return {
-    update: {
-      name: `${FIRESTORE_DOCUMENTS_ROOT}/${cleanCollection}/${encodeURIComponent(docId)}`,
-      fields: encodeDocumentFields(data)
-    },
-    currentDocument: { exists: false }
-  };
-}
-
-async function commitCreateBatchRest(fetchImpl, token, writes) {
-  const res = await fetchImpl(`${FIRESTORE_REST_BASE_URL}:commit`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-      Accept: 'application/json'
-    },
-    body: JSON.stringify({ writes })
-  });
-
-  const text = await res.text();
-  if (!res.ok) {
-    const { statusText, message } = parseFirestoreErrorPayload(text, res.status);
-    if (res.status === 401 || res.status === 403 || statusText === 'PERMISSION_DENIED') {
+    if (res.status === 409 || parsed.error === 'CONFLICT_DETECTED') {
       throw new SeederError(
-        'OWNER_AUTH_REJECTED',
-        `Firestore rejected Owner authorization during commit (${res.status} ${statusText}): ${message}`
+        'CONFLICT_DETECTED',
+        parsed.message || `Conflict detected during seeding (${res.status}).`,
+        parsed
       );
     }
-    throw new SeederError(
-      'FIRESTORE_COMMIT_FAILED',
-      `Firestore commit failed (${res.status} ${statusText}): ${message}`
-    );
+
+    if (!res.ok) {
+      throw new SeederError(
+        parsed.error || 'WORKER_REQUEST_FAILED',
+        `Worker request failed (${res.status} ${parsed.error || ''}): ${parsed.message || rawText || 'Unknown error'}`,
+        parsed
+      );
+    }
+
+    return parsed;
   }
-  return text ? JSON.parse(text) : {};
+
+  throw new SeederError('RATE_LIMITED', 'Worker rate limit retries exhausted.');
 }
-
-// ---------------------------------------------------------
-// Conflict Comparison Helpers
-// ---------------------------------------------------------
-
-function arraysEqual(a, b) {
-  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    if (a[i] !== b[i]) return false;
-  }
-  return true;
-}
-
-function findQuestionConflictReason(existing, expected) {
-  if (
-    'correctOptionIndex' in existing ||
-    'explanationBn' in existing ||
-    'explanationEn' in existing
-  ) {
-    return 'Existing /questions doc contains embedded answer key or explanation fields.';
-  }
-  if (String(existing.subjectId ?? '') !== expected.subjectId) return 'subjectId mismatch';
-  if (String(existing.questionBn ?? '') !== expected.questionBn) return 'questionBn mismatch';
-  if (String(existing.questionEn ?? '') !== expected.questionEn) return 'questionEn mismatch';
-  if (!arraysEqual(existing.optionsBn, expected.optionsBn)) return 'optionsBn mismatch';
-  if (!arraysEqual(existing.optionsEn, expected.optionsEn)) return 'optionsEn mismatch';
-  if (String(existing.legalReference ?? '') !== expected.legalReference) return 'legalReference mismatch';
-  if (String(existing.difficulty ?? 'medium') !== expected.difficulty) return 'difficulty mismatch';
-  if (String(existing.status ?? 'published') !== expected.status) return 'status mismatch';
-  if (Boolean(existing.isDemoSample) !== expected.isDemoSample) return 'isDemoSample mismatch';
-  if ((existing.topicId ?? null) !== (expected.topicId ?? null)) return 'topicId mismatch';
-  return null;
-}
-
-function findQuestionKeyConflictReason(existing, expected) {
-  if (Number(existing.correctOptionIndex) !== expected.correctOptionIndex) {
-    return 'correctOptionIndex mismatch';
-  }
-  if (String(existing.explanationBn ?? '') !== expected.explanationBn) {
-    return 'explanationBn mismatch';
-  }
-  if (String(existing.explanationEn ?? '') !== expected.explanationEn) {
-    return 'explanationEn mismatch';
-  }
-  if (String(existing.legalReference ?? '') !== expected.legalReference) {
-    return 'legalReference mismatch';
-  }
-  return null;
-}
-
-function findExamConflictReason(existing, expected) {
-  // Preserve admin-customizable fields (isActive, scheduledDate, isPaid, published, passThresholdPercentage),
-  // while flagging structural identity mismatches as conflicts.
-  if (String(existing.type ?? 'full_mock') !== expected.type) return 'type mismatch';
-  if (Number(existing.durationMinutes) !== expected.durationMinutes) return 'durationMinutes mismatch';
-  if (Number(existing.totalMarks) !== expected.totalMarks) return 'totalMarks mismatch';
-  if ((existing.subjectId ?? null) !== (expected.subjectId ?? null)) return 'subjectId mismatch';
-  if (!arraysEqual(existing.questionIds, expected.questionIds)) return 'questionIds mismatch';
-  return null;
-}
-
-function chunkItems(items, maxSize = MAX_COMMIT_BATCH_SIZE) {
-  const out = [];
-  for (let i = 0; i < items.length; i += maxSize) {
-    out.push(items.slice(i, i + maxSize));
-  }
-  return out;
-}
-
-// ---------------------------------------------------------
-// Core Inspection, Planning & Execution
-// ---------------------------------------------------------
 
 export async function runSeedFirestoreKeyless(options = {}) {
   const mode = options.execute === true ? 'execute' : 'dry-run';
+  const dryRun = mode === 'dry-run';
   const nowMs = typeof options.nowMs === 'number' ? options.nowMs : Date.now();
-  const nowIso = new Date(nowMs).toISOString();
   const fetchImpl = options.fetchImpl || fetch;
-  const batchSize = Math.min(
-    MAX_COMMIT_BATCH_SIZE,
-    Math.max(1, Math.floor(options.batchSize ?? MAX_COMMIT_BATCH_SIZE))
+  const workerBaseUrl = normalizeWorkerBaseUrl(
+    options.workerUrl || process.env.SANAD_WORKER_URL || DEFAULT_WORKER_BASE_URL
+  );
+  const questionBatchMax = Math.min(
+    100,
+    Math.max(1, Math.floor(options.batchSize ?? MAX_QUESTION_BATCH_COUNT))
+  );
+  const examBatchMax = Math.min(
+    50,
+    Math.max(1, Math.floor(options.examBatchSize ?? MAX_EXAM_BATCH_COUNT))
   );
 
   const rawToken =
@@ -642,117 +425,175 @@ export async function runSeedFirestoreKeyless(options = {}) {
 
   const { questions, exams } = loadAndValidateSources(options);
 
-  const [questionsRes, keysRes, examsRes, versionDoc] = await Promise.all([
-    listCollectionDocumentsRest(fetchImpl, token, 'questions', { pageSize: options.pageSize }),
-    listCollectionDocumentsRest(fetchImpl, token, 'questionKeys', { pageSize: options.pageSize }),
-    listCollectionDocumentsRest(fetchImpl, token, 'exams', { pageSize: options.pageSize }),
-    getDocumentRest(fetchImpl, token, 'config', 'questionBankVersion')
-  ]);
+  const questionChunks = buildBoundedPayloadChunks(
+    questions,
+    'questions',
+    dryRun,
+    questionBatchMax,
+    options.maxPayloadBytes ?? MAX_BATCH_PAYLOAD_BYTES
+  );
+  const examChunks = buildBoundedPayloadChunks(
+    exams,
+    'exams',
+    dryRun,
+    examBatchMax,
+    options.maxPayloadBytes ?? MAX_BATCH_PAYLOAD_BYTES
+  );
 
-  const existingQuestionsMap = new Map(questionsRes.docs.map(d => [d.id, d]));
-  const existingKeysMap = new Map(keysRes.docs.map(d => [d.id, d]));
-  const existingExamsMap = new Map(examsRes.docs.map(d => [d.id, d]));
+  const totalPlannedDataBatches = questionChunks.length + examChunks.length;
+  const batchEndpoint = `${workerBaseUrl}/api/admin/seed/question-bank/batch`;
+  const finalizeEndpoint = `${workerBaseUrl}/api/admin/seed/question-bank/finalize`;
+  const syncCacheEndpoint = `${workerBaseUrl}/api/admin/questions/sync-cache`;
 
+  const existingCounts = { questions: 0, questionKeys: 0, exams: 0, questionBankVersionExists: false };
+  const matchingCounts = { questions: 0, questionKeys: 0, exams: 0 };
+  const wouldCreate = { questions: 0, questionKeys: 0, exams: 0, versionDocument: 0, total: 0 };
   const conflicts = [];
-  const matching = { questions: [], questionKeys: [], exams: [] };
-  const missingQuestionOps = [];
-  const missingKeyOps = [];
-  const missingExamOps = [];
 
-  for (const q of questions) {
-    const qId = String(q.id).trim();
-    const sanitized = buildSanitizedQuestionDoc(q, nowIso);
-    const existingQ = existingQuestionsMap.get(qId);
-    if (!existingQ) {
-      missingQuestionOps.push(buildCreateOnlyWriteOp('questions', qId, sanitized));
-    } else {
-      const reason = findQuestionConflictReason(existingQ, sanitized);
-      if (reason) {
-        conflicts.push({ collection: 'questions', docId: qId, reason });
-      } else {
-        matching.questions.push(qId);
+  let batchesSucceeded = 0;
+  let writesCommitted = 0;
+
+  const processBatch = async (phase, phaseBatchNumber, batchIndex, payload) => {
+    try {
+      const res = await callWorkerSeedApi(fetchImpl, batchEndpoint, token, payload, {
+        sleepFn: options.sleepFn
+      });
+
+      existingCounts.questions += Number(res.existing?.questions || 0);
+      existingCounts.questionKeys += Number(res.existing?.questionKeys || 0);
+      existingCounts.exams += Number(res.existing?.exams || 0);
+
+      matchingCounts.questions += Number(res.matching?.questions || 0);
+      matchingCounts.questionKeys += Number(res.matching?.questionKeys || 0);
+      matchingCounts.exams += Number(res.matching?.exams || 0);
+
+      wouldCreate.questions += Number(res.wouldCreate?.questions || 0);
+      wouldCreate.questionKeys += Number(res.wouldCreate?.questionKeys || 0);
+      wouldCreate.exams += Number(res.wouldCreate?.exams || 0);
+
+      if (Array.isArray(res.conflicts) && res.conflicts.length > 0) {
+        conflicts.push(...res.conflicts);
       }
-    }
 
-    const keyDoc = buildQuestionKeyDoc(q, nowIso);
-    const existingKey = existingKeysMap.get(qId);
-    if (!existingKey) {
-      missingKeyOps.push(buildCreateOnlyWriteOp('questionKeys', qId, keyDoc));
-    } else {
-      const reason = findQuestionKeyConflictReason(existingKey, keyDoc);
-      if (reason) {
-        conflicts.push({ collection: 'questionKeys', docId: qId, reason });
-      } else {
-        matching.questionKeys.push(qId);
+      if (!dryRun) {
+        batchesSucceeded += 1;
+        writesCommitted += Number(res.writesCommitted || 0);
       }
-    }
-  }
-
-  for (const exam of exams) {
-    const exId = String(exam.id).trim();
-    const examDoc = buildExamDoc(exam, nowIso);
-    const existingExam = existingExamsMap.get(exId);
-    if (!existingExam) {
-      missingExamOps.push(buildCreateOnlyWriteOp('exams', exId, examDoc));
-    } else {
-      const reason = findExamConflictReason(existingExam, examDoc);
-      if (reason) {
-        conflicts.push({ collection: 'exams', docId: exId, reason });
-      } else {
-        matching.exams.push(exId);
+    } catch (err) {
+      const baseDetails = err instanceof SeederError && err.details ? err.details : {};
+      if (Array.isArray(baseDetails.conflicts)) {
+        conflicts.push(...baseDetails.conflicts);
       }
+      const partialSummary = {
+        mode,
+        workerBaseUrl,
+        projectId: FIREBASE_PROJECT_ID,
+        databaseId: FIRESTORE_DATABASE_ID,
+        partialExecution: batchesSucceeded > 0,
+        batchesSucceeded,
+        writesCommitted,
+        conflicts,
+        safeToExecute: false,
+        failedBatch: {
+          batchNumber: batchIndex + 1,
+          totalBatches: totalPlannedDataBatches + 1,
+          phase,
+          phaseBatchNumber,
+          error: sanitizeDiagnosticMessage(err instanceof Error ? err.message : String(err))
+        }
+      };
+
+      if (err instanceof SeederError && err.code === 'CONFLICT_DETECTED') {
+        throw new SeederError(
+          'CONFLICT_DETECTED',
+          `Aborting ${mode}: ${conflicts.length} conflict(s) detected in batch ${batchIndex + 1}. Remaining batches and config/questionBankVersion were NOT written.`,
+          partialSummary
+        );
+      }
+      if (err instanceof SeederError && err.code === 'OWNER_AUTH_REJECTED') {
+        throw err;
+      }
+
+      throw new SeederError(
+        err instanceof SeederError ? err.code : 'BATCH_COMMIT_FAILED',
+        `Execution stopped at batch ${batchIndex + 1}/${totalPlannedDataBatches + 1} (${phase} #${phaseBatchNumber}). ${batchesSucceeded} batch(es) (${writesCommitted} writes) committed before failure; remaining batches and config/questionBankVersion were NOT written.`,
+        partialSummary
+      );
     }
-  }
+  };
 
-  const dataWritesPlanned =
-    missingQuestionOps.length + missingKeyOps.length + missingExamOps.length;
-
-  let versionDocumentStatus;
-  let versionPayload = null;
-  let versionBatchOps = [];
-
-  if (!versionDoc) {
-    versionDocumentStatus = 'missing (will create last)';
-    versionPayload =
-      options.versionPayload || createQuestionBankVersionPayload(nowMs, nowIso);
-    versionBatchOps = [buildCreateOnlyWriteOp('config', 'questionBankVersion', versionPayload)];
-  } else if (dataWritesPlanned > 0) {
-    versionDocumentStatus = `exists (versionToken=${String(versionDoc.versionToken || versionDoc.version || 'unknown')})`;
-    conflicts.push({
-      collection: 'config',
-      docId: 'questionBankVersion',
-      reason:
-        'config/questionBankVersion already exists while missing documents remain; create-only seeder will not overwrite existing version document.'
+  let batchIdx = 0;
+  for (let i = 0; i < questionChunks.length; i++) {
+    await processBatch('questions+questionKeys', i + 1, batchIdx++, {
+      dryRun,
+      questions: questionChunks[i]
     });
-  } else {
-    versionDocumentStatus = `exists (versionToken=${String(versionDoc.versionToken || versionDoc.version || 'unknown')}, up-to-date)`;
+  }
+  for (let i = 0; i < examChunks.length; i++) {
+    await processBatch('exams', i + 1, batchIdx++, {
+      dryRun,
+      exams: examChunks[i]
+    });
   }
 
-  const questionBatches = chunkItems(missingQuestionOps, batchSize).map((writes, idx) => ({
-    phase: 'questions',
-    phaseBatchNumber: idx + 1,
-    writes
-  }));
-  const keyBatches = chunkItems(missingKeyOps, batchSize).map((writes, idx) => ({
-    phase: 'questionKeys',
-    phaseBatchNumber: idx + 1,
-    writes
-  }));
-  const examBatches = chunkItems(missingExamOps, batchSize).map((writes, idx) => ({
-    phase: 'exams',
-    phaseBatchNumber: idx + 1,
-    writes
-  }));
-  const versionBatches =
-    versionBatchOps.length > 0 && conflicts.length === 0
-      ? [{ phase: 'config/questionBankVersion', phaseBatchNumber: 1, writes: versionBatchOps }]
-      : [];
+  const dataWritesTotal = wouldCreate.questions + wouldCreate.questionKeys + wouldCreate.exams;
+  if (dryRun && conflicts.length > 0) {
+    // Still check version doc status in dry-run safely
+  }
 
-  const plannedBatches = [...questionBatches, ...keyBatches, ...examBatches, ...versionBatches];
-  const safeToExecute = conflicts.length === 0;
+  let versionRes = {};
+  if (dryRun || conflicts.length === 0) {
+    versionRes = await callWorkerSeedApi(
+      fetchImpl,
+      finalizeEndpoint,
+      token,
+      {
+        dryRun,
+        pendingDataWrites: dryRun ? dataWritesTotal : writesCommitted,
+        questionsCreated: wouldCreate.questions,
+        questionKeysCreated: wouldCreate.questionKeys,
+        examsCreated: wouldCreate.exams
+      },
+      { sleepFn: options.sleepFn }
+    );
+  }
 
-  const summary = {
+  existingCounts.questionBankVersionExists = Boolean(versionRes.versionExists);
+  if (Array.isArray(versionRes.conflicts) && versionRes.conflicts.length > 0) {
+    conflicts.push(...versionRes.conflicts);
+  }
+
+  const versionDocPlanned = versionRes.versionExists ? 0 : 1;
+  wouldCreate.versionDocument = versionDocPlanned;
+  wouldCreate.total = dataWritesTotal + versionDocPlanned;
+
+  if (!dryRun) {
+    writesCommitted += Number(versionRes.writesCommitted || 0);
+    if (Number(versionRes.writesCommitted || 0) > 0) {
+      batchesSucceeded += 1;
+    }
+  }
+
+  let d1SyncResult = null;
+  if (!dryRun && options.syncD1 !== false) {
+    try {
+      d1SyncResult = await callWorkerSeedApi(fetchImpl, syncCacheEndpoint, token, {}, {
+        sleepFn: options.sleepFn
+      });
+    } catch (err) {
+      d1SyncResult = {
+        success: false,
+        error: sanitizeDiagnosticMessage(err instanceof Error ? err.message : String(err))
+      };
+    }
+  }
+
+  const safeToExecute = conflicts.length === 0 && (dryRun ? versionRes.safeToExecute !== false : true);
+
+  return {
     mode,
+    authPath: 'worker-owner-id-token-via-batchGet-and-commit',
+    workerBaseUrl,
     projectId: FIREBASE_PROJECT_ID,
     databaseId: FIRESTORE_DATABASE_ID,
     sourceCounts: {
@@ -760,114 +601,42 @@ export async function runSeedFirestoreKeyless(options = {}) {
       questionKeys: questions.length,
       exams: exams.length
     },
-    existingFirestoreCounts: {
-      questions: existingQuestionsMap.size,
-      questionKeys: existingKeysMap.size,
-      exams: existingExamsMap.size,
-      questionBankVersionExists: Boolean(versionDoc)
-    },
-    paginationPagesRead: {
-      questions: questionsRes.pagesFetched,
-      questionKeys: keysRes.pagesFetched,
-      exams: examsRes.pagesFetched
-    },
-    matchingCounts: {
-      questions: matching.questions.length,
-      questionKeys: matching.questionKeys.length,
-      exams: matching.exams.length
-    },
-    wouldCreate: {
-      questions: missingQuestionOps.length,
-      questionKeys: missingKeyOps.length,
-      exams: missingExamOps.length,
-      versionDocument: versionBatches.length,
-      total: dataWritesPlanned + versionBatches.length
-    },
+    existingFirestoreCounts: existingCounts,
+    matchingCounts,
+    wouldCreate,
     conflicts,
-    versionDocumentStatus,
-    ...(versionPayload ? { plannedVersionToken: versionPayload.versionToken } : {}),
+    versionDocumentStatus:
+      String(versionRes.versionDocumentStatus || (existingCounts.questionBankVersionExists ? 'exists' : 'missing')),
+    ...(versionRes.plannedVersionToken ? { plannedVersionToken: versionRes.plannedVersionToken } : {}),
+    ...(versionRes.versionToken ? { versionToken: versionRes.versionToken } : {}),
     plannedCommitBatches: {
-      questions: questionBatches.length,
-      questionKeys: keyBatches.length,
-      exams: examBatches.length,
-      versionDocument: versionBatches.length,
-      total: plannedBatches.length,
-      maxBatchSize: batchSize
+      questionsAndKeys: questionChunks.length,
+      exams: examChunks.length,
+      versionDocument: versionDocPlanned,
+      total: totalPlannedDataBatches + versionDocPlanned,
+      maxQuestionBatchSize: questionBatchMax,
+      maxExamBatchSize: examBatchMax
     },
     safeToExecute,
-    executed: false,
-    batchesSucceeded: 0,
-    writesCommitted: 0
-  };
-
-  if (mode === 'dry-run') {
-    return summary;
-  }
-
-  if (!safeToExecute) {
-    throw new SeederError(
-      'CONFLICT_DETECTED',
-      `Aborting --execute: ${conflicts.length} conflict(s) detected during pre-flight inspection. Zero writes committed.`,
-      summary
-    );
-  }
-
-  if (plannedBatches.length === 0) {
-    return { ...summary, executed: true };
-  }
-
-  let batchesSucceeded = 0;
-  let writesCommitted = 0;
-
-  for (let i = 0; i < plannedBatches.length; i++) {
-    const batch = plannedBatches[i];
-    try {
-      await commitCreateBatchRest(fetchImpl, token, batch.writes);
-      batchesSucceeded += 1;
-      writesCommitted += batch.writes.length;
-    } catch (err) {
-      const partialSummary = {
-        ...summary,
-        executed: false,
-        partialExecution: batchesSucceeded > 0,
-        batchesSucceeded,
-        writesCommitted,
-        failedBatch: {
-          batchNumber: i + 1,
-          totalBatches: plannedBatches.length,
-          phase: batch.phase,
-          phaseBatchNumber: batch.phaseBatchNumber,
-          writeCount: batch.writes.length,
-          error: sanitizeDiagnosticMessage(err instanceof Error ? err.message : String(err))
-        }
-      };
-      throw new SeederError(
-        err instanceof SeederError ? err.code : 'BATCH_COMMIT_FAILED',
-        `Execution stopped at batch ${i + 1}/${plannedBatches.length} (${batch.phase} #${batch.phaseBatchNumber}). ${batchesSucceeded} batch(es) (${writesCommitted} writes) committed before failure; remaining batches and config/questionBankVersion were NOT written.`,
-        partialSummary
-      );
-    }
-  }
-
-  return {
-    ...summary,
-    executed: true,
+    executed: !dryRun,
     batchesSucceeded,
-    writesCommitted
+    writesCommitted,
+    ...(d1SyncResult ? { d1SyncResult } : {})
   };
 }
 
 function formatReport(report) {
   const lines = [
-    `=== Sanad Prep BD: Keyless Firestore REST Seeder (${report.mode.toUpperCase()}) ===`,
-    `Target: ${report.projectId} / ${report.databaseId}`,
+    `=== Sanad Prep BD: Worker-Mediated Keyless Firestore Seeder (${report.mode.toUpperCase()}) ===`,
+    `Worker URL: ${report.workerBaseUrl}`,
+    `Target Firebase: ${report.projectId} / ${report.databaseId}`,
     `Source counts -> questions: ${report.sourceCounts.questions}, questionKeys: ${report.sourceCounts.questionKeys}, exams: ${report.sourceCounts.exams}`,
     `Existing Firestore counts -> questions: ${report.existingFirestoreCounts.questions}, questionKeys: ${report.existingFirestoreCounts.questionKeys}, exams: ${report.existingFirestoreCounts.exams}, config/questionBankVersion: ${report.existingFirestoreCounts.questionBankVersionExists ? 'exists' : 'missing'}`,
     `Matching preserved IDs -> questions: ${report.matchingCounts.questions}, questionKeys: ${report.matchingCounts.questionKeys}, exams: ${report.matchingCounts.exams}`,
     `Documents to create (exists=false) -> questions: ${report.wouldCreate.questions}, questionKeys: ${report.wouldCreate.questionKeys}, exams: ${report.wouldCreate.exams}, config/questionBankVersion: ${report.wouldCreate.versionDocument} (total: ${report.wouldCreate.total})`,
     `Conflicting documents: ${report.conflicts.length}`,
     `Version document status: ${report.versionDocumentStatus}`,
-    `Planned commit batches (max ${report.plannedCommitBatches.maxBatchSize}/batch) -> questions: ${report.plannedCommitBatches.questions}, questionKeys: ${report.plannedCommitBatches.questionKeys}, exams: ${report.plannedCommitBatches.exams}, versionDoc: ${report.plannedCommitBatches.versionDocument}, total: ${report.plannedCommitBatches.total}`,
+    `Worker batches -> questions+keys: ${report.plannedCommitBatches.questionsAndKeys} (<= ${report.plannedCommitBatches.maxQuestionBatchSize}/batch), exams: ${report.plannedCommitBatches.exams}, finalize: ${report.plannedCommitBatches.versionDocument}, total: ${report.plannedCommitBatches.total}`,
     `Safe to execute: ${report.safeToExecute}`
   ];
 
@@ -879,11 +648,20 @@ function formatReport(report) {
   }
 
   if (report.mode === 'dry-run') {
-    lines.push('[DRY-RUN COMPLETE] Zero Firestore write requests were sent.');
+    lines.push('[DRY-RUN COMPLETE] Zero Firestore write requests were executed.');
   } else if (report.executed) {
     lines.push(
-      `[EXECUTED] Committed ${report.writesCommitted} create-only writes across ${report.batchesSucceeded} batch(es).`
+      `[EXECUTED] Committed ${report.writesCommitted} create-only writes across ${report.batchesSucceeded} Worker batch(es).`
     );
+    if (report.d1SyncResult) {
+      if (report.d1SyncResult.success) {
+        lines.push(
+          `[D1 SYNC COMPLETE] Synced ${report.d1SyncResult.questionCount} questions, ${report.d1SyncResult.keyCount} keys, ${report.d1SyncResult.examsCount} exams to D1.`
+        );
+      } else {
+        lines.push(`[D1 SYNC WARNING] Firestore seeded, but D1 /sync-cache returned: ${report.d1SyncResult.error}`);
+      }
+    }
   }
 
   return lines.join('\n');
@@ -894,8 +672,9 @@ async function main() {
   if (parsed.help) {
     console.log(
       'Usage:\n' +
-        '  node scripts/seedFirestoreKeyless.mjs [--dry-run]   # Read-only inspection (default)\n' +
-        '  node scripts/seedFirestoreKeyless.mjs --execute     # Create missing docs only (requires OWNER_FIREBASE_ID_TOKEN)'
+        '  node scripts/seedFirestoreKeyless.mjs [--dry-run] [--worker-url <url>]\n' +
+        '  node scripts/seedFirestoreKeyless.mjs --execute [--worker-url <url>] [--skip-d1-sync]\n' +
+        'Requires OWNER_FIREBASE_ID_TOKEN environment variable (raw JWT, no quotes or Bearer prefix).'
     );
     return;
   }
@@ -906,7 +685,12 @@ async function main() {
   }
 
   try {
-    const report = await runSeedFirestoreKeyless({ execute: parsed.execute });
+    const report = await runSeedFirestoreKeyless({
+      execute: parsed.execute,
+      workerUrl: parsed.workerUrl,
+      batchSize: parsed.batchSize,
+      syncD1: !parsed.skipD1Sync
+    });
     console.log(formatReport(report));
     if (!report.safeToExecute) {
       process.exitCode = 1;
@@ -918,7 +702,10 @@ async function main() {
       if (err.details.failedBatch) {
         console.error('Failed batch details:', JSON.stringify(err.details.failedBatch, null, 2));
       } else if (Array.isArray(err.details.conflicts)) {
-        console.error(`Conflicts (${err.details.conflicts.length}):`, JSON.stringify(err.details.conflicts.slice(0, 20), null, 2));
+        console.error(
+          `Conflicts (${err.details.conflicts.length}):`,
+          JSON.stringify(err.details.conflicts.slice(0, 20), null, 2)
+        );
       }
     }
     process.exitCode = 1;

@@ -45,6 +45,7 @@ import {
   type ServerQuestion,
   type WorkerEnv
 } from './types.ts';
+import { handleQuestionBankSeedRoutes } from './questionBankSeed.ts';
 
 const DEFAULT_PAYMENT_SETTINGS = {
   bkashNumber: '01712607777',
@@ -177,6 +178,11 @@ export async function handlePhase2Routes(
   const windowMs = ctx.rateLimitOverrides?.windowMs ?? 60_000;
   const nowIso = new Date(nowMs).toISOString();
 
+  const seedResult = await handleQuestionBankSeedRoutes(ctx);
+  if (seedResult) {
+    return seedResult;
+  }
+
   // ---------------------------------------------------------
   // 1. PUBLIC CATALOG ENDPOINTS (No keys/explanations exposed)
   // ---------------------------------------------------------
@@ -253,7 +259,18 @@ export async function handlePhase2Routes(
 
   if (pathname === '/api/packages' && method === 'GET') {
     const [pkgDocs, configDoc] = await Promise.all([
-      firestoreClient.listDocuments<Record<string, unknown>>('packages', { pageSize: 50, maxPages: 2 }),
+      firestoreClient
+        .listDocuments<Record<string, unknown>>('packages', {
+          pageSize: 50,
+          maxPages: 2,
+          fallbackToRunQueryOn403: true
+        })
+        .catch(err => {
+          if (err instanceof WorkerHttpError && (err.status === 403 || err.code === 'PERMISSION_DENIED')) {
+            return [] as Array<Record<string, unknown> & { id: string }>;
+          }
+          throw err;
+        }),
       firestoreClient.getDocument<Record<string, unknown>>('config', 'examDate')
     ]);
 
@@ -700,7 +717,11 @@ export async function handlePhase2Routes(
     const syncRes = await syncQuestionsAndKeysToD1(db, ownerClient, { nowMs });
 
     const examDocs = await ownerClient
-      .listDocuments<Record<string, unknown>>('exams', { pageSize: 200, maxPages: 5 })
+      .listDocuments<Record<string, unknown>>('exams', {
+        pageSize: 200,
+        maxPages: 5,
+        fallbackToRunQueryOn403: true
+      })
       .catch(() => []);
     if (examDocs.length > 0) {
       await upsertExamsBatchD1(

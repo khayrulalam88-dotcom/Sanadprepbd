@@ -373,8 +373,16 @@ export async function syncQuestionsAndKeysToD1(
 
   const [remote, questionDocs, keyDocs] = await Promise.all([
     getRemoteQuestionBankVersion(ownerClient),
-    ownerClient.listDocuments<Record<string, unknown>>('questions', { pageSize: 500, maxPages: 20 }),
-    ownerClient.listDocuments<Record<string, unknown>>('questionKeys', { pageSize: 500, maxPages: 20 })
+    ownerClient.listDocuments<Record<string, unknown>>('questions', {
+      pageSize: 500,
+      maxPages: 20,
+      fallbackToRunQueryOn403: true
+    }),
+    ownerClient.listDocuments<Record<string, unknown>>('questionKeys', {
+      pageSize: 500,
+      maxPages: 20,
+      fallbackToRunQueryOn403: true
+    })
   ]);
 
   const sanitizedList = questionDocs.map(d => sanitizeQuestion(firestoreDocToSanitizedQuestion(d)));
@@ -476,7 +484,8 @@ export async function ensureSanitizedQuestionsSyncedD1(
     try {
       docs = await firestoreClient.listDocuments<Record<string, unknown>>('questions', {
         pageSize: 500,
-        maxPages: 20
+        maxPages: 20,
+        fallbackToRunQueryOn403: Boolean(options?.isOwner)
       });
     } catch (err) {
       if (isFirestoreForbiddenError(err)) {
@@ -853,8 +862,16 @@ export async function fetchAllQuestionsWithKeysAuthoritative(
   ownerClient: FirestoreRestClient
 ): Promise<ServerQuestion[]> {
   const [questionDocs, keyDocs] = await Promise.all([
-    ownerClient.listDocuments<Record<string, unknown>>('questions', { pageSize: 500, maxPages: 20 }),
-    ownerClient.listDocuments<Record<string, unknown>>('questionKeys', { pageSize: 500, maxPages: 20 })
+    ownerClient.listDocuments<Record<string, unknown>>('questions', {
+      pageSize: 500,
+      maxPages: 20,
+      fallbackToRunQueryOn403: true
+    }),
+    ownerClient.listDocuments<Record<string, unknown>>('questionKeys', {
+      pageSize: 500,
+      maxPages: 20,
+      fallbackToRunQueryOn403: true
+    })
   ]);
 
   const keyMap = new Map<string, Record<string, unknown>>();

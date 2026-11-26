@@ -378,6 +378,19 @@ export async function apiFetchAdminQuestions() {
   return apiRequest<{ questions: Question[] }>('/api/admin/questions', { requireAuth: true });
 }
 
+export async function apiAdminSyncQuestionCache() {
+  return apiRequest<{
+    success: boolean;
+    versionToken: string;
+    questionCount: number;
+    keyCount: number;
+    examsCount: number;
+  }>('/api/admin/questions/sync-cache', {
+    method: 'POST',
+    requireAuth: true
+  });
+}
+
 export async function apiAdminSaveQuestion(q: Question) {
   return apiRequest<{ success: boolean; question: Question }>('/api/admin/questions', {
     method: 'POST',

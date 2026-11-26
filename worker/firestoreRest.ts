@@ -450,6 +450,9 @@ export class FirestoreRestClient {
         body: JSON.stringify(body)
       });
       if (!res.ok) {
+        if (res.status === 401) {
+          throw new WorkerHttpError(401, 'UNAUTHORIZED', 'Firestore batchGet unauthorized.');
+        }
         if (res.status === 403) {
           throw new WorkerHttpError(403, 'PERMISSION_DENIED', 'Firestore batchGet permission denied.');
         }
@@ -560,9 +563,62 @@ export class FirestoreRestClient {
     return out;
   }
 
-  async listDocuments<T extends Record<string, unknown> = Record<string, unknown>>(
+  async listDocumentsViaQuery<T extends Record<string, unknown> = Record<string, unknown>>(
     collectionPath: string,
     options?: { pageSize?: number; maxPages?: number }
+  ): Promise<Array<T & { id: string }>> {
+    const cleanCollection = collectionPath.replace(/^\/+|\/+$/g, '');
+    const pageSize = Math.min(1000, Math.max(1, Math.floor(options?.pageSize ?? 500)));
+    const maxPages = Math.min(40, Math.max(1, Math.floor(options?.maxPages ?? 20)));
+    const out: Array<T & { id: string }> = [];
+    let lastDocResourceName: string | undefined;
+
+    for (let page = 0; page < maxPages; page++) {
+      const structuredQuery: Record<string, unknown> = {
+        from: [{ collectionId: cleanCollection }],
+        orderBy: [{ field: { fieldPath: '__name__' }, direction: 'ASCENDING' }],
+        limit: pageSize
+      };
+      if (lastDocResourceName) {
+        structuredQuery.startAt = {
+          values: [{ referenceValue: lastDocResourceName }],
+          before: false
+        };
+      }
+
+      const { data } = await this.requestJson<Array<{ document?: FirestoreRestDocument }>>(
+        `${this.baseUrl}:runQuery`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ structuredQuery })
+        }
+      );
+
+      let pageCount = 0;
+      let pageLastName: string | undefined;
+      for (const row of Array.isArray(data) ? data : []) {
+        if (row.document) {
+          pageCount += 1;
+          pageLastName = row.document.name;
+          out.push({
+            ...(decodeDocumentFields(row.document.fields) as T),
+            id: extractDocumentId(row.document.name)
+          });
+        }
+      }
+
+      if (pageCount < pageSize || !pageLastName || pageLastName === lastDocResourceName) {
+        break;
+      }
+      lastDocResourceName = pageLastName;
+    }
+
+    return out;
+  }
+
+  async listDocuments<T extends Record<string, unknown> = Record<string, unknown>>(
+    collectionPath: string,
+    options?: { pageSize?: number; maxPages?: number; fallbackToRunQueryOn403?: boolean }
   ): Promise<Array<T & { id: string }>> {
     const cleanCollection = collectionPath.replace(/^\/+|\/+$/g, '');
     const pageSize = Math.min(500, Math.max(1, Math.floor(options?.pageSize ?? 500)));
@@ -570,32 +626,43 @@ export class FirestoreRestClient {
     const out: Array<T & { id: string }> = [];
     let pageToken: string | undefined;
 
-    for (let page = 0; page < maxPages; page++) {
-      const params = new URLSearchParams({ pageSize: String(pageSize) });
-      if (pageToken) {
-        params.set('pageToken', pageToken);
-      }
-      const { data } = await this.requestJson<{
-        documents?: FirestoreRestDocument[];
-        nextPageToken?: string;
-      }>(`${this.baseUrl}/${cleanCollection}?${params.toString()}`, {
-        method: 'GET'
-      });
-
-      for (const doc of data.documents || []) {
-        out.push({
-          ...(decodeDocumentFields(doc.fields) as T),
-          id: extractDocumentId(doc.name)
+    try {
+      for (let page = 0; page < maxPages; page++) {
+        const params = new URLSearchParams({ pageSize: String(pageSize) });
+        if (pageToken) {
+          params.set('pageToken', pageToken);
+        }
+        const { data } = await this.requestJson<{
+          documents?: FirestoreRestDocument[];
+          nextPageToken?: string;
+        }>(`${this.baseUrl}/${cleanCollection}?${params.toString()}`, {
+          method: 'GET'
         });
+
+        for (const doc of data.documents || []) {
+          out.push({
+            ...(decodeDocumentFields(doc.fields) as T),
+            id: extractDocumentId(doc.name)
+          });
+        }
+
+        if (!data.nextPageToken) {
+          break;
+        }
+        pageToken = data.nextPageToken;
       }
 
-      if (!data.nextPageToken) {
-        break;
+      return out;
+    } catch (err) {
+      if (
+        options?.fallbackToRunQueryOn403 &&
+        err instanceof WorkerHttpError &&
+        (err.status === 403 || err.code === 'PERMISSION_DENIED')
+      ) {
+        return this.listDocumentsViaQuery<T>(cleanCollection, options);
       }
-      pageToken = data.nextPageToken;
+      throw err;
     }
-
-    return out;
   }
 
   async beginTransaction(readOnly = false): Promise<string> {

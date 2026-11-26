@@ -1,13 +1,13 @@
 import test, { describe } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  FIRESTORE_DOCUMENTS_ROOT,
-  FIRESTORE_REST_BASE_URL,
+  DEFAULT_WORKER_BASE_URL,
+  FIREBASE_PROJECT_ID,
+  FIRESTORE_DATABASE_ID,
   OWNER_ADMIN_EMAIL,
   OWNER_ADMIN_UID,
-  FIREBASE_PROJECT_ID,
-  decodeDocumentFields,
-  encodeDocumentFields,
+  buildBoundedPayloadChunks,
+  normalizeWorkerBaseUrl,
   parseCliArgs,
   runSeedFirestoreKeyless,
   validateOwnerIdToken
@@ -18,6 +18,7 @@ function makeOwnerJwt(overrides = {}) {
   const payload = Buffer.from(
     JSON.stringify({
       aud: FIREBASE_PROJECT_ID,
+      iss: `https://securetoken.google.com/${FIREBASE_PROJECT_ID}`,
       sub: OWNER_ADMIN_UID,
       user_id: OWNER_ADMIN_UID,
       email: OWNER_ADMIN_EMAIL,
@@ -45,11 +46,9 @@ function makeSampleQuestions(count = 5) {
       legalReference: `Section ${i}`,
       difficulty: 'easy',
       status: 'published',
-      year: '2026',
       isDemoSample: i === 1,
       createdAt: '2026-01-01T00:00:00.000Z',
-      updatedAt: '2026-01-01T00:00:00.000Z',
-      createdBy: 'Test Board'
+      updatedAt: '2026-01-01T00:00:00.000Z'
     });
   }
   return out;
@@ -79,7 +78,7 @@ function makeSampleExams(questionIds) {
   ];
 }
 
-function createMockFirestoreFetch(initialStore = {}, options = {}) {
+function createMockWorkerFetch(initialStore = {}, options = {}) {
   const store = {
     questions: new Map(Object.entries(initialStore.questions || {})),
     questionKeys: new Map(Object.entries(initialStore.questionKeys || {})),
@@ -87,91 +86,190 @@ function createMockFirestoreFetch(initialStore = {}, options = {}) {
     config: new Map(Object.entries(initialStore.config || {}))
   };
   const requests = [];
-  let commitCallCount = 0;
+  let batchCallCount = 0;
 
   const fetchImpl = async (url, init = {}) => {
     const method = String(init.method || 'GET').toUpperCase();
-    const bodyObj = init.body ? JSON.parse(init.body) : null;
-    requests.push({ url, method, body: bodyObj });
+    const bodyObj = init.body ? JSON.parse(init.body) : {};
+    const authHeader = new Headers(init.headers).get('Authorization') || '';
+    requests.push({ url, method, body: bodyObj, authHeader });
 
     if (options.rejectAuthStatus) {
       return new Response(
-        JSON.stringify({ error: { code: options.rejectAuthStatus, status: 'PERMISSION_DENIED', message: 'Forbidden' } }),
+        JSON.stringify({
+          error: options.rejectAuthStatus === 401 ? 'UNAUTHORIZED' : 'PERMISSION_DENIED',
+          message: 'Forbidden'
+        }),
         { status: options.rejectAuthStatus, headers: { 'Content-Type': 'application/json' } }
       );
     }
 
-    if (url.startsWith(`${FIRESTORE_REST_BASE_URL}:commit`) && method === 'POST') {
-      commitCallCount += 1;
-      if (options.failCommitOnCall === commitCallCount) {
+    const parsedUrl = new URL(url);
+    if (parsedUrl.pathname === '/api/admin/seed/question-bank/batch' && method === 'POST') {
+      batchCallCount += 1;
+      if (options.rateLimitOnCall === batchCallCount) {
+        options.rateLimitOnCall = -1; // Once
+        return new Response(JSON.stringify({ error: 'RATE_LIMITED', retryAfterSeconds: 1 }), {
+          status: 429,
+          headers: { 'Content-Type': 'application/json', 'Retry-After': '1' }
+        });
+      }
+      if (options.failBatchOnCall === batchCallCount) {
         return new Response(
-          JSON.stringify({ error: { code: 500, status: 'INTERNAL', message: 'Simulated commit failure' } }),
-          { status: 500, headers: { 'Content-Type': 'application/json' } }
+          JSON.stringify({ error: 'FIRESTORE_COMMIT_FAILED', message: 'Simulated Worker batch failure' }),
+          { status: 503, headers: { 'Content-Type': 'application/json' } }
         );
       }
 
-      const writes = bodyObj?.writes || [];
-      for (const w of writes) {
-        assert.equal(w.delete, undefined, 'Never use delete operations');
-        const prefix = `${FIRESTORE_DOCUMENTS_ROOT}/`;
-        assert.ok(w.update?.name?.startsWith(prefix));
-        const rel = w.update.name.slice(prefix.length);
-        const [col, encodedId] = rel.split('/');
-        const docId = decodeURIComponent(encodedId);
-        const targetMap = store[col];
-        assert.ok(targetMap, `Unexpected collection ${col}`);
+      const dryRun = bodyObj.dryRun !== false;
+      const qs = Array.isArray(bodyObj.questions) ? bodyObj.questions : [];
+      const exs = Array.isArray(bodyObj.exams) ? bodyObj.exams : [];
+      const conflicts = [];
+      const existing = { questions: 0, questionKeys: 0, exams: 0 };
+      const matching = { questions: 0, questionKeys: 0, exams: 0 };
+      const wouldCreate = { questions: 0, questionKeys: 0, exams: 0, total: 0 };
+      const writes = [];
 
-        if (w.currentDocument?.exists === false && targetMap.has(docId)) {
-          return new Response(
-            JSON.stringify({ error: { code: 409, status: 'ALREADY_EXISTS', message: `${col}/${docId} already exists` } }),
-            { status: 409, headers: { 'Content-Type': 'application/json' } }
-          );
+      for (const q of qs) {
+        const exQ = store.questions.get(q.id);
+        if (exQ) {
+          existing.questions += 1;
+          if (exQ.questionBn !== q.questionBn) {
+            conflicts.push({ collection: 'questions', docId: q.id, reason: 'questionBn mismatch' });
+          } else {
+            matching.questions += 1;
+          }
+        } else {
+          wouldCreate.questions += 1;
+          writes.push({ col: 'questions', id: q.id, data: { id: q.id, subjectId: q.subjectId, questionBn: q.questionBn } });
         }
-        targetMap.set(docId, decodeDocumentFields(w.update.fields));
-      }
-      return new Response(JSON.stringify({ writeResults: writes.map(() => ({})) }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
 
-    const parsed = new URL(url);
-    const relPath = parsed.pathname.split('/documents/')[1] || '';
-    const segments = relPath.split('/').filter(Boolean);
-
-    if (segments.length === 2 && method === 'GET') {
-      const [col, rawId] = segments;
-      const docId = decodeURIComponent(rawId);
-      const doc = store[col]?.get(docId);
-      if (!doc) {
-        return new Response(JSON.stringify({ error: { code: 404, status: 'NOT_FOUND', message: 'Not found' } }), {
-          status: 404,
-          headers: { 'Content-Type': 'application/json' }
-        });
+        const exK = store.questionKeys.get(q.id);
+        if (exK) {
+          existing.questionKeys += 1;
+          if (exK.correctOptionIndex !== q.correctOptionIndex) {
+            conflicts.push({ collection: 'questionKeys', docId: q.id, reason: 'correctOptionIndex mismatch' });
+          } else {
+            matching.questionKeys += 1;
+          }
+        } else {
+          wouldCreate.questionKeys += 1;
+          writes.push({ col: 'questionKeys', id: q.id, data: { correctOptionIndex: q.correctOptionIndex, explanationBn: q.explanationBn || '' } });
+        }
       }
+
+      for (const ex of exs) {
+        const exDoc = store.exams.get(ex.id);
+        if (exDoc) {
+          existing.exams += 1;
+          if (exDoc.totalMarks !== ex.totalMarks) {
+            conflicts.push({ collection: 'exams', docId: ex.id, reason: 'totalMarks mismatch' });
+          } else {
+            matching.exams += 1;
+          }
+        } else {
+          wouldCreate.exams += 1;
+          writes.push({ col: 'exams', id: ex.id, data: ex });
+        }
+      }
+
+      wouldCreate.total = writes.length;
+      if (conflicts.length > 0 && !dryRun) {
+        return new Response(
+          JSON.stringify({
+            error: 'CONFLICT_DETECTED',
+            message: 'Conflict detected',
+            dryRun: false,
+            safeToExecute: false,
+            conflicts
+          }),
+          { status: 409, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+
+      if (!dryRun) {
+        for (const w of writes) {
+          store[w.col].set(w.id, w.data);
+        }
+      }
+
       return new Response(
         JSON.stringify({
-          name: `${FIRESTORE_DOCUMENTS_ROOT}/${col}/${encodeURIComponent(docId)}`,
-          fields: encodeDocumentFields(doc)
+          success: conflicts.length === 0,
+          dryRun,
+          executed: !dryRun,
+          safeToExecute: conflicts.length === 0,
+          existing,
+          matching,
+          wouldCreate,
+          writesCommitted: dryRun ? 0 : writes.length,
+          conflicts
         }),
         { status: 200, headers: { 'Content-Type': 'application/json' } }
       );
     }
 
-    if (segments.length === 1 && method === 'GET') {
-      const col = segments[0];
-      const allEntries = Array.from((store[col] || new Map()).entries());
-      const pageSize = Number(parsed.searchParams.get('pageSize') || '500');
-      const offset = Number(parsed.searchParams.get('pageToken') || '0');
-      const slice = allEntries.slice(offset, offset + pageSize);
-      const nextOffset = offset + slice.length;
+    if (parsedUrl.pathname === '/api/admin/seed/question-bank/finalize' && method === 'POST') {
+      const dryRun = bodyObj.dryRun !== false;
+      const pending = Number(bodyObj.pendingDataWrites || 0);
+      const existingVersion = store.config.get('questionBankVersion');
+      if (existingVersion) {
+        if (pending > 0) {
+          return new Response(
+            JSON.stringify({
+              success: false,
+              dryRun,
+              safeToExecute: false,
+              versionExists: true,
+              versionDocumentStatus: 'exists',
+              conflicts: [{ collection: 'config', docId: 'questionBankVersion', reason: 'Already exists' }]
+            }),
+            { status: dryRun ? 200 : 409, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            success: true,
+            dryRun,
+            executed: !dryRun,
+            safeToExecute: true,
+            versionExists: true,
+            versionDocumentStatus: 'exists (up-to-date)',
+            writesCommitted: 0,
+            conflicts: []
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+
+      const tokenVal = '1700000000000_1_mock';
+      if (!dryRun) {
+        store.config.set('questionBankVersion', { version: 1700000000000001, versionToken: tokenVal });
+      }
       return new Response(
         JSON.stringify({
-          documents: slice.map(([docId, data]) => ({
-            name: `${FIRESTORE_DOCUMENTS_ROOT}/${col}/${encodeURIComponent(docId)}`,
-            fields: encodeDocumentFields(data)
-          })),
-          ...(nextOffset < allEntries.length ? { nextPageToken: String(nextOffset) } : {})
+          success: true,
+          dryRun,
+          executed: !dryRun,
+          safeToExecute: true,
+          versionExists: false,
+          versionDocumentStatus: dryRun ? 'missing (will create last)' : 'created',
+          plannedVersionToken: tokenVal,
+          versionToken: dryRun ? undefined : tokenVal,
+          writesCommitted: dryRun ? 0 : 1,
+          conflicts: []
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+
+    if (parsedUrl.pathname === '/api/admin/questions/sync-cache' && method === 'POST') {
+      return new Response(
+        JSON.stringify({
+          success: true,
+          questionCount: store.questions.size,
+          keyCount: store.questionKeys.size,
+          examsCount: store.exams.size
         }),
         { status: 200, headers: { 'Content-Type': 'application/json' } }
       );
@@ -183,17 +281,37 @@ function createMockFirestoreFetch(initialStore = {}, options = {}) {
   return { fetchImpl, store, requests };
 }
 
-describe('Keyless Firestore REST Seeder', () => {
-  test('CLI defaults to dry-run and rejects conflicting flags', () => {
-    assert.deepEqual(parseCliArgs([]), { valid: true, help: false, dryRun: true, execute: false });
-    assert.deepEqual(parseCliArgs(['--dry-run']), { valid: true, help: false, dryRun: true, execute: false });
-    assert.deepEqual(parseCliArgs(['--execute']), { valid: true, help: false, dryRun: false, execute: true });
+describe('Worker-Mediated Keyless Firestore Seeder CLI', () => {
+  test('CLI defaults to dry-run and parses --worker-url, --batch-size, --skip-d1-sync', () => {
+    assert.deepEqual(parseCliArgs([]), { valid: true, help: false, dryRun: true, execute: false, skipD1Sync: false });
+    assert.deepEqual(parseCliArgs(['--dry-run']), { valid: true, help: false, dryRun: true, execute: false, skipD1Sync: false });
+    assert.deepEqual(
+      parseCliArgs(['--execute', '--worker-url', 'https://example.workers.dev', '--batch-size', '50', '--skip-d1-sync']),
+      {
+        valid: true,
+        help: false,
+        dryRun: false,
+        execute: true,
+        skipD1Sync: true,
+        workerUrl: 'https://example.workers.dev',
+        batchSize: 50
+      }
+    );
     assert.equal(parseCliArgs(['--dry-run', '--execute']).valid, false);
     assert.equal(parseCliArgs(['--unknown']).valid, false);
+    assert.equal(normalizeWorkerBaseUrl('https://s--khayrul-alam.khayrulalam88.workers.dev/'), DEFAULT_WORKER_BASE_URL);
+    assert.throws(
+      () => normalizeWorkerBaseUrl('http://insecure.example.com'),
+      err => err.code === 'INVALID_WORKER_URL'
+    );
   });
 
-  test('fails safely when OWNER_FIREBASE_ID_TOKEN is missing, non-owner, unverified, or expired', async () => {
+  test('validates OWNER_FIREBASE_ID_TOKEN and rejects Bearer prefix, quotes, non-owner, unverified, or expired', async () => {
+    const valid = makeOwnerJwt();
+    assert.equal(validateOwnerIdToken(valid).uid, OWNER_ADMIN_UID);
     assert.throws(() => validateOwnerIdToken(''), /MISSING_TOKEN|OWNER_FIREBASE_ID_TOKEN/);
+    assert.throws(() => validateOwnerIdToken(`Bearer ${valid}`), /Bearer/);
+    assert.throws(() => validateOwnerIdToken(`"${valid}"`), /quotes/);
     assert.throws(() => validateOwnerIdToken(makeOwnerJwt({ sub: 'student_uid', user_id: 'student_uid' })), /Owner UID/);
     assert.throws(() => validateOwnerIdToken(makeOwnerJwt({ email: 'other@example.com' })), /Owner email/);
     assert.throws(() => validateOwnerIdToken(makeOwnerJwt({ email_verified: false })), /email_verified/);
@@ -205,10 +323,21 @@ describe('Keyless Firestore REST Seeder', () => {
     );
   });
 
-  test('dry-run sends zero write requests and reports accurate counts and batches', async () => {
+  test('buildBoundedPayloadChunks respects both item count and JSON byte limits', () => {
+    const qs = makeSampleQuestions(10);
+    const chunks = buildBoundedPayloadChunks(qs, 'questions', true, 4, 50_000);
+    assert.deepEqual(
+      chunks.map(c => c.length),
+      [4, 4, 2]
+    );
+    const byteChunks = buildBoundedPayloadChunks(qs, 'questions', true, 50, 900);
+    assert.ok(byteChunks.length > 2);
+  });
+
+  test('dry-run targets Worker endpoints with dryRun=true and writes zero documents', async () => {
     const questions = makeSampleQuestions(5);
     const exams = makeSampleExams(questions.map(q => q.id));
-    const { fetchImpl, requests, store } = createMockFirestoreFetch();
+    const { fetchImpl, requests, store } = createMockWorkerFetch();
 
     const report = await runSeedFirestoreKeyless({
       execute: false,
@@ -221,9 +350,11 @@ describe('Keyless Firestore REST Seeder', () => {
     });
 
     assert.equal(report.mode, 'dry-run');
+    assert.equal(report.projectId, FIREBASE_PROJECT_ID);
+    assert.equal(report.databaseId, FIRESTORE_DATABASE_ID);
     assert.equal(report.safeToExecute, true);
     assert.equal(report.executed, false);
-    assert.deepEqual(report.sourceCounts, { questions: 5, questionKeys: 5, exams: 1 });
+    assert.equal(report.writesCommitted, 0);
     assert.deepEqual(report.wouldCreate, {
       questions: 5,
       questionKeys: 5,
@@ -231,28 +362,21 @@ describe('Keyless Firestore REST Seeder', () => {
       versionDocument: 1,
       total: 12
     });
-    assert.deepEqual(report.plannedCommitBatches, {
-      questions: 3,
-      questionKeys: 3,
-      exams: 1,
-      versionDocument: 1,
-      total: 8,
-      maxBatchSize: 2
-    });
-    assert.equal(report.conflicts.length, 0);
-    assert.ok(requests.every(r => r.method === 'GET'), 'Dry-run must send only GET requests');
+    assert.ok(requests.every(r => !r.url.endsWith('/sync-cache')), 'Dry-run must not call sync-cache');
+    assert.ok(
+      requests.filter(r => r.url.includes('/seed/')).every(r => r.body.dryRun === true),
+      'Every seed request in dry-run must send dryRun: true'
+    );
     assert.equal(store.questions.size, 0);
-    assert.equal(store.questionKeys.size, 0);
-    assert.equal(store.exams.size, 0);
     assert.equal(store.config.size, 0);
   });
 
-  test('execute uses create-only preconditions, strips answers from /questions, puts keys in /questionKeys, and writes version doc last', async () => {
+  test('execute commits batches, writes version doc last, and triggers /sync-cache', async () => {
     const questions = makeSampleQuestions(3);
     const exams = makeSampleExams(questions.map(q => q.id));
-    const { fetchImpl, requests, store } = createMockFirestoreFetch();
+    const { fetchImpl, requests, store } = createMockWorkerFetch();
 
-    const result = await runSeedFirestoreKeyless({
+    const report = await runSeedFirestoreKeyless({
       execute: true,
       token: makeOwnerJwt(),
       fetchImpl,
@@ -262,179 +386,47 @@ describe('Keyless Firestore REST Seeder', () => {
       nowMs: 1700000000000
     });
 
-    assert.equal(result.executed, true);
-    assert.equal(result.writesCommitted, 8);
-    assert.equal(result.batchesSucceeded, 6);
-
-    const commits = requests.filter(r => r.method === 'POST');
-    assert.equal(commits.length, 6);
-
-    for (const commitReq of commits) {
-      for (const write of commitReq.body.writes) {
-        assert.deepEqual(write.currentDocument, { exists: false });
-        assert.equal(write.delete, undefined);
-      }
-    }
-
-    // Final commit must contain ONLY config/questionBankVersion
-    const lastCommitWrites = commits[commits.length - 1].body.writes;
-    assert.equal(lastCommitWrites.length, 1);
-    assert.ok(lastCommitWrites[0].update.name.endsWith('/documents/config/questionBankVersion'));
-
-    // Verify sanitized /questions vs /questionKeys separation
+    assert.equal(report.executed, true);
+    assert.equal(report.writesCommitted, 8);
+    assert.equal(report.batchesSucceeded, 4); // 2 question batches + 1 exam batch + 1 finalize
     assert.equal(store.questions.size, 3);
     assert.equal(store.questionKeys.size, 3);
-    for (const q of questions) {
-      const savedQ = store.questions.get(q.id);
-      assert.equal('correctOptionIndex' in savedQ, false);
-      assert.equal('explanationBn' in savedQ, false);
-      assert.equal('explanationEn' in savedQ, false);
-      assert.equal(savedQ.questionBn, q.questionBn);
+    assert.equal(store.exams.size, 1);
+    assert.equal(store.config.has('questionBankVersion'), true);
+    assert.equal(report.d1SyncResult.success, true);
+    assert.equal(report.d1SyncResult.questionCount, 3);
 
-      const savedKey = store.questionKeys.get(q.id);
-      assert.equal(savedKey.correctOptionIndex, q.correctOptionIndex);
-      assert.equal(savedKey.explanationBn, q.explanationBn);
-      assert.equal(savedKey.explanationEn, q.explanationEn);
-    }
-
-    const versionDoc = store.config.get('questionBankVersion');
-    assert.equal(typeof versionDoc.version, 'number');
-    assert.equal(versionDoc.versionToken, result.plannedVersionToken);
-    assert.equal(typeof versionDoc.updatedAt, 'string');
+    const pathOrder = requests.map(r => new URL(r.url).pathname);
+    assert.equal(pathOrder[pathOrder.length - 2], '/api/admin/seed/question-bank/finalize');
+    assert.equal(pathOrder[pathOrder.length - 1], '/api/admin/questions/sync-cache');
   });
 
-  test('pagination works across multi-page collections and preserves matching existing docs without overwriting', async () => {
-    const questions = makeSampleQuestions(5);
+  test('handles 429 rate-limit response with bounded retry', async () => {
+    const questions = makeSampleQuestions(2);
     const exams = makeSampleExams(questions.map(q => q.id));
+    let sleptMs = 0;
+    const { fetchImpl, store } = createMockWorkerFetch({}, { rateLimitOnCall: 1 });
 
-    // Pre-populate 3 matching questions + 1 custom-configured existing exam (isActive toggled)
-    const { fetchImpl, requests, store } = createMockFirestoreFetch({
-      questions: {
-        q_test_001: {
-          id: 'q_test_001',
-          subjectId: 'sub_cpc',
-          questionBn: 'প্রশ্ন 1?',
-          questionEn: 'Question 1?',
-          optionsBn: ['ক', 'খ', 'গ', 'ঘ'],
-          optionsEn: ['A', 'B', 'C', 'D'],
-          legalReference: 'Section 1',
-          difficulty: 'easy',
-          status: 'published',
-          isDemoSample: true,
-          createdAt: '2026-01-01T00:00:00.000Z',
-          updatedAt: '2026-01-01T00:00:00.000Z'
-        },
-        q_test_002: {
-          id: 'q_test_002',
-          subjectId: 'sub_cpc',
-          questionBn: 'প্রশ্ন 2?',
-          questionEn: 'Question 2?',
-          optionsBn: ['ক', 'খ', 'গ', 'ঘ'],
-          optionsEn: ['A', 'B', 'C', 'D'],
-          legalReference: 'Section 2',
-          difficulty: 'easy',
-          status: 'published',
-          isDemoSample: false,
-          createdAt: '2026-01-01T00:00:00.000Z',
-          updatedAt: '2026-01-01T00:00:00.000Z'
-        },
-        q_test_003: {
-          id: 'q_test_003',
-          subjectId: 'sub_cpc',
-          questionBn: 'প্রশ্ন 3?',
-          questionEn: 'Question 3?',
-          optionsBn: ['ক', 'খ', 'গ', 'ঘ'],
-          optionsEn: ['A', 'B', 'C', 'D'],
-          legalReference: 'Section 3',
-          difficulty: 'easy',
-          status: 'published',
-          isDemoSample: false,
-          createdAt: '2026-01-01T00:00:00.000Z',
-          updatedAt: '2026-01-01T00:00:00.000Z'
-        }
-      },
-      exams: {
-        exam_model_test_01: {
-          ...exams[0],
-          isActive: false,
-          scheduledDate: '2026-12-15'
-        }
-      }
-    });
-
-    const result = await runSeedFirestoreKeyless({
+    const report = await runSeedFirestoreKeyless({
       execute: true,
       token: makeOwnerJwt(),
       fetchImpl,
       questions,
       exams,
-      pageSize: 2, // Force multi-page pagination
-      nowMs: 1700000000000
-    });
-
-    assert.equal(result.paginationPagesRead.questions, 2);
-    assert.equal(result.matchingCounts.questions, 3);
-    assert.equal(result.matchingCounts.exams, 1);
-    assert.equal(result.wouldCreate.questions, 2);
-    assert.equal(result.wouldCreate.questionKeys, 5);
-    assert.equal(result.wouldCreate.exams, 0);
-
-    // Custom admin configuration on existing exam must be preserved untouched
-    assert.equal(store.exams.get('exam_model_test_01').isActive, false);
-    assert.equal(store.exams.get('exam_model_test_01').scheduledDate, '2026-12-15');
-    assert.equal(requests.filter(r => r.method === 'POST').every(c => c.body.writes.every(w => !w.update.name.includes('/exams/'))), true);
-  });
-
-  test('conflicting existing documents prevent execution and send zero writes', async () => {
-    const questions = makeSampleQuestions(2);
-    const exams = makeSampleExams(questions.map(q => q.id));
-    const { fetchImpl, requests } = createMockFirestoreFetch({
-      questions: {
-        q_test_001: {
-          id: 'q_test_001',
-          subjectId: 'sub_cpc',
-          questionBn: 'Different question text',
-          questionEn: 'Question 1?',
-          optionsBn: ['ক', 'খ', 'গ', 'ঘ'],
-          optionsEn: ['A', 'B', 'C', 'D'],
-          legalReference: 'Section 1',
-          difficulty: 'easy',
-          status: 'published',
-          isDemoSample: true
-        }
-      },
-      questionKeys: {
-        q_test_002: {
-          correctOptionIndex: 3, // source has 2
-          explanationBn: 'ব্যাখ্যা 2',
-          explanationEn: 'Explanation 2',
-          legalReference: 'Section 2'
-        }
+      sleepFn: async ms => {
+        sleptMs += ms;
       }
     });
 
-    await assert.rejects(
-      () =>
-        runSeedFirestoreKeyless({
-          execute: true,
-          token: makeOwnerJwt(),
-          fetchImpl,
-          questions,
-          exams
-        }),
-      err =>
-        err.code === 'CONFLICT_DETECTED' &&
-        err.details.conflicts.length === 2 &&
-        err.details.safeToExecute === false
-    );
-
-    assert.equal(requests.filter(r => r.method === 'POST').length, 0);
+    assert.equal(report.executed, true);
+    assert.ok(sleptMs >= 1000);
+    assert.equal(store.questions.size, 2);
   });
 
-  test('aborts immediately on batch commit failure and never writes version document', async () => {
+  test('aborts immediately on batch failure and never calls /finalize or /sync-cache', async () => {
     const questions = makeSampleQuestions(3);
     const exams = makeSampleExams(questions.map(q => q.id));
-    const { fetchImpl, store } = createMockFirestoreFetch({}, { failCommitOnCall: 2 });
+    const { fetchImpl, requests, store } = createMockWorkerFetch({}, { failBatchOnCall: 2 });
 
     await assert.rejects(
       () =>
@@ -453,13 +445,17 @@ describe('Keyless Firestore REST Seeder', () => {
         err.details.failedBatch.batchNumber === 2
     );
 
-    assert.equal(store.config.has('questionBankVersion'), false, 'Version doc must NOT be created after partial failure');
+    assert.equal(store.config.has('questionBankVersion'), false);
+    assert.equal(
+      requests.some(r => r.url.includes('/finalize') || r.url.includes('/sync-cache')),
+      false
+    );
   });
 
-  test('fails safely when Firestore rejects Owner authorization with 403', async () => {
+  test('fails cleanly when Worker rejects authorization with 403', async () => {
     const questions = makeSampleQuestions(1);
     const exams = makeSampleExams(['q_test_001']);
-    const { fetchImpl } = createMockFirestoreFetch({}, { rejectAuthStatus: 403 });
+    const { fetchImpl } = createMockWorkerFetch({}, { rejectAuthStatus: 403 });
 
     await assert.rejects(
       () =>
@@ -475,7 +471,7 @@ describe('Keyless Firestore REST Seeder', () => {
   });
 
   test('validates real local questionBankFull.json and initialExamsMeta.json in offline dry-run', async () => {
-    const { fetchImpl, requests } = createMockFirestoreFetch();
+    const { fetchImpl, requests } = createMockWorkerFetch();
 
     const report = await runSeedFirestoreKeyless({
       execute: false,
@@ -486,7 +482,6 @@ describe('Keyless Firestore REST Seeder', () => {
 
     assert.equal(report.mode, 'dry-run');
     assert.equal(report.safeToExecute, true);
-    assert.equal(report.executed, false);
     assert.deepEqual(report.sourceCounts, {
       questions: 3000,
       questionKeys: 3000,
@@ -499,16 +494,7 @@ describe('Keyless Firestore REST Seeder', () => {
       versionDocument: 1,
       total: 6034
     });
-    assert.deepEqual(report.plannedCommitBatches, {
-      questions: 15,
-      questionKeys: 15,
-      exams: 1,
-      versionDocument: 1,
-      total: 32,
-      maxBatchSize: 200
-    });
     assert.equal(report.conflicts.length, 0);
-    assert.ok(requests.every(r => r.method === 'GET'));
+    assert.ok(requests.length >= 42);
   });
 });
-

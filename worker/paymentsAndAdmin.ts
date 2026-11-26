@@ -1002,7 +1002,11 @@ export async function handlePaymentsAndAdminRoutes(
 
     const ownerClient = firestoreClient.withToken(authUser.idToken);
     const [pkgDocs, configDoc] = await Promise.all([
-      ownerClient.listDocuments<Record<string, unknown>>('packages', { pageSize: 50, maxPages: 2 }),
+      ownerClient.listDocuments<Record<string, unknown>>('packages', {
+        pageSize: 50,
+        maxPages: 2,
+        fallbackToRunQueryOn403: true
+      }),
       ownerClient.getDocument<Record<string, unknown>>('config', 'examDate')
     ]);
     const examDateConfig = configDoc
@@ -1911,16 +1915,32 @@ export async function handlePaymentsAndAdminRoutes(
     const ownerClient = firestoreClient.withToken(authUser.idToken);
     const [userDocs, fsPayDocs, fsSubDocs, fsResDocs, d1PayDocs, d1SubDocs, d1ResDocs] = await Promise.all([
       ownerClient
-        .listDocuments<Record<string, unknown>>('users', { pageSize: 500, maxPages: 10 })
+        .listDocuments<Record<string, unknown>>('users', {
+          pageSize: 500,
+          maxPages: 10,
+          fallbackToRunQueryOn403: true
+        })
         .catch(() => [] as Array<Record<string, unknown> & { id: string }>),
       ownerClient
-        .listDocuments<Record<string, unknown>>('paymentRequests', { pageSize: 500, maxPages: 10 })
+        .listDocuments<Record<string, unknown>>('paymentRequests', {
+          pageSize: 500,
+          maxPages: 10,
+          fallbackToRunQueryOn403: true
+        })
         .catch(() => [] as Array<Record<string, unknown> & { id: string }>),
       ownerClient
-        .listDocuments<Record<string, unknown>>('subscriptions', { pageSize: 500, maxPages: 10 })
+        .listDocuments<Record<string, unknown>>('subscriptions', {
+          pageSize: 500,
+          maxPages: 10,
+          fallbackToRunQueryOn403: true
+        })
         .catch(() => [] as Array<Record<string, unknown> & { id: string }>),
       ownerClient
-        .listDocuments<Record<string, unknown>>('examResults', { pageSize: 500, maxPages: 10 })
+        .listDocuments<Record<string, unknown>>('examResults', {
+          pageSize: 500,
+          maxPages: 10,
+          fallbackToRunQueryOn403: true
+        })
         .catch(() => [] as Array<Record<string, unknown> & { id: string }>),
       listPaymentRequestsD1(db),
       listSubscriptionsD1(db),
@@ -2000,7 +2020,8 @@ export async function handlePaymentsAndAdminRoutes(
       ownerClient
         .listDocuments<Record<string, unknown>>('auditLogs', {
           pageSize: 500,
-          maxPages: 5
+          maxPages: 5,
+          fallbackToRunQueryOn403: true
         })
         .catch(() => [] as Array<Record<string, unknown> & { id: string }>),
       listAuditLogsD1(db, 200)
@@ -2036,7 +2057,11 @@ export async function handlePaymentsAndAdminRoutes(
       syncQuestionsAndKeysToD1(db, ownerClient, { nowMs }),
       syncEdgeRecordsWithOwnerFirestore(db, ownerClient),
       ownerClient
-        .listDocuments<Record<string, unknown>>('exams', { pageSize: 200, maxPages: 5 })
+        .listDocuments<Record<string, unknown>>('exams', {
+          pageSize: 200,
+          maxPages: 5,
+          fallbackToRunQueryOn403: true
+        })
         .catch(() => [] as Array<Record<string, unknown> & { id: string }>)
     ]);
 

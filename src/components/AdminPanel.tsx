@@ -83,8 +83,13 @@ export const AdminPanel: React.FC = () => {
     recoverSession,
     auditLogs,
     examResults,
-    adminDashboardStats
+    adminDashboardStats,
+    adminQuestionsState,
+    reloadAdminQuestions,
+    syncEdgeQuestionCache
   } = useApp();
+
+  const [isSyncingEdgeCache, setIsSyncingEdgeCache] = useState<boolean>(false);
 
   const [activeTab, setActiveTab] = useState<'overview' | 'packages' | 'subscribers' | 'payments' | 'questions' | 'exams' | 'sessions' | 'audit'>('overview');
 
@@ -1907,7 +1912,47 @@ export const AdminPanel: React.FC = () => {
               </select>
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  void reloadAdminQuestions();
+                }}
+                disabled={adminQuestionsState.status === 'loading'}
+                className="px-3 py-2 rounded-xl bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 font-bold text-xs flex items-center gap-1.5 transition cursor-pointer disabled:opacity-50"
+                title={t('Firestore থেকে প্রশ্ন সম্ভার পুনরায় লোড করুন', 'Reload Question Bank from Firestore')}
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${adminQuestionsState.status === 'loading' ? 'animate-spin' : ''}`} />
+                <span>{t('রিফ্রেশ', 'Refresh')}</span>
+              </button>
+
+              {isAdmin && (
+                <button
+                  type="button"
+                  disabled={isSyncingEdgeCache}
+                  onClick={async () => {
+                    setAdminActionError('');
+                    setAdminActionSuccess('');
+                    setIsSyncingEdgeCache(true);
+                    try {
+                      const syncRes = await syncEdgeQuestionCache();
+                      if (!syncRes.success) {
+                        setAdminActionError(syncRes.message);
+                      } else {
+                        setAdminActionSuccess(syncRes.message);
+                      }
+                    } finally {
+                      setIsSyncingEdgeCache(false);
+                    }
+                  }}
+                  className="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-[#102A43] border border-slate-300 font-bold text-xs flex items-center gap-1.5 transition cursor-pointer disabled:opacity-50"
+                  title={t('Firestore থেকে D1 Edge Cache সিঙ্ক করুন', 'Sync D1 Edge Cache from Firestore')}
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isSyncingEdgeCache ? 'animate-spin' : ''}`} />
+                  <span>{isSyncingEdgeCache ? t('সিঙ্ক হচ্ছে...', 'Syncing...') : t('D1 ক্যাশ সিঙ্ক', 'Sync D1 Cache')}</span>
+                </button>
+              )}
+
               <button
                 type="button"
                 onClick={() => {
@@ -1945,6 +1990,61 @@ export const AdminPanel: React.FC = () => {
             </div>
           </div>
 
+          {adminQuestionsState.status === 'loading' && (
+            <div className="p-4 bg-sky-50 border border-sky-200 rounded-2xl flex items-center gap-3 text-xs text-sky-900 font-semibold">
+              <RefreshCw className="w-4 h-4 text-sky-700 animate-spin shrink-0" />
+              <span>
+                {t(
+                  'Firestore ডাটাবেজ থেকে অনুমোদিত প্রশ্ন সম্ভার লোড হচ্ছে...',
+                  'Loading authoritative Question Bank from Firestore...'
+                )}
+              </span>
+            </div>
+          )}
+
+          {adminQuestionsState.status === 'error' && (
+            <div
+              role="alert"
+              className="p-5 bg-rose-50 border-2 border-rose-300 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-4 text-xs"
+            >
+              <div className="flex items-start gap-3">
+                <AlertTriangle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
+                <div className="space-y-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h4 className="font-black text-rose-900 text-sm">
+                      {adminQuestionsState.errorCategory === 'auth' || adminQuestionsState.errorCategory === 'forbidden'
+                        ? t('প্রশ্ন সম্ভার অনুমোদন ত্রুটি (Authentication / Permission Error)', 'Question Bank Authorization Error')
+                        : t('ব্যাকএন্ড বা ডাটাবেজ থেকে প্রশ্ন সম্ভার লোড করা যায়নি', 'Failed to Load Question Bank from Backend')}
+                    </h4>
+                    {(adminQuestionsState.httpStatus !== undefined || adminQuestionsState.errorCode) && (
+                      <span className="px-2 py-0.5 rounded-md bg-rose-100 text-rose-800 font-mono text-[11px] font-bold">
+                        {adminQuestionsState.httpStatus ? `HTTP ${adminQuestionsState.httpStatus}` : ''}
+                        {adminQuestionsState.errorCode ? ` • ${adminQuestionsState.errorCode}` : ''}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-rose-800 font-medium">
+                    {adminQuestionsState.errorMessage ||
+                      t(
+                        'প্রশ্ন সম্ভার লোড করার সময় ব্যাকএন্ড ত্রুটি ঘটেছে। দয়া করে আবার চেষ্টা করুন।',
+                        'An error occurred while loading questions from the backend.'
+                      )}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  void reloadAdminQuestions();
+                }}
+                className="px-4 py-2 rounded-xl bg-rose-700 hover:bg-rose-800 text-white font-bold text-xs flex items-center gap-1.5 shrink-0 transition cursor-pointer"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>{t('পুনরায় চেষ্টা করুন', 'Retry Load')}</span>
+              </button>
+            </div>
+          )}
+
           {adminCheckedQuestions.size > 0 && (
             <div className="p-3 bg-amber-50 border border-amber-300 rounded-2xl flex items-center justify-between text-xs animate-in fade-in">
               <span className="font-bold text-[#102A43]">
@@ -1969,6 +2069,39 @@ export const AdminPanel: React.FC = () => {
                   {t('মডেল টেস্ট তৈরি করুন ও পরীক্ষা নিন', 'Create Model Test & Host Exam')}
                 </button>
               </div>
+            </div>
+          )}
+
+          {adminQuestionsState.status !== 'error' &&
+            adminQuestionsState.status !== 'loading' &&
+            questions.length === 0 && (
+              <div className="bg-white rounded-3xl border border-slate-200 p-8 text-center space-y-3">
+                <FileQuestion className="w-10 h-10 text-amber-500 mx-auto" />
+                <h4 className="font-black text-slate-900 text-base">
+                  {t('প্রোডাকশন প্রশ্ন সম্ভার এখনও খালি (০টি প্রশ্ন)', 'Question Bank is Currently Empty (0 Questions)')}
+                </h4>
+                <p className="text-xs text-slate-600 max-w-lg mx-auto">
+                  {t(
+                    'Firestore-এ কোনো প্রশ্ন পাওয়া যায়নি। নতুন প্রশ্ন যোগ করুন অথবা কীলেস সিডার দিয়ে ৩,০০০ প্রশ্নের সংগ্রহ আপলোড করে D1 ক্যাশ সিঙ্ক করুন।',
+                    'No questions were found in Firestore. Add questions manually or seed the 3,000-question bank and sync the D1 edge cache.'
+                  )}
+                </p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void reloadAdminQuestions();
+                  }}
+                  className="px-4 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-[#102A43] font-bold text-xs inline-flex items-center gap-1.5 cursor-pointer"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>{t('পুনরায় যাচাই করুন', 'Check Again')}</span>
+                </button>
+              </div>
+            )}
+
+          {questions.length > 0 && filteredQuestions.length === 0 && (
+            <div className="bg-white rounded-3xl border border-slate-200 p-6 text-center text-xs text-slate-600 font-semibold">
+              {t('সার্চ বা ফিল্টারের সাথে মিলে এমন কোনো প্রশ্ন পাওয়া যায়নি।', 'No questions match your current search or subject filter.')}
             </div>
           )}
 

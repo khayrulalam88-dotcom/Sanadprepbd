@@ -525,7 +525,11 @@ export function createWorkerHandler(deps?: WorkerDependencies) {
             ) {
               await syncQuestionsAndKeysToD1(env.DB, userClient, { nowMs }).catch(() => undefined);
               const examDocs = await userClient
-                .listDocuments<Record<string, unknown>>('exams', { pageSize: 200, maxPages: 5 })
+                .listDocuments<Record<string, unknown>>('exams', {
+                  pageSize: 200,
+                  maxPages: 5,
+                  fallbackToRunQueryOn403: true
+                })
                 .catch(() => [] as Array<Record<string, unknown> & { id: string }>);
               if (examDocs.length > 0) {
                 await upsertExamsBatchD1(

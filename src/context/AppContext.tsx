@@ -66,6 +66,7 @@ import {
   apiLogoutSession,
   apiFetchSanitizedQuestions,
   apiFetchAdminQuestions,
+  apiAdminSyncQuestionCache,
   apiCheckPracticeAnswer,
   apiStartExam,
   apiSaveExamAnswer,
@@ -93,6 +94,10 @@ import {
   executeAuthoritativeAdminApi,
   formatBackendApiError
 } from '../lib/securityHelpers';
+import {
+  resolveAdminQuestionBankFetchOutcome,
+  type AdminQuestionBankLoadState
+} from '../lib/adminQuestionHelpers';
 
 interface AppContextType {
   language: Language;
@@ -115,6 +120,15 @@ interface AppContextType {
     loading: boolean;
   };
   adminDashboardStats: AdminDashboardStatsResponse | null;
+  adminQuestionsState: AdminQuestionBankLoadState;
+  reloadAdminQuestions: () => Promise<void>;
+  syncEdgeQuestionCache: () => Promise<{
+    success: boolean;
+    questionCount?: number;
+    keyCount?: number;
+    examsCount?: number;
+    message: string;
+  }>;
   exams: Exam[];
   examResults: ExamResult[];
   paymentRequests: PaymentRequest[];
@@ -517,6 +531,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   >({});
   const subjectFetchInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
   const [adminDashboardStats, setAdminDashboardStats] = useState<AdminDashboardStatsResponse | null>(null);
+  const [adminQuestionsState, setAdminQuestionsState] = useState<AdminQuestionBankLoadState>({
+    status: 'idle',
+    questionCount: 0
+  });
   const activeAttemptRef = useRef<ExamAttempt | null>(activeAttempt);
   const handleSessionRevokedRef = useRef<(reason: string) => void>(() => {});
   const examBatcherRef = useRef<ExamAnswerBatcher | null>(null);
@@ -579,12 +597,28 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setTotalQuestionCount(pool.length);
   }, []);
 
-  const ensureQuestionsLoaded = useCallback(async () => {
+  const ensureQuestionsLoaded = useCallback(async (opts?: { forceReload?: boolean }) => {
     const fbUser = auth?.currentUser;
-    if (!fbUser || !fbUser.emailVerified) return;
+    if (!fbUser || !fbUser.emailVerified) {
+      if (activeScreen === 'admin' || activeScreen === 'question_bank') {
+        setAdminQuestionsState({
+          status: 'error',
+          questionCount: 0,
+          httpStatus: 401,
+          errorCode: 'UNAUTHORIZED',
+          errorCategory: 'auth',
+          errorMessage: 'অ্যাডমিন প্রশ্ন সম্ভার দেখতে যাচাইকৃত Firebase অ্যাকাউন্ট দিয়ে সাইন ইন করুন।'
+        });
+      }
+      return;
+    }
 
     const isOwner = isVerifiedOwnerAccount(fbUser);
     const desiredMode: 'sanitized' | 'admin' = isOwner ? 'admin' : 'sanitized';
+
+    if (opts?.forceReload) {
+      questionsLoadedModeRef.current = 'none';
+    }
 
     if (
       questionsLoadedModeRef.current === desiredMode ||
@@ -602,18 +636,37 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     const runFetch = async () => {
       try {
         if (isOwner) {
+          setAdminQuestionsState(prev => ({
+            ...prev,
+            status: 'loading',
+            errorMessage: undefined
+          }));
           const adminQRes = await apiFetchAdminQuestions();
-          if (adminQRes.ok && adminQRes.data?.questions?.length) {
-            setQuestions(adminQRes.data.questions);
-            updateQuestionCountsFromPool(adminQRes.data.questions);
+          const outcome = resolveAdminQuestionBankFetchOutcome(adminQRes);
+          if (outcome.ok) {
+            setQuestions(outcome.questions);
+            updateQuestionCountsFromPool(outcome.questions);
             questionsLoadedModeRef.current = 'admin';
+            setAdminQuestionsState(outcome.state);
           } else if (!isProdEnv) {
             const fsQ = await fetchQuestionsFromFirestore();
             if (fsQ.length > 0) {
               setQuestions(fsQ);
               updateQuestionCountsFromPool(fsQ);
               questionsLoadedModeRef.current = 'admin';
+              setAdminQuestionsState({ status: 'loaded', questionCount: fsQ.length });
+            } else {
+              setQuestions([]);
+              questionsLoadedModeRef.current = 'none';
+              setAdminQuestionsState(outcome.state);
             }
+          } else {
+            if (outcome.state.errorCode === 'SESSION_REVOKED') {
+              handleSessionRevokedRef.current(outcome.state.errorMessage || 'Session revoked');
+            }
+            setQuestions([]);
+            questionsLoadedModeRef.current = 'none';
+            setAdminQuestionsState(outcome.state);
           }
         } else {
           const qRes = await apiFetchSanitizedQuestions();
@@ -625,6 +678,18 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         }
       } catch (err) {
         console.warn('Lazy question bank load notice:', err);
+        if (isOwner) {
+          setQuestions([]);
+          questionsLoadedModeRef.current = 'none';
+          setAdminQuestionsState({
+            status: 'error',
+            questionCount: 0,
+            httpStatus: 0,
+            errorCode: 'NETWORK_ERROR',
+            errorCategory: 'unavailable',
+            errorMessage: formatBackendApiError({ status: 0, code: 'NETWORK_ERROR' })
+          });
+        }
       }
     };
 
@@ -635,7 +700,35 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     });
     questionsFetchInFlightRef.current = { mode: desiredMode, promise };
     return promise;
-  }, [updateQuestionCountsFromPool]);
+  }, [activeScreen, updateQuestionCountsFromPool]);
+
+  const reloadAdminQuestions = useCallback(async () => {
+    await ensureQuestionsLoaded({ forceReload: true });
+  }, [ensureQuestionsLoaded]);
+
+  const syncEdgeQuestionCache = useCallback(async () => {
+    const res = await executeAuthoritativeAdminApi({
+      isVerifiedOwner: isVerifiedOwnerAccount(auth?.currentUser),
+      operation: () => apiAdminSyncQuestionCache(),
+      onSessionRevoked: reason => handleSessionRevokedRef.current(reason)
+    });
+    if (!res.success || !res.data) {
+      return {
+        success: false,
+        message: res.error || 'D1 Edge Cache সিঙ্ক করা যায়নি।'
+      };
+    }
+    const { questionCount, keyCount, examsCount } = res.data;
+    setTotalQuestionCount(questionCount);
+    await ensureQuestionsLoaded({ forceReload: true });
+    return {
+      success: true,
+      questionCount,
+      keyCount,
+      examsCount,
+      message: `Edge Cache সিঙ্ক সম্পন্ন: ${questionCount}টি প্রশ্ন, ${keyCount}টি উত্তর কী এবং ${examsCount}টি পরীক্ষা D1-এ আপডেট হয়েছে।`
+    };
+  }, [ensureQuestionsLoaded]);
 
   const ensureSubjectQuestionsLoaded = useCallback(
     async (subjectId: string, opts?: { loadNextPage?: boolean }) => {
@@ -1238,6 +1331,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     subjectFetchInFlightRef.current.clear();
     setSubjectPagination({});
     setAdminDashboardStats(null);
+    setAdminQuestionsState({ status: 'idle', questionCount: 0 });
     setQuestions(INITIAL_QUESTIONS);
     setSubscriptions([]);
     setPaymentRequests([]);
@@ -1360,6 +1454,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         subjectFetchInFlightRef.current.clear();
         setSubjectPagination({});
         setAdminDashboardStats(null);
+        setAdminQuestionsState({ status: 'idle', questionCount: 0 });
         setQuestions(INITIAL_QUESTIONS);
         setSubscriptions([]);
         setPaymentRequests([]);
@@ -2817,6 +2912,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         loadMoreSubjectQuestions,
         getSubjectLoadState,
         adminDashboardStats,
+        adminQuestionsState,
+        reloadAdminQuestions,
+        syncEdgeQuestionCache,
         exams,
         examResults,
         paymentRequests,
