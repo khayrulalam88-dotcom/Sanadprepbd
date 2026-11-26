@@ -287,12 +287,293 @@ export function findSeedExamConflictReason(
   return null;
 }
 
+export interface QuestionBankVersionValidationResult {
+  compatible: boolean;
+  reason?: string;
+  versionToken?: string;
+  version?: number;
+  updatedAt?: string;
+  updateTime?: string;
+  unrelatedFields: string[];
+}
+
+const CORE_VERSION_MARKER_FIELDS = new Set(['id', 'version', 'versionToken', 'updatedAt']);
+const UNEXPECTED_REQUIRED_METADATA_PATTERNS = [
+  /^required/i,
+  /^min[A-Z_]/,
+  /^expected[A-Z_]/,
+  /^lock/i,
+  /^migration/i,
+  /^checksum$/i,
+  /^manifest/i,
+  /^signature$/i,
+  /^metadata$/i
+];
+
+export function validateQuestionBankVersionMarker(
+  doc: Record<string, unknown> | null | undefined,
+  updateTime?: string,
+  options?: { expectedProjectId?: string; expectedDatabaseId?: string }
+): QuestionBankVersionValidationResult {
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) {
+    return {
+      compatible: false,
+      reason: 'Existing config/questionBankVersion is not a valid document object.',
+      unrelatedFields: []
+    };
+  }
+
+  const cleanUpdateTime = typeof updateTime === 'string' ? updateTime.trim() : '';
+  if (!cleanUpdateTime) {
+    return {
+      compatible: false,
+      reason:
+        'Existing config/questionBankVersion is missing Firestore updateTime metadata required for compare-and-swap.',
+      unrelatedFields: []
+    };
+  }
+
+  const rawToken = doc.versionToken;
+  const cleanToken = typeof rawToken === 'string' ? rawToken.trim() : '';
+  if (!cleanToken || cleanToken.length > 128 || /\s/.test(cleanToken)) {
+    return {
+      compatible: false,
+      reason: 'Existing config/questionBankVersion is missing a valid versionToken string.',
+      updateTime: cleanUpdateTime,
+      unrelatedFields: []
+    };
+  }
+
+  if ('version' in doc && doc.version !== undefined) {
+    if (typeof doc.version !== 'number' || !Number.isFinite(doc.version) || doc.version < 0) {
+      return {
+        compatible: false,
+        reason: 'Existing config/questionBankVersion has an invalid non-numeric version field.',
+        versionToken: cleanToken,
+        updateTime: cleanUpdateTime,
+        unrelatedFields: []
+      };
+    }
+  }
+
+  if ('updatedAt' in doc && doc.updatedAt !== undefined) {
+    if (
+      typeof doc.updatedAt !== 'string' ||
+      !doc.updatedAt.trim() ||
+      Number.isNaN(Date.parse(doc.updatedAt))
+    ) {
+      return {
+        compatible: false,
+        reason: 'Existing config/questionBankVersion has an invalid updatedAt timestamp.',
+        versionToken: cleanToken,
+        updateTime: cleanUpdateTime,
+        unrelatedFields: []
+      };
+    }
+  }
+
+  if (doc.locked === true || doc.readOnly === true || doc.frozen === true || doc.incompatible === true) {
+    return {
+      compatible: false,
+      reason: 'Existing config/questionBankVersion is locked or marked incompatible.',
+      versionToken: cleanToken,
+      updateTime: cleanUpdateTime,
+      unrelatedFields: []
+    };
+  }
+
+  if ('schemaVersion' in doc && doc.schemaVersion !== undefined && doc.schemaVersion !== 1) {
+    return {
+      compatible: false,
+      reason: `Unsupported config/questionBankVersion schemaVersion (${String(doc.schemaVersion)}).`,
+      versionToken: cleanToken,
+      updateTime: cleanUpdateTime,
+      unrelatedFields: []
+    };
+  }
+
+  if ('formatVersion' in doc && doc.formatVersion !== undefined && doc.formatVersion !== 1) {
+    return {
+      compatible: false,
+      reason: `Unsupported config/questionBankVersion formatVersion (${String(doc.formatVersion)}).`,
+      versionToken: cleanToken,
+      updateTime: cleanUpdateTime,
+      unrelatedFields: []
+    };
+  }
+
+  if ('versionSchema' in doc && doc.versionSchema !== undefined && doc.versionSchema !== 1) {
+    return {
+      compatible: false,
+      reason: `Unsupported config/questionBankVersion versionSchema (${String(doc.versionSchema)}).`,
+      versionToken: cleanToken,
+      updateTime: cleanUpdateTime,
+      unrelatedFields: []
+    };
+  }
+
+  if (
+    'projectId' in doc &&
+    doc.projectId !== undefined &&
+    options?.expectedProjectId &&
+    String(doc.projectId) !== options.expectedProjectId
+  ) {
+    return {
+      compatible: false,
+      reason: `Existing config/questionBankVersion projectId "${String(doc.projectId)}" does not match "${options.expectedProjectId}".`,
+      versionToken: cleanToken,
+      updateTime: cleanUpdateTime,
+      unrelatedFields: []
+    };
+  }
+
+  if (
+    'databaseId' in doc &&
+    doc.databaseId !== undefined &&
+    options?.expectedDatabaseId &&
+    String(doc.databaseId) !== options.expectedDatabaseId
+  ) {
+    return {
+      compatible: false,
+      reason: `Existing config/questionBankVersion databaseId "${String(doc.databaseId)}" does not match "${options.expectedDatabaseId}".`,
+      versionToken: cleanToken,
+      updateTime: cleanUpdateTime,
+      unrelatedFields: []
+    };
+  }
+
+  const unrelatedFields: string[] = [];
+  for (const [key, val] of Object.entries(doc)) {
+    if (CORE_VERSION_MARKER_FIELDS.has(key)) continue;
+    const isUnexpectedRequired = UNEXPECTED_REQUIRED_METADATA_PATTERNS.some(re => re.test(key));
+    if (isUnexpectedRequired && val !== undefined && val !== null && val !== false) {
+      return {
+        compatible: false,
+        reason: `Existing config/questionBankVersion contains unexpected required metadata field "${key}".`,
+        versionToken: cleanToken,
+        updateTime: cleanUpdateTime,
+        unrelatedFields: []
+      };
+    }
+    unrelatedFields.push(key);
+  }
+
+  return {
+    compatible: true,
+    versionToken: cleanToken,
+    ...(typeof doc.version === 'number' ? { version: doc.version } : {}),
+    ...(typeof doc.updatedAt === 'string' ? { updatedAt: doc.updatedAt } : {}),
+    updateTime: cleanUpdateTime,
+    unrelatedFields
+  };
+}
+
+function isFirestoreConflictError(err: unknown): boolean {
+  if (!(err instanceof WorkerHttpError)) return false;
+  return (
+    err.status === 409 ||
+    err.code === 'ALREADY_EXISTS' ||
+    err.code === 'FAILED_PRECONDITION' ||
+    err.code === 'ABORTED' ||
+    err.code === 'CONFLICT_DETECTED'
+  );
+}
+
 export async function handleQuestionBankSeedRoutes(
   ctx: SeedRouteContext
 ): Promise<SeedRouteResult | null> {
   const { pathname, method, env, projectId, nowMs, firestoreClient } = ctx;
   const db = env.DB!;
   const nowIso = new Date(nowMs).toISOString();
+
+  if (pathname === '/api/admin/seed/question-bank/preflight' && method === 'POST') {
+    const authUser = await authenticateFirebaseRequest(ctx.request, {
+      projectId,
+      environment: env.ENVIRONMENT,
+      jwksFetcher: ctx.jwksFetcher,
+      tokenVerifier: ctx.tokenVerifier,
+      nowMs
+    });
+    assertOwnerAdmin(authUser, env);
+
+    const body = await parseSeedJsonObjectBody(ctx.request);
+    if (body.dryRun !== undefined && typeof body.dryRun !== 'boolean') {
+      throw new WorkerHttpError(400, 'INVALID_SEED_PAYLOAD', 'dryRun must be a boolean.');
+    }
+    const dryRun = body.dryRun !== false;
+
+    const ownerClient = firestoreClient.withToken(authUser.idToken);
+    const versionMeta = await ownerClient.getDocumentWithMetadata<Record<string, unknown>>(
+      'config',
+      'questionBankVersion'
+    );
+
+    if (!versionMeta.data) {
+      return {
+        status: 200,
+        payload: {
+          success: true,
+          dryRun,
+          safeToExecute: true,
+          versionExists: false,
+          compatible: true,
+          versionAction: 'create',
+          versionDocumentStatus: 'missing (will create at finalize)',
+          existingVersionToken: null,
+          expectedUpdateTime: null,
+          unrelatedFields: [],
+          conflicts: []
+        }
+      };
+    }
+
+    const validation = validateQuestionBankVersionMarker(versionMeta.data, versionMeta.updateTime, {
+      expectedProjectId: ownerClient.projectId,
+      expectedDatabaseId: ownerClient.databaseId
+    });
+
+    if (!validation.compatible) {
+      const conflict: SeedConflict = {
+        collection: 'config',
+        docId: 'questionBankVersion',
+        reason: validation.reason || 'Incompatible existing config/questionBankVersion marker.'
+      };
+      return {
+        status: dryRun ? 200 : 409,
+        payload: {
+          ...(dryRun ? {} : { error: 'CONFLICT_DETECTED', message: conflict.reason }),
+          success: false,
+          dryRun,
+          safeToExecute: false,
+          versionExists: true,
+          compatible: false,
+          versionAction: 'blocked',
+          versionDocumentStatus: `incompatible (${conflict.reason})`,
+          existingVersionToken: validation.versionToken ?? null,
+          expectedUpdateTime: versionMeta.updateTime ?? null,
+          unrelatedFields: [],
+          conflicts: [conflict]
+        }
+      };
+    }
+
+    return {
+      status: 200,
+      payload: {
+        success: true,
+        dryRun,
+        safeToExecute: true,
+        versionExists: true,
+        compatible: true,
+        versionAction: 'conditional_update',
+        versionDocumentStatus: 'will be conditionally updated at finalize',
+        existingVersionToken: validation.versionToken,
+        expectedUpdateTime: validation.updateTime,
+        unrelatedFields: validation.unrelatedFields,
+        conflicts: []
+      }
+    };
+  }
 
   if (pathname === '/api/admin/seed/question-bank/batch' && method === 'POST') {
     const authUser = await authenticateFirebaseRequest(ctx.request, {
@@ -555,18 +836,112 @@ export async function handleQuestionBankSeedRoutes(
     if (!Number.isFinite(pendingDataWrites) || pendingDataWrites < 0) {
       throw new WorkerHttpError(400, 'INVALID_SEED_PAYLOAD', 'pendingDataWrites must be >= 0.');
     }
+    if (body.expectedVersionExists !== undefined && typeof body.expectedVersionExists !== 'boolean') {
+      throw new WorkerHttpError(
+        400,
+        'INVALID_SEED_PAYLOAD',
+        'expectedVersionExists must be a boolean when provided.'
+      );
+    }
+    if (
+      body.expectedUpdateTime !== undefined &&
+      body.expectedUpdateTime !== null &&
+      typeof body.expectedUpdateTime !== 'string'
+    ) {
+      throw new WorkerHttpError(
+        400,
+        'INVALID_SEED_PAYLOAD',
+        'expectedUpdateTime must be a string when provided.'
+      );
+    }
+    if (
+      body.expectedVersionToken !== undefined &&
+      body.expectedVersionToken !== null &&
+      typeof body.expectedVersionToken !== 'string'
+    ) {
+      throw new WorkerHttpError(
+        400,
+        'INVALID_SEED_PAYLOAD',
+        'expectedVersionToken must be a string when provided.'
+      );
+    }
+
+    const expectedVersionExists =
+      typeof body.expectedVersionExists === 'boolean' ? body.expectedVersionExists : undefined;
+    const expectedUpdateTime =
+      typeof body.expectedUpdateTime === 'string' && body.expectedUpdateTime.trim()
+        ? body.expectedUpdateTime.trim()
+        : undefined;
+    const expectedVersionToken =
+      typeof body.expectedVersionToken === 'string' && body.expectedVersionToken.trim()
+        ? body.expectedVersionToken.trim()
+        : undefined;
+
     const totalQuestionsCommitted = Number(body.questionsCreated ?? 0);
     const totalKeysCommitted = Number(body.questionKeysCreated ?? 0);
     const totalExamsCommitted = Number(body.examsCreated ?? 0);
 
     const ownerClient = firestoreClient.withToken(authUser.idToken);
-    const versionDoc = await ownerClient.getDocument<Record<string, unknown>>(
+    const versionMeta = await ownerClient.getDocumentWithMetadata<Record<string, unknown>>(
       'config',
       'questionBankVersion'
     );
 
-    if (!versionDoc) {
-      const versionPayload = createQuestionBankVersionPayload(nowIso, nowMs);
+    const makeFreshVersionPayload = (previousToken?: string) => {
+      let candidate = createQuestionBankVersionPayload(nowIso, nowMs);
+      if (previousToken && candidate.versionToken === previousToken) {
+        candidate = createQuestionBankVersionPayload(nowIso, nowMs + 1);
+      }
+      return candidate;
+    };
+
+    if (!versionMeta.data) {
+      if (expectedVersionExists === true) {
+        const conflict: SeedConflict = {
+          collection: 'config',
+          docId: 'questionBankVersion',
+          reason:
+            'config/questionBankVersion existed during preflight but disappeared before finalize.'
+        };
+        if (!dryRun) {
+          return {
+            status: 409,
+            payload: {
+              error: 'CONFLICT_DETECTED',
+              message: conflict.reason,
+              success: false,
+              dryRun: false,
+              executed: false,
+              safeToExecute: false,
+              versionExists: false,
+              compatible: false,
+              versionAction: 'blocked',
+              versionDocumentStatus: 'deleted since preflight',
+              writesCommitted: 0,
+              conflicts: [conflict]
+            }
+          };
+        }
+        return {
+          status: 200,
+          payload: {
+            success: false,
+            dryRun: true,
+            executed: false,
+            safeToExecute: false,
+            versionExists: false,
+            compatible: false,
+            versionAction: 'blocked',
+            versionDocumentStatus: 'deleted since preflight',
+            wouldCreateVersionDocument: 0,
+            wouldUpdateVersionDocument: 0,
+            writesCommitted: 0,
+            conflicts: [conflict]
+          }
+        };
+      }
+
+      const versionPayload = makeFreshVersionPayload();
       if (dryRun) {
         return {
           status: 200,
@@ -576,9 +951,12 @@ export async function handleQuestionBankSeedRoutes(
             executed: false,
             safeToExecute: true,
             versionExists: false,
-            versionDocumentStatus: 'missing (will create last)',
+            compatible: true,
+            versionAction: 'create',
+            versionDocumentStatus: 'missing (will create at finalize)',
             plannedVersionToken: versionPayload.versionToken,
             wouldCreateVersionDocument: 1,
+            wouldUpdateVersionDocument: 0,
             writesCommitted: 0,
             conflicts: []
           }
@@ -594,20 +972,46 @@ export async function handleQuestionBankSeedRoutes(
         timestamp: nowIso
       };
 
-      await ownerClient.commitWrites([
-        {
-          type: 'create',
-          collection: 'config',
-          docId: 'questionBankVersion',
-          data: { ...versionPayload }
-        },
-        {
-          type: 'set',
-          collection: 'auditLogs',
-          docId: auditEntry.id,
-          data: { ...auditEntry }
+      try {
+        await ownerClient.commitWrites([
+          {
+            type: 'create',
+            collection: 'config',
+            docId: 'questionBankVersion',
+            data: { ...versionPayload }
+          },
+          {
+            type: 'set',
+            collection: 'auditLogs',
+            docId: auditEntry.id,
+            data: { ...auditEntry }
+          }
+        ]);
+      } catch (err) {
+        if (isFirestoreConflictError(err)) {
+          const conflict: SeedConflict = {
+            collection: 'config',
+            docId: 'questionBankVersion',
+            reason:
+              'config/questionBankVersion was created concurrently before finalize commit.'
+          };
+          return {
+            status: 409,
+            payload: {
+              error: 'CONFLICT_DETECTED',
+              message: conflict.reason,
+              success: false,
+              dryRun: false,
+              executed: false,
+              safeToExecute: false,
+              versionExists: true,
+              writesCommitted: 0,
+              conflicts: [conflict]
+            }
+          };
         }
-      ]);
+        throw err;
+      }
       await writeAuditLogD1(db, auditEntry, true).catch(() => undefined);
 
       return {
@@ -618,6 +1022,8 @@ export async function handleQuestionBankSeedRoutes(
           executed: true,
           safeToExecute: true,
           versionExists: false,
+          compatible: true,
+          versionAction: 'create',
           versionDocumentStatus: 'created',
           versionToken: versionPayload.versionToken,
           versionPayload,
@@ -627,13 +1033,13 @@ export async function handleQuestionBankSeedRoutes(
       };
     }
 
-    const existingToken = String(versionDoc.versionToken || versionDoc.version || 'unknown');
-    if (pendingDataWrites > 0) {
+    // Existing config/questionBankVersion marker
+    if (expectedVersionExists === false) {
       const conflict: SeedConflict = {
         collection: 'config',
         docId: 'questionBankVersion',
         reason:
-          'config/questionBankVersion already exists while missing documents remain; create-only seeder will not overwrite existing version document.'
+          'config/questionBankVersion did not exist during preflight but was created concurrently before finalize.'
       };
       if (!dryRun) {
         return {
@@ -646,7 +1052,9 @@ export async function handleQuestionBankSeedRoutes(
             executed: false,
             safeToExecute: false,
             versionExists: true,
-            versionDocumentStatus: `exists (versionToken=${existingToken})`,
+            compatible: false,
+            versionAction: 'blocked',
+            versionDocumentStatus: 'created concurrently since preflight',
             writesCommitted: 0,
             conflicts: [conflict]
           }
@@ -660,26 +1068,254 @@ export async function handleQuestionBankSeedRoutes(
           executed: false,
           safeToExecute: false,
           versionExists: true,
-          versionDocumentStatus: `exists (versionToken=${existingToken})`,
+          compatible: false,
+          versionAction: 'blocked',
+          versionDocumentStatus: 'created concurrently since preflight',
           wouldCreateVersionDocument: 0,
+          wouldUpdateVersionDocument: 0,
           writesCommitted: 0,
           conflicts: [conflict]
         }
       };
     }
 
+    const validation = validateQuestionBankVersionMarker(versionMeta.data, versionMeta.updateTime, {
+      expectedProjectId: ownerClient.projectId,
+      expectedDatabaseId: ownerClient.databaseId
+    });
+
+    if (!validation.compatible) {
+      const conflict: SeedConflict = {
+        collection: 'config',
+        docId: 'questionBankVersion',
+        reason: validation.reason || 'Incompatible existing config/questionBankVersion marker.'
+      };
+      if (!dryRun) {
+        return {
+          status: 409,
+          payload: {
+            error: 'CONFLICT_DETECTED',
+            message: conflict.reason,
+            success: false,
+            dryRun: false,
+            executed: false,
+            safeToExecute: false,
+            versionExists: true,
+            compatible: false,
+            versionAction: 'blocked',
+            versionDocumentStatus: `incompatible (${conflict.reason})`,
+            existingVersionToken: validation.versionToken ?? null,
+            expectedUpdateTime: versionMeta.updateTime ?? null,
+            writesCommitted: 0,
+            conflicts: [conflict]
+          }
+        };
+      }
+      return {
+        status: 200,
+        payload: {
+          success: false,
+          dryRun: true,
+          executed: false,
+          safeToExecute: false,
+          versionExists: true,
+          compatible: false,
+          versionAction: 'blocked',
+          versionDocumentStatus: `incompatible (${conflict.reason})`,
+          existingVersionToken: validation.versionToken ?? null,
+          expectedUpdateTime: versionMeta.updateTime ?? null,
+          wouldCreateVersionDocument: 0,
+          wouldUpdateVersionDocument: 0,
+          writesCommitted: 0,
+          conflicts: [conflict]
+        }
+      };
+    }
+
+    const casMismatchReason =
+      expectedUpdateTime && versionMeta.updateTime !== expectedUpdateTime
+        ? `config/questionBankVersion changed since preflight (updateTime expected ${expectedUpdateTime}, found ${versionMeta.updateTime}).`
+        : expectedVersionToken && validation.versionToken !== expectedVersionToken
+        ? `config/questionBankVersion changed since preflight (versionToken expected ${expectedVersionToken}, found ${validation.versionToken}).`
+        : null;
+
+    if (casMismatchReason) {
+      const conflict: SeedConflict = {
+        collection: 'config',
+        docId: 'questionBankVersion',
+        reason: casMismatchReason
+      };
+      if (!dryRun) {
+        return {
+          status: 409,
+          payload: {
+            error: 'CONFLICT_DETECTED',
+            message: casMismatchReason,
+            success: false,
+            dryRun: false,
+            executed: false,
+            safeToExecute: false,
+            versionExists: true,
+            compatible: true,
+            versionAction: 'blocked',
+            versionDocumentStatus: 'modified concurrently since preflight',
+            existingVersionToken: validation.versionToken,
+            expectedUpdateTime: versionMeta.updateTime,
+            writesCommitted: 0,
+            conflicts: [conflict]
+          }
+        };
+      }
+      return {
+        status: 200,
+        payload: {
+          success: false,
+          dryRun: true,
+          executed: false,
+          safeToExecute: false,
+          versionExists: true,
+          compatible: true,
+          versionAction: 'blocked',
+          versionDocumentStatus: 'modified concurrently since preflight',
+          existingVersionToken: validation.versionToken,
+          expectedUpdateTime: versionMeta.updateTime,
+          wouldCreateVersionDocument: 0,
+          wouldUpdateVersionDocument: 0,
+          writesCommitted: 0,
+          conflicts: [conflict]
+        }
+      };
+    }
+
+    const versionPayload = makeFreshVersionPayload(validation.versionToken);
+    const casUpdateTime = expectedUpdateTime || validation.updateTime!;
+
+    if (dryRun) {
+      const willUpdate = pendingDataWrites > 0;
+      return {
+        status: 200,
+        payload: {
+          success: true,
+          dryRun: true,
+          executed: false,
+          safeToExecute: true,
+          versionExists: true,
+          compatible: true,
+          versionAction: willUpdate ? 'conditional_update' : 'noop',
+          versionDocumentStatus: willUpdate
+            ? 'will be conditionally updated at finalize'
+            : `exists (versionToken=${validation.versionToken}, up-to-date)`,
+          existingVersionToken: validation.versionToken,
+          expectedUpdateTime: casUpdateTime,
+          unrelatedFieldsPreserved: validation.unrelatedFields,
+          plannedVersionToken: willUpdate ? versionPayload.versionToken : validation.versionToken,
+          wouldCreateVersionDocument: 0,
+          wouldUpdateVersionDocument: willUpdate ? 1 : 0,
+          writesCommitted: 0,
+          conflicts: []
+        }
+      };
+    }
+
+    if (pendingDataWrites === 0) {
+      return {
+        status: 200,
+        payload: {
+          success: true,
+          dryRun: false,
+          executed: true,
+          safeToExecute: true,
+          versionExists: true,
+          compatible: true,
+          versionAction: 'noop',
+          versionDocumentStatus: `exists (versionToken=${validation.versionToken}, up-to-date)`,
+          existingVersionToken: validation.versionToken,
+          versionToken: validation.versionToken,
+          expectedUpdateTime: casUpdateTime,
+          unrelatedFieldsPreserved: validation.unrelatedFields,
+          writesCommitted: 0,
+          conflicts: []
+        }
+      };
+    }
+
+    const auditEntry: AuditLog = {
+      id: `log_${nowMs}_${Math.random().toString(36).slice(2, 6)}`,
+      userId: authUser.uid,
+      userName: authUser.email || 'Owner Admin',
+      action: 'SEED_QUESTION_BANK_WORKER',
+      details: `Owner seeded question bank via Worker (created questions=${totalQuestionsCommitted}, keys=${totalKeysCommitted}, exams=${totalExamsCommitted}, previousVersionToken=${validation.versionToken}, versionToken=${versionPayload.versionToken}).`,
+      timestamp: nowIso
+    };
+
+    try {
+      await ownerClient.commitWrites([
+        {
+          type: 'update',
+          collection: 'config',
+          docId: 'questionBankVersion',
+          patch: {
+            version: versionPayload.version,
+            versionToken: versionPayload.versionToken,
+            updatedAt: versionPayload.updatedAt
+          },
+          currentDocument: { updateTime: casUpdateTime }
+        },
+        {
+          type: 'set',
+          collection: 'auditLogs',
+          docId: auditEntry.id,
+          data: { ...auditEntry }
+        }
+      ]);
+    } catch (err) {
+      if (isFirestoreConflictError(err)) {
+        const conflict: SeedConflict = {
+          collection: 'config',
+          docId: 'questionBankVersion',
+          reason:
+            'config/questionBankVersion was modified concurrently since preflight (currentDocument.updateTime precondition failed).'
+        };
+        return {
+          status: 409,
+          payload: {
+            error: 'CONFLICT_DETECTED',
+            message: conflict.reason,
+            success: false,
+            dryRun: false,
+            executed: false,
+            safeToExecute: false,
+            versionExists: true,
+            compatible: true,
+            versionAction: 'blocked',
+            versionDocumentStatus: 'concurrent modification rejected (409)',
+            writesCommitted: 0,
+            conflicts: [conflict]
+          }
+        };
+      }
+      throw err;
+    }
+
+    await writeAuditLogD1(db, auditEntry, true).catch(() => undefined);
+
     return {
       status: 200,
       payload: {
         success: true,
-        dryRun,
-        executed: !dryRun,
+        dryRun: false,
+        executed: true,
         safeToExecute: true,
         versionExists: true,
-        versionDocumentStatus: `exists (versionToken=${existingToken}, up-to-date)`,
-        existingVersionToken: existingToken,
-        wouldCreateVersionDocument: 0,
-        writesCommitted: 0,
+        compatible: true,
+        versionAction: 'conditional_update',
+        versionDocumentStatus: 'conditionally updated',
+        previousVersionToken: validation.versionToken,
+        previousUpdateTime: casUpdateTime,
+        versionToken: versionPayload.versionToken,
+        versionPayload,
+        unrelatedFieldsPreserved: validation.unrelatedFields,
+        writesCommitted: 1,
         conflicts: []
       }
     };

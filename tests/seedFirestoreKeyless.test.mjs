@@ -105,6 +105,51 @@ function createMockWorkerFetch(initialStore = {}, options = {}) {
     }
 
     const parsedUrl = new URL(url);
+    if (parsedUrl.pathname === '/api/admin/seed/question-bank/preflight' && method === 'POST') {
+      const existingVersion = store.config.get('questionBankVersion');
+      if (!existingVersion) {
+        return new Response(
+          JSON.stringify({
+            success: true,
+            safeToExecute: true,
+            versionExists: false,
+            compatible: true,
+            versionDocumentStatus: 'missing (will create at finalize)',
+            existingVersionToken: null,
+            expectedUpdateTime: null,
+            conflicts: []
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (existingVersion.locked === true) {
+        return new Response(
+          JSON.stringify({
+            success: false,
+            safeToExecute: false,
+            versionExists: true,
+            compatible: false,
+            versionDocumentStatus: 'incompatible (locked)',
+            conflicts: [{ collection: 'config', docId: 'questionBankVersion', reason: 'Marker is locked.' }]
+          }),
+          { status: bodyObj.dryRun === false ? 409 : 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          success: true,
+          safeToExecute: true,
+          versionExists: true,
+          compatible: true,
+          versionDocumentStatus: 'will be conditionally updated at finalize',
+          existingVersionToken: existingVersion.versionToken,
+          expectedUpdateTime: existingVersion._updateTime || '2026-01-01T00:00:00.000Z',
+          conflicts: []
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+
     if (parsedUrl.pathname === '/api/admin/seed/question-bank/batch' && method === 'POST') {
       batchCallCount += 1;
       if (options.rateLimitOnCall === batchCallCount) {
@@ -212,20 +257,58 @@ function createMockWorkerFetch(initialStore = {}, options = {}) {
     if (parsedUrl.pathname === '/api/admin/seed/question-bank/finalize' && method === 'POST') {
       const dryRun = bodyObj.dryRun !== false;
       const pending = Number(bodyObj.pendingDataWrites || 0);
+      if (options.simulateConcurrentVersionChangeOnFinalize && !dryRun) {
+        return new Response(
+          JSON.stringify({
+            error: 'CONFLICT_DETECTED',
+            message: 'Concurrent modification detected on config/questionBankVersion.',
+            success: false,
+            safeToExecute: false,
+            conflicts: [{ collection: 'config', docId: 'questionBankVersion', reason: 'updateTime mismatch' }]
+          }),
+          { status: 409, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+
       const existingVersion = store.config.get('questionBankVersion');
       if (existingVersion) {
-        if (pending > 0) {
+        if (existingVersion.locked === true) {
           return new Response(
             JSON.stringify({
+              error: 'CONFLICT_DETECTED',
+              message: 'Marker is locked.',
               success: false,
               dryRun,
               safeToExecute: false,
               versionExists: true,
-              versionDocumentStatus: 'exists',
-              conflicts: [{ collection: 'config', docId: 'questionBankVersion', reason: 'Already exists' }]
+              compatible: false,
+              versionDocumentStatus: 'incompatible (Marker is locked.)',
+              conflicts: [{ collection: 'config', docId: 'questionBankVersion', reason: 'Marker is locked.' }]
             }),
             { status: dryRun ? 200 : 409, headers: { 'Content-Type': 'application/json' } }
           );
+        }
+        const currentUpdateTime = existingVersion._updateTime || '2026-01-01T00:00:00.000Z';
+        if (bodyObj.expectedUpdateTime && bodyObj.expectedUpdateTime !== currentUpdateTime) {
+          return new Response(
+            JSON.stringify({
+              error: 'CONFLICT_DETECTED',
+              message: 'config/questionBankVersion changed since preflight.',
+              success: false,
+              safeToExecute: false,
+              conflicts: [{ collection: 'config', docId: 'questionBankVersion', reason: 'updateTime mismatch' }]
+            }),
+            { status: dryRun ? 200 : 409, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        const tokenVal = '1700000000001_2_mock';
+        if (!dryRun && pending > 0) {
+          store.config.set('questionBankVersion', {
+            ...existingVersion,
+            version: 1700000000001002,
+            versionToken: tokenVal,
+            _updateTime: '2026-01-02T00:00:00.000Z'
+          });
         }
         return new Response(
           JSON.stringify({
@@ -234,8 +317,16 @@ function createMockWorkerFetch(initialStore = {}, options = {}) {
             executed: !dryRun,
             safeToExecute: true,
             versionExists: true,
-            versionDocumentStatus: 'exists (up-to-date)',
-            writesCommitted: 0,
+            compatible: true,
+            versionDocumentStatus:
+              pending > 0
+                ? dryRun
+                  ? 'will be conditionally updated at finalize'
+                  : 'conditionally updated'
+                : 'exists (up-to-date)',
+            wouldUpdateVersionDocument: pending > 0 ? 1 : 0,
+            versionToken: !dryRun && pending > 0 ? tokenVal : existingVersion.versionToken,
+            writesCommitted: !dryRun && pending > 0 ? 1 : 0,
             conflicts: []
           }),
           { status: 200, headers: { 'Content-Type': 'application/json' } }
@@ -244,7 +335,11 @@ function createMockWorkerFetch(initialStore = {}, options = {}) {
 
       const tokenVal = '1700000000000_1_mock';
       if (!dryRun) {
-        store.config.set('questionBankVersion', { version: 1700000000000001, versionToken: tokenVal });
+        store.config.set('questionBankVersion', {
+          version: 1700000000000001,
+          versionToken: tokenVal,
+          _updateTime: '2026-01-01T00:00:00.000Z'
+        });
       }
       return new Response(
         JSON.stringify({
@@ -253,7 +348,8 @@ function createMockWorkerFetch(initialStore = {}, options = {}) {
           executed: !dryRun,
           safeToExecute: true,
           versionExists: false,
-          versionDocumentStatus: dryRun ? 'missing (will create last)' : 'created',
+          compatible: true,
+          versionDocumentStatus: dryRun ? 'missing (will create at finalize)' : 'created',
           plannedVersionToken: tokenVal,
           versionToken: dryRun ? undefined : tokenVal,
           writesCommitted: dryRun ? 0 : 1,
@@ -496,5 +592,71 @@ describe('Worker-Mediated Keyless Firestore Seeder CLI', () => {
     });
     assert.equal(report.conflicts.length, 0);
     assert.ok(requests.length >= 42);
+  });
+
+  test('CLI handles existing compatible version marker safely and blocks on concurrent 409 without D1 sync', async () => {
+    const questions = makeSampleQuestions(3);
+    const exams = makeSampleExams(questions.map(q => q.id));
+
+    const { fetchImpl: compatibleFetch, store } = createMockWorkerFetch({
+      config: {
+        questionBankVersion: {
+          version: 1795617149157001,
+          versionToken: '1795617149157_1_80125c',
+          _updateTime: '2026-11-26T00:00:00.000Z'
+        }
+      },
+      exams: {
+        exam_model_test_01: exams[0]
+      }
+    });
+
+    const dryReport = await runSeedFirestoreKeyless({
+      execute: false,
+      token: makeOwnerJwt(),
+      fetchImpl: compatibleFetch,
+      questions,
+      exams
+    });
+    assert.equal(dryReport.safeToExecute, true);
+    assert.equal(dryReport.conflicts.length, 0);
+    assert.equal(dryReport.versionDocumentStatus, 'will be conditionally updated at finalize');
+    assert.equal(dryReport.existingFirestoreCounts.questionBankVersionExists, true);
+    assert.equal(dryReport.matchingCounts.exams, 1);
+    assert.equal(dryReport.wouldCreate.questions, 3);
+    assert.equal(dryReport.wouldCreate.questionKeys, 3);
+    assert.equal(dryReport.wouldCreate.exams, 0);
+    assert.equal(dryReport.wouldUpdateVersionDocument, 1);
+    assert.equal(store.config.get('questionBankVersion').versionToken, '1795617149157_1_80125c');
+
+    const { fetchImpl: conflictFetch, requests: conflictRequests } = createMockWorkerFetch(
+      {
+        config: {
+          questionBankVersion: {
+            version: 1795617149157001,
+            versionToken: '1795617149157_1_80125c',
+            _updateTime: '2026-11-26T00:00:00.000Z'
+          }
+        }
+      },
+      { simulateConcurrentVersionChangeOnFinalize: true }
+    );
+
+    await assert.rejects(
+      () =>
+        runSeedFirestoreKeyless({
+          execute: true,
+          token: makeOwnerJwt(),
+          fetchImpl: conflictFetch,
+          questions,
+          exams
+        }),
+      err => err.code === 'CONFLICT_DETECTED'
+    );
+    assert.equal(
+      conflictRequests.some(r => r.url.includes('/sync-cache')),
+      false,
+      'D1 sync must NOT execute when finalize returns 409 CONFLICT_DETECTED'
+    );
   });
 });

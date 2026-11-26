@@ -156,11 +156,19 @@ async function signJwt(privateKey: CryptoKey, kid: string, claims: Record<string
 function createEnterpriseFirestoreStub(options?: {
   rejectCollectionListRest?: boolean;
   failCommitOnCall?: number;
+  mutateVersionDocOnCommitCall?: { callNumber: number; nextVersionToken: string };
 }) {
   const expectedPrefix = `https://firestore.googleapis.com/v1/projects/${EXPECTED_FIREBASE_PROJECT_ID}/databases/${EXPECTED_FIREBASE_DATABASE_ID}/documents`;
   const collections = new Map<string, Map<string, Record<string, unknown>>>();
-  const opLog: Array<{ op: string; url: string }> = [];
+  const docTimestamps = new Map<string, { createTime: string; updateTime: string }>();
+  const opLog: Array<{ op: string; url: string; writes?: unknown[] }> = [];
   let commitCalls = 0;
+  let tsSeq = 0;
+
+  const nextUpdateTimestamp = () => {
+    tsSeq += 1;
+    return `2026-11-26T00:00:${String(tsSeq).padStart(2, '0')}.000000Z`;
+  };
 
   const getCol = (col: string) => {
     let map = collections.get(col);
@@ -171,9 +179,18 @@ function createEnterpriseFirestoreStub(options?: {
     return map;
   };
 
-  const setDoc = (col: string, id: string, data: Record<string, unknown>) => {
+  const setDoc = (col: string, id: string, data: Record<string, unknown>, customUpdateTime?: string) => {
     getCol(col).set(id, { ...data });
+    const key = `${col}/${id}`;
+    const existingMeta = docTimestamps.get(key);
+    const updateTime = customUpdateTime || nextUpdateTimestamp();
+    docTimestamps.set(key, {
+      createTime: existingMeta?.createTime || updateTime,
+      updateTime
+    });
   };
+
+  const getDocMeta = (col: string, id: string) => docTimestamps.get(`${col}/${id}`);
 
   const fetchImpl: typeof fetch = async (input, init) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
@@ -183,8 +200,28 @@ function createEnterpriseFirestoreStub(options?: {
     const restPath = url.slice(expectedPrefix.length);
 
     if (restPath === ':commit' && method === 'POST') {
-      opLog.push({ op: 'commit', url });
       commitCalls += 1;
+      const parsed = JSON.parse(String(init?.body || '{}')) as {
+        writes?: Array<{
+          update?: { name: string; fields?: Record<string, any> };
+          updateMask?: { fieldPaths?: string[] };
+          currentDocument?: { exists?: boolean; updateTime?: string };
+          delete?: string;
+        }>;
+      };
+      opLog.push({ op: 'commit', url, writes: parsed.writes });
+
+      if (
+        options?.mutateVersionDocOnCommitCall &&
+        options.mutateVersionDocOnCommitCall.callNumber === commitCalls
+      ) {
+        const existingVer = getCol('config').get('questionBankVersion') || {};
+        setDoc('config', 'questionBankVersion', {
+          ...existingVer,
+          versionToken: options.mutateVersionDocOnCommitCall.nextVersionToken
+        });
+      }
+
       if (options?.failCommitOnCall === commitCalls) {
         return new Response(
           JSON.stringify({ error: { code: 500, status: 'INTERNAL', message: 'Simulated commit error' } }),
@@ -192,21 +229,16 @@ function createEnterpriseFirestoreStub(options?: {
         );
       }
 
-      const parsed = JSON.parse(String(init?.body || '{}')) as {
-        writes?: Array<{
-          update?: { name: string; fields?: Record<string, any> };
-          currentDocument?: { exists?: boolean };
-          delete?: string;
-        }>;
-      };
-
+      // First validate all preconditions atomically before mutating
       for (const w of parsed.writes || []) {
         assert.equal(w.delete, undefined, 'Seed writes must never delete');
         if (w.update) {
           const [col, rawId] = w.update.name.split('/documents/')[1].split('/');
           const docId = decodeURIComponent(rawId);
           const colMap = getCol(col);
-          if (w.currentDocument?.exists === false && colMap.has(docId)) {
+          const exists = colMap.has(docId);
+          const meta = getDocMeta(col, docId);
+          if (w.currentDocument?.exists === false && exists) {
             return new Response(
               JSON.stringify({
                 error: { code: 409, status: 'ALREADY_EXISTS', message: `${col}/${docId} already exists` }
@@ -214,7 +246,47 @@ function createEnterpriseFirestoreStub(options?: {
               { status: 409, headers: { 'Content-Type': 'application/json' } }
             );
           }
-          colMap.set(docId, decodeDocumentFields(w.update.fields));
+          if (w.currentDocument?.exists === true && !exists) {
+            return new Response(
+              JSON.stringify({
+                error: { code: 404, status: 'NOT_FOUND', message: `${col}/${docId} not found` }
+              }),
+              { status: 404, headers: { 'Content-Type': 'application/json' } }
+            );
+          }
+          if (w.currentDocument?.updateTime) {
+            if (!exists || meta?.updateTime !== w.currentDocument.updateTime) {
+              return new Response(
+                JSON.stringify({
+                  error: {
+                    code: 409,
+                    status: 'FAILED_PRECONDITION',
+                    message: `${col}/${docId} updateTime precondition failed`
+                  }
+                }),
+                { status: 409, headers: { 'Content-Type': 'application/json' } }
+              );
+            }
+          }
+        }
+      }
+
+      for (const w of parsed.writes || []) {
+        if (w.update) {
+          const [col, rawId] = w.update.name.split('/documents/')[1].split('/');
+          const docId = decodeURIComponent(rawId);
+          const decoded = decodeDocumentFields(w.update.fields);
+          if (w.updateMask?.fieldPaths && w.updateMask.fieldPaths.length > 0) {
+            const prev = { ...(getCol(col).get(docId) || {}) };
+            for (const fieldPath of w.updateMask.fieldPaths) {
+              if (fieldPath in decoded) {
+                prev[fieldPath] = decoded[fieldPath];
+              }
+            }
+            setDoc(col, docId, prev);
+          } else {
+            setDoc(col, docId, decoded);
+          }
         }
       }
       return new Response(JSON.stringify({ writeResults: (parsed.writes || []).map(() => ({})) }), {
@@ -311,17 +383,20 @@ function createEnterpriseFirestoreStub(options?: {
       if (segments.length === 2) {
         opLog.push({ op: 'getDocument', url });
         const [col, rawId] = segments;
-        const found = getCol(col).get(decodeURIComponent(rawId));
+        const docId = decodeURIComponent(rawId);
+        const found = getCol(col).get(docId);
         if (!found) {
           return new Response(JSON.stringify({ error: { code: 404, status: 'NOT_FOUND' } }), {
             status: 404,
             headers: { 'Content-Type': 'application/json' }
           });
         }
+        const meta = getDocMeta(col, docId);
         return new Response(
           JSON.stringify({
             name: `${expectedPrefix}/${col}/${rawId}`,
-            fields: encodeDocumentFields(found)
+            fields: encodeDocumentFields(found),
+            ...(meta ? { createTime: meta.createTime, updateTime: meta.updateTime } : {})
           }),
           { status: 200, headers: { 'Content-Type': 'application/json' } }
         );
@@ -331,7 +406,7 @@ function createEnterpriseFirestoreStub(options?: {
     throw new Error(`Unhandled Firestore mock call: ${method} ${url}`);
   };
 
-  return { fetchImpl, getCol, setDoc, opLog };
+  return { fetchImpl, getCol, setDoc, getDocMeta, opLog };
 }
 
 function makeSampleQuestions(count = 6) {
@@ -734,5 +809,346 @@ describe('Worker-Mediated Question Bank Seeding, Sync Fallback & Admin Error Vis
     assert.equal(unavailableErr.ok, false);
     assert.equal(unavailableErr.state.status, 'error');
     assert.equal(unavailableErr.state.errorCategory, 'unavailable');
+  });
+
+  test('6. Existing compatible config/questionBankVersion + preserved exam: dry-run reports safeToExecute=true and execute performs CAS update preserving unrelated fields and D1 sync', async () => {
+    const db = await createMigratedTestD1();
+    const stub = createEnterpriseFirestoreStub({ rejectCollectionListRest: true });
+
+    const questions = makeSampleQuestions(5);
+    const exams = [
+      ...makeSampleExams(questions.map(q => q.id)),
+      {
+        id: 'exam_model_test_02',
+        titleBn: 'মডেল টেস্ট ০২',
+        titleEn: 'Model Test 02',
+        descriptionBn: 'দ্বিতীয় মডেল টেস্ট',
+        descriptionEn: 'Second model test',
+        type: 'full_mock',
+        durationMinutes: 60,
+        totalMarks: questions.length,
+        passThresholdPercentage: 50,
+        questionIds: questions.map(q => q.id),
+        isPaid: true,
+        isActive: false,
+        published: true,
+        releaseExplanationsImmediately: true,
+        negativeMarkRatio: 0.25,
+        positiveMarkRatio: 1,
+        createdAt: '2026-01-01T00:00:00.000Z'
+      }
+    ];
+
+    // Pre-existing Admin-customized exam + compatible config/questionBankVersion marker with unrelated field
+    stub.setDoc('exams', 'exam_model_test_01', {
+      ...exams[0],
+      isActive: false,
+      scheduledDate: '2026-12-30'
+    });
+    stub.setDoc(
+      'config',
+      'questionBankVersion',
+      {
+        version: 1795617149157001,
+        versionToken: '1795617149157_1_80125c',
+        updatedAt: '2026-11-25T10:00:00.000Z',
+        note: 'preserve-unrelated-field',
+        createdBy: 'initial-setup'
+      },
+      '2026-11-25T10:00:00.123456Z'
+    );
+
+    const env: WorkerEnv = {
+      DB: db,
+      FIREBASE_PROJECT_ID: EXPECTED_FIREBASE_PROJECT_ID,
+      FIREBASE_DATABASE_ID: EXPECTED_FIREBASE_DATABASE_ID,
+      ENVIRONMENT: 'production'
+    };
+    const handler = createWorkerHandler({
+      fetchImpl: stub.fetchImpl,
+      jwksFetcher: async () => ({ keys: [authKeys.jwk], maxAgeSeconds: 300 }),
+      nowMsFn: () => fixedNowMs
+    });
+
+    const callOrder: string[] = [];
+    const workerFetchAdapter: typeof fetch = async (input, init) => {
+      const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      callOrder.push(new URL(urlStr).pathname);
+      return handler(new Request(urlStr, init), env);
+    };
+
+    // Dry-run
+    const dryReport = await runSeedFirestoreKeyless({
+      execute: false,
+      token: ownerToken,
+      fetchImpl: workerFetchAdapter,
+      questions,
+      exams,
+      batchSize: 3,
+      nowMs: fixedNowMs
+    });
+
+    assert.equal(dryReport.safeToExecute, true);
+    assert.equal(dryReport.conflicts.length, 0);
+    assert.equal(dryReport.versionDocumentStatus, 'will be conditionally updated at finalize');
+    assert.equal(dryReport.existingFirestoreCounts.questionBankVersionExists, true);
+    assert.equal(dryReport.matchingCounts.exams, 1);
+    assert.equal(dryReport.wouldCreate.questions, 5);
+    assert.equal(dryReport.wouldCreate.questionKeys, 5);
+    assert.equal(dryReport.wouldCreate.exams, 1);
+    assert.equal(dryReport.wouldCreate.versionDocument, 0);
+    assert.equal(dryReport.wouldUpdateVersionDocument, 1);
+    assert.equal(
+      stub.getCol('config').get('questionBankVersion')?.versionToken,
+      '1795617149157_1_80125c',
+      'Dry-run must never mutate version marker'
+    );
+    assert.equal(callOrder.includes('/api/admin/questions/sync-cache'), false);
+
+    // Execute
+    callOrder.length = 0;
+    const execReport = await runSeedFirestoreKeyless({
+      execute: true,
+      token: ownerToken,
+      fetchImpl: workerFetchAdapter,
+      questions,
+      exams,
+      batchSize: 3,
+      nowMs: fixedNowMs
+    });
+
+    assert.equal(execReport.executed, true);
+    assert.equal(execReport.safeToExecute, true);
+    assert.equal(execReport.writesCommitted, 12); // 5 questions + 5 keys + 1 new exam + 1 version CAS update
+    assert.equal(stub.getCol('questions').size, 5);
+    assert.equal(stub.getCol('questionKeys').size, 5);
+    assert.equal(stub.getCol('exams').size, 2);
+
+    // Existing exam configuration remains untouched
+    assert.equal(stub.getCol('exams').get('exam_model_test_01')?.isActive, false);
+    assert.equal(stub.getCol('exams').get('exam_model_test_01')?.scheduledDate, '2026-12-30');
+
+    // Version doc updated conditionally with CAS precondition & unrelated fields preserved
+    const updatedVer = stub.getCol('config').get('questionBankVersion')!;
+    assert.notEqual(updatedVer.versionToken, '1795617149157_1_80125c');
+    assert.equal(updatedVer.versionToken, execReport.versionToken);
+    assert.equal(updatedVer.note, 'preserve-unrelated-field');
+    assert.equal(updatedVer.createdBy, 'initial-setup');
+
+    const finalizeCommit = [...stub.opLog].reverse().find(
+      o =>
+        o.op === 'commit' &&
+        (o.writes || []).some((w: any) => String(w?.update?.name || '').endsWith('/config/questionBankVersion'))
+    );
+    const verWrite = (finalizeCommit?.writes || []).find((w: any) =>
+      String(w?.update?.name || '').endsWith('/config/questionBankVersion')
+    ) as { updateMask?: { fieldPaths?: string[] }; currentDocument?: { updateTime?: string } } | undefined;
+    assert.ok(verWrite);
+    assert.deepEqual(verWrite?.updateMask?.fieldPaths?.sort(), ['updatedAt', 'version', 'versionToken']);
+    assert.equal(verWrite?.currentDocument?.updateTime, '2026-11-25T10:00:00.123456Z');
+
+    // D1 sync occurred ONLY after finalization succeeded
+    assert.equal(callOrder[0], '/api/admin/seed/question-bank/preflight');
+    assert.equal(callOrder[callOrder.length - 2], '/api/admin/seed/question-bank/finalize');
+    assert.equal(callOrder[callOrder.length - 1], '/api/admin/questions/sync-cache');
+    const countsRes = await handler(
+      new Request('https://s--khayrul-alam.khayrulalam88.workers.dev/api/subjects/counts'),
+      env
+    );
+    const countsJson = (await countsRes.json()) as { total: number };
+    assert.equal(countsJson.total, 5);
+  });
+
+  test('7. Incompatible version marker or unexpected required metadata keeps safeToExecute=false and blocks execute before any batch writes', async () => {
+    const db = await createMigratedTestD1();
+    const stub = createEnterpriseFirestoreStub({ rejectCollectionListRest: true });
+    stub.setDoc(
+      'config',
+      'questionBankVersion',
+      {
+        version: 1795617149157001,
+        versionToken: '1795617149157_1_80125c',
+        requiredMigration: 'manual-v2'
+      },
+      '2026-11-25T10:00:00.123456Z'
+    );
+
+    const env: WorkerEnv = {
+      DB: db,
+      FIREBASE_PROJECT_ID: EXPECTED_FIREBASE_PROJECT_ID,
+      FIREBASE_DATABASE_ID: EXPECTED_FIREBASE_DATABASE_ID,
+      ENVIRONMENT: 'production'
+    };
+    const handler = createWorkerHandler({
+      fetchImpl: stub.fetchImpl,
+      jwksFetcher: async () => ({ keys: [authKeys.jwk], maxAgeSeconds: 300 }),
+      nowMsFn: () => fixedNowMs
+    });
+    const workerFetchAdapter: typeof fetch = async (input, init) => {
+      const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      return handler(new Request(urlStr, init), env);
+    };
+
+    const questions = makeSampleQuestions(2);
+    const exams = makeSampleExams(questions.map(q => q.id));
+
+    const dryReport = await runSeedFirestoreKeyless({
+      execute: false,
+      token: ownerToken,
+      fetchImpl: workerFetchAdapter,
+      questions,
+      exams
+    });
+    assert.equal(dryReport.safeToExecute, false);
+    assert.ok(dryReport.conflicts.some(c => c.collection === 'config' && c.reason.includes('requiredMigration')));
+
+    await assert.rejects(
+      () =>
+        runSeedFirestoreKeyless({
+          execute: true,
+          token: ownerToken,
+          fetchImpl: workerFetchAdapter,
+          questions,
+          exams
+        }),
+      (err: { code?: string }) => err.code === 'CONFLICT_DETECTED'
+    );
+    assert.equal(stub.getCol('questions').size, 0, 'Incompatible marker must abort before writing any batches');
+  });
+
+  test('8. Concurrent modification of config/questionBankVersion after preflight aborts finalize with 409 CONFLICT_DETECTED and skips D1 sync', async () => {
+    const db = await createMigratedTestD1();
+    // Mutate config/questionBankVersion right on commit #1 (the question batch commit, after preflight ran)
+    const stub = createEnterpriseFirestoreStub({
+      rejectCollectionListRest: true,
+      mutateVersionDocOnCommitCall: {
+        callNumber: 1,
+        nextVersionToken: 'concurrent_other_writer_token'
+      }
+    });
+    stub.setDoc(
+      'config',
+      'questionBankVersion',
+      {
+        version: 1795617149157001,
+        versionToken: '1795617149157_1_80125c',
+        updatedAt: '2026-11-25T10:00:00.000Z'
+      },
+      '2026-11-25T10:00:00.123456Z'
+    );
+
+    const env: WorkerEnv = {
+      DB: db,
+      FIREBASE_PROJECT_ID: EXPECTED_FIREBASE_PROJECT_ID,
+      FIREBASE_DATABASE_ID: EXPECTED_FIREBASE_DATABASE_ID,
+      ENVIRONMENT: 'production'
+    };
+    const handler = createWorkerHandler({
+      fetchImpl: stub.fetchImpl,
+      jwksFetcher: async () => ({ keys: [authKeys.jwk], maxAgeSeconds: 300 }),
+      nowMsFn: () => fixedNowMs
+    });
+
+    const calledPaths: string[] = [];
+    const workerFetchAdapter: typeof fetch = async (input, init) => {
+      const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      calledPaths.push(new URL(urlStr).pathname);
+      return handler(new Request(urlStr, init), env);
+    };
+
+    const questions = makeSampleQuestions(2);
+    const exams = makeSampleExams(questions.map(q => q.id));
+
+    await assert.rejects(
+      () =>
+        runSeedFirestoreKeyless({
+          execute: true,
+          token: ownerToken,
+          fetchImpl: workerFetchAdapter,
+          questions,
+          exams,
+          batchSize: 5
+        }),
+      (err: { code?: string }) => err.code === 'CONFLICT_DETECTED'
+    );
+
+    // Concurrent writer's token must be preserved; D1 sync must NEVER run
+    assert.equal(stub.getCol('config').get('questionBankVersion')?.versionToken, 'concurrent_other_writer_token');
+    assert.equal(calledPaths.includes('/api/admin/questions/sync-cache'), false);
+
+    // Also verify direct Firestore :commit precondition rejection returns 409 CONFLICT_DETECTED
+    const directFinalizeRes = await handler(
+      new Request('https://s--khayrul-alam.khayrulalam88.workers.dev/api/admin/seed/question-bank/finalize', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${ownerToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          dryRun: false,
+          pendingDataWrites: 4,
+          expectedVersionExists: true,
+          expectedUpdateTime: '2026-11-25T10:00:00.123456Z',
+          expectedVersionToken: '1795617149157_1_80125c'
+        })
+      }),
+      env
+    );
+    assert.equal(directFinalizeRes.status, 409);
+    const directJson = (await directFinalizeRes.json()) as { error: string };
+    assert.equal(directJson.error, 'CONFLICT_DETECTED');
+  });
+
+  test('9. Failed batch never updates existing compatible config/questionBankVersion marker and never triggers D1 sync', async () => {
+    const db = await createMigratedTestD1();
+    const stub = createEnterpriseFirestoreStub({ rejectCollectionListRest: true, failCommitOnCall: 2 });
+    stub.setDoc(
+      'config',
+      'questionBankVersion',
+      {
+        version: 1795617149157001,
+        versionToken: '1795617149157_1_80125c',
+        updatedAt: '2026-11-25T10:00:00.000Z'
+      },
+      '2026-11-25T10:00:00.123456Z'
+    );
+
+    const env: WorkerEnv = {
+      DB: db,
+      FIREBASE_PROJECT_ID: EXPECTED_FIREBASE_PROJECT_ID,
+      FIREBASE_DATABASE_ID: EXPECTED_FIREBASE_DATABASE_ID,
+      ENVIRONMENT: 'production'
+    };
+    const handler = createWorkerHandler({
+      fetchImpl: stub.fetchImpl,
+      jwksFetcher: async () => ({ keys: [authKeys.jwk], maxAgeSeconds: 300 }),
+      nowMsFn: () => fixedNowMs
+    });
+
+    const calledPaths: string[] = [];
+    const workerFetchAdapter: typeof fetch = async (input, init) => {
+      const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      calledPaths.push(new URL(urlStr).pathname);
+      return handler(new Request(urlStr, init), env);
+    };
+
+    const questions = makeSampleQuestions(4);
+    const exams = makeSampleExams(questions.map(q => q.id));
+
+    await assert.rejects(
+      () =>
+        runSeedFirestoreKeyless({
+          execute: true,
+          token: ownerToken,
+          fetchImpl: workerFetchAdapter,
+          questions,
+          exams,
+          batchSize: 2,
+          nowMs: fixedNowMs
+        }),
+      (err: { details?: { partialExecution?: boolean } }) => err.details?.partialExecution === true
+    );
+
+    assert.equal(stub.getCol('config').get('questionBankVersion')?.versionToken, '1795617149157_1_80125c');
+    assert.equal(stub.getDocMeta('config', 'questionBankVersion')?.updateTime, '2026-11-25T10:00:00.123456Z');
+    assert.equal(calledPaths.includes('/api/admin/seed/question-bank/finalize'), false);
+    assert.equal(calledPaths.includes('/api/admin/questions/sync-cache'), false);
   });
 });

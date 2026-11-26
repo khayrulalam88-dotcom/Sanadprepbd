@@ -441,11 +441,45 @@ export async function runSeedFirestoreKeyless(options = {}) {
   );
 
   const totalPlannedDataBatches = questionChunks.length + examChunks.length;
+  const preflightEndpoint = `${workerBaseUrl}/api/admin/seed/question-bank/preflight`;
   const batchEndpoint = `${workerBaseUrl}/api/admin/seed/question-bank/batch`;
   const finalizeEndpoint = `${workerBaseUrl}/api/admin/seed/question-bank/finalize`;
   const syncCacheEndpoint = `${workerBaseUrl}/api/admin/questions/sync-cache`;
 
-  const existingCounts = { questions: 0, questionKeys: 0, exams: 0, questionBankVersionExists: false };
+  const preflightRes = await callWorkerSeedApi(
+    fetchImpl,
+    preflightEndpoint,
+    token,
+    { dryRun },
+    { sleepFn: options.sleepFn }
+  );
+
+  if (!dryRun && !preflightRes.safeToExecute) {
+    const preflightConflicts = Array.isArray(preflightRes.conflicts) ? preflightRes.conflicts : [];
+    throw new SeederError(
+      'CONFLICT_DETECTED',
+      preflightConflicts[0]?.reason ||
+        'Preflight failed: config/questionBankVersion marker is incompatible. Aborting before any batch writes.',
+      {
+        mode,
+        workerBaseUrl,
+        projectId: FIREBASE_PROJECT_ID,
+        databaseId: FIRESTORE_DATABASE_ID,
+        partialExecution: false,
+        batchesSucceeded: 0,
+        writesCommitted: 0,
+        conflicts: preflightConflicts,
+        safeToExecute: false
+      }
+    );
+  }
+
+  const existingCounts = {
+    questions: 0,
+    questionKeys: 0,
+    exams: 0,
+    questionBankVersionExists: Boolean(preflightRes.versionExists)
+  };
   const matchingCounts = { questions: 0, questionKeys: 0, exams: 0 };
   const wouldCreate = { questions: 0, questionKeys: 0, exams: 0, versionDocument: 0, total: 0 };
   const conflicts = [];
@@ -537,9 +571,6 @@ export async function runSeedFirestoreKeyless(options = {}) {
   }
 
   const dataWritesTotal = wouldCreate.questions + wouldCreate.questionKeys + wouldCreate.exams;
-  if (dryRun && conflicts.length > 0) {
-    // Still check version doc status in dry-run safely
-  }
 
   let versionRes = {};
   if (dryRun || conflicts.length === 0) {
@@ -552,20 +583,38 @@ export async function runSeedFirestoreKeyless(options = {}) {
         pendingDataWrites: dryRun ? dataWritesTotal : writesCommitted,
         questionsCreated: wouldCreate.questions,
         questionKeysCreated: wouldCreate.questionKeys,
-        examsCreated: wouldCreate.exams
+        examsCreated: wouldCreate.exams,
+        expectedVersionExists: Boolean(preflightRes.versionExists),
+        ...(preflightRes.expectedUpdateTime
+          ? { expectedUpdateTime: preflightRes.expectedUpdateTime }
+          : {}),
+        ...(preflightRes.existingVersionToken
+          ? { expectedVersionToken: preflightRes.existingVersionToken }
+          : {})
       },
       { sleepFn: options.sleepFn }
     );
   }
 
-  existingCounts.questionBankVersionExists = Boolean(versionRes.versionExists);
-  if (Array.isArray(versionRes.conflicts) && versionRes.conflicts.length > 0) {
-    conflicts.push(...versionRes.conflicts);
+  existingCounts.questionBankVersionExists = Boolean(
+    versionRes.versionExists ?? preflightRes.versionExists
+  );
+  const versionConflicts = Array.isArray(versionRes.conflicts)
+    ? versionRes.conflicts
+    : Array.isArray(preflightRes.conflicts)
+    ? preflightRes.conflicts
+    : [];
+  if (versionConflicts.length > 0) {
+    conflicts.push(...versionConflicts);
   }
 
-  const versionDocPlanned = versionRes.versionExists ? 0 : 1;
-  wouldCreate.versionDocument = versionDocPlanned;
-  wouldCreate.total = dataWritesTotal + versionDocPlanned;
+  const versionDocCreatePlanned = existingCounts.questionBankVersionExists ? 0 : 1;
+  const versionDocUpdatePlanned = Number(
+    versionRes.wouldUpdateVersionDocument ??
+      (existingCounts.questionBankVersionExists && dataWritesTotal > 0 ? 1 : 0)
+  );
+  wouldCreate.versionDocument = versionDocCreatePlanned;
+  wouldCreate.total = dataWritesTotal + versionDocCreatePlanned;
 
   if (!dryRun) {
     writesCommitted += Number(versionRes.writesCommitted || 0);
@@ -588,7 +637,10 @@ export async function runSeedFirestoreKeyless(options = {}) {
     }
   }
 
-  const safeToExecute = conflicts.length === 0 && (dryRun ? versionRes.safeToExecute !== false : true);
+  const safeToExecute =
+    conflicts.length === 0 &&
+    (dryRun ? preflightRes.safeToExecute !== false && versionRes.safeToExecute !== false : true);
+  const finalizeBatchCount = versionDocCreatePlanned > 0 || versionDocUpdatePlanned > 0 ? 1 : 0;
 
   return {
     mode,
@@ -604,16 +656,26 @@ export async function runSeedFirestoreKeyless(options = {}) {
     existingFirestoreCounts: existingCounts,
     matchingCounts,
     wouldCreate,
+    wouldUpdateVersionDocument: versionDocUpdatePlanned,
     conflicts,
-    versionDocumentStatus:
-      String(versionRes.versionDocumentStatus || (existingCounts.questionBankVersionExists ? 'exists' : 'missing')),
+    versionDocumentStatus: String(
+      versionRes.versionDocumentStatus ||
+        preflightRes.versionDocumentStatus ||
+        (existingCounts.questionBankVersionExists ? 'exists' : 'missing')
+    ),
+    ...(preflightRes.existingVersionToken
+      ? { existingVersionToken: preflightRes.existingVersionToken }
+      : {}),
+    ...(preflightRes.expectedUpdateTime
+      ? { existingVersionUpdateTime: preflightRes.expectedUpdateTime }
+      : {}),
     ...(versionRes.plannedVersionToken ? { plannedVersionToken: versionRes.plannedVersionToken } : {}),
     ...(versionRes.versionToken ? { versionToken: versionRes.versionToken } : {}),
     plannedCommitBatches: {
       questionsAndKeys: questionChunks.length,
       exams: examChunks.length,
-      versionDocument: versionDocPlanned,
-      total: totalPlannedDataBatches + versionDocPlanned,
+      versionDocument: finalizeBatchCount,
+      total: totalPlannedDataBatches + finalizeBatchCount,
       maxQuestionBatchSize: questionBatchMax,
       maxExamBatchSize: examBatchMax
     },
@@ -632,10 +694,12 @@ function formatReport(report) {
     `Target Firebase: ${report.projectId} / ${report.databaseId}`,
     `Source counts -> questions: ${report.sourceCounts.questions}, questionKeys: ${report.sourceCounts.questionKeys}, exams: ${report.sourceCounts.exams}`,
     `Existing Firestore counts -> questions: ${report.existingFirestoreCounts.questions}, questionKeys: ${report.existingFirestoreCounts.questionKeys}, exams: ${report.existingFirestoreCounts.exams}, config/questionBankVersion: ${report.existingFirestoreCounts.questionBankVersionExists ? 'exists' : 'missing'}`,
-    `Matching preserved IDs -> questions: ${report.matchingCounts.questions}, questionKeys: ${report.matchingCounts.questionKeys}, exams: ${report.matchingCounts.exams}`,
-    `Documents to create (exists=false) -> questions: ${report.wouldCreate.questions}, questionKeys: ${report.wouldCreate.questionKeys}, exams: ${report.wouldCreate.exams}, config/questionBankVersion: ${report.wouldCreate.versionDocument} (total: ${report.wouldCreate.total})`,
+    `Existing version marker: ${report.versionDocumentStatus}`,
     `Conflicting documents: ${report.conflicts.length}`,
-    `Version document status: ${report.versionDocumentStatus}`,
+    `Questions to create: ${report.wouldCreate.questions}`,
+    `Question keys to create: ${report.wouldCreate.questionKeys}`,
+    `Existing exams preserved: ${report.matchingCounts.exams}`,
+    `Exams to create: ${report.wouldCreate.exams}`,
     `Worker batches -> questions+keys: ${report.plannedCommitBatches.questionsAndKeys} (<= ${report.plannedCommitBatches.maxQuestionBatchSize}/batch), exams: ${report.plannedCommitBatches.exams}, finalize: ${report.plannedCommitBatches.versionDocument}, total: ${report.plannedCommitBatches.total}`,
     `Safe to execute: ${report.safeToExecute}`
   ];
@@ -651,7 +715,7 @@ function formatReport(report) {
     lines.push('[DRY-RUN COMPLETE] Zero Firestore write requests were executed.');
   } else if (report.executed) {
     lines.push(
-      `[EXECUTED] Committed ${report.writesCommitted} create-only writes across ${report.batchesSucceeded} Worker batch(es).`
+      `[EXECUTED] Committed ${report.writesCommitted} write(s) across ${report.batchesSucceeded} Worker batch(es).`
     );
     if (report.d1SyncResult) {
       if (report.d1SyncResult.success) {

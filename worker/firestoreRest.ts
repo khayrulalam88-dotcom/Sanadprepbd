@@ -239,7 +239,7 @@ export type FirestoreWriteOp =
       docId: string;
       data: Record<string, unknown>;
       merge?: boolean;
-      currentDocument?: { exists?: boolean };
+      currentDocument?: { exists?: boolean; updateTime?: string };
     }
   | {
       type: 'create';
@@ -252,13 +252,13 @@ export type FirestoreWriteOp =
       collection: string;
       docId: string;
       patch: Record<string, unknown>;
-      currentDocument?: { exists?: boolean };
+      currentDocument?: { exists?: boolean; updateTime?: string };
     }
   | {
       type: 'delete';
       collection: string;
       docId: string;
-      currentDocument?: { exists?: boolean };
+      currentDocument?: { exists?: boolean; updateTime?: string };
     };
 
 export interface StructuredQueryWhere {
@@ -394,11 +394,15 @@ export class FirestoreRestClient {
     return { status: res.status, data: parsed as T };
   }
 
-  async getDocument<T extends Record<string, unknown> = Record<string, unknown>>(
+  async getDocumentWithMetadata<T extends Record<string, unknown> = Record<string, unknown>>(
     collectionPath: string,
     docId: string,
     options?: { transactionId?: string }
-  ): Promise<(T & { id: string }) | null> {
+  ): Promise<{
+    data: (T & { id: string }) | null;
+    updateTime?: string;
+    createTime?: string;
+  }> {
     const qs = options?.transactionId ? `?transaction=${encodeURIComponent(options.transactionId)}` : '';
     const headers = new Headers();
     this.applyAuthHeader(headers);
@@ -407,7 +411,7 @@ export class FirestoreRestClient {
       headers
     });
     if (res.status === 404) {
-      return null;
+      return { data: null };
     }
     if (!res.ok) {
       const text = await res.text();
@@ -422,9 +426,22 @@ export class FirestoreRestClient {
     }
     const doc = (await res.json()) as FirestoreRestDocument;
     return {
-      ...(decodeDocumentFields(doc.fields) as T),
-      id: extractDocumentId(doc.name)
+      data: {
+        ...(decodeDocumentFields(doc.fields) as T),
+        id: extractDocumentId(doc.name)
+      },
+      ...(typeof doc.updateTime === 'string' && doc.updateTime ? { updateTime: doc.updateTime } : {}),
+      ...(typeof doc.createTime === 'string' && doc.createTime ? { createTime: doc.createTime } : {})
     };
+  }
+
+  async getDocument<T extends Record<string, unknown> = Record<string, unknown>>(
+    collectionPath: string,
+    docId: string,
+    options?: { transactionId?: string }
+  ): Promise<(T & { id: string }) | null> {
+    const res = await this.getDocumentWithMetadata<T>(collectionPath, docId, options);
+    return res.data;
   }
 
   async batchGetDocuments<T extends Record<string, unknown> = Record<string, unknown>>(
