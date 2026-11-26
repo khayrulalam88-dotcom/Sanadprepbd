@@ -57,6 +57,7 @@ export const AdminPanel: React.FC = () => {
     loginWithEmail,
     loginWithGoogle,
     questions, 
+    subjectQuestionCounts,
     addQuestion, 
     deleteQuestion, 
     exams, 
@@ -85,6 +86,9 @@ export const AdminPanel: React.FC = () => {
     examResults,
     adminDashboardStats,
     adminQuestionsState,
+    adminQuestionsPageData,
+    loadAdminQuestionsPage,
+    ensureAdminQuestionPool,
     reloadAdminQuestions,
     syncEdgeQuestionCache
   } = useApp();
@@ -209,9 +213,10 @@ export const AdminPanel: React.FC = () => {
   const [newStatus, setNewStatus] = useState<QuestionStatus>('published');
   const [newIsDemoSample, setNewIsDemoSample] = useState<boolean>(false);
 
-  // Question search & filter
+  // Question search & filter (D1 server-backed pagination, 50 per page)
   const [questionSearch, setQuestionSearch] = useState<string>('');
   const [subjectFilter, setSubjectFilter] = useState<string>('all');
+  const ADMIN_PAGE_SIZE = 50;
 
   // Payment Settings Editing State
   const [editBkash, setEditBkash] = useState<string>(paymentSettings.bkashNumber || '01712607777');
@@ -422,15 +427,45 @@ export const AdminPanel: React.FC = () => {
     }
   };
 
-  // Filter questions
-  const filteredQuestions = questions.filter(q => {
-    const matchesSubject = subjectFilter === 'all' || q.subjectId === subjectFilter;
-    const matchesSearch = questionSearch === '' || 
-      q.questionBn.toLowerCase().includes(questionSearch.toLowerCase()) ||
-      q.questionEn.toLowerCase().includes(questionSearch.toLowerCase()) ||
-      (q.legalReference && q.legalReference.toLowerCase().includes(questionSearch.toLowerCase()));
-    return matchesSubject && matchesSearch;
-  });
+  // Debounced server-backed D1 filter/search for Admin Question Bank
+  useEffect(() => {
+    if (!isLoggedInOrReady()) return;
+    if (activeTab !== 'questions') return;
+    if (
+      subjectFilter === adminQuestionsPageData.subjectId &&
+      questionSearch === adminQuestionsPageData.search
+    ) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      void loadAdminQuestionsPage({
+        subjectId: subjectFilter,
+        search: questionSearch,
+        limit: ADMIN_PAGE_SIZE,
+        offset: 0
+      });
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [
+    activeTab,
+    subjectFilter,
+    questionSearch,
+    adminQuestionsPageData.subjectId,
+    adminQuestionsPageData.search,
+    loadAdminQuestionsPage,
+    currentUser.uid,
+    currentUser.role
+  ]);
+
+  function isLoggedInOrReady(): boolean {
+    const uid = resolveFrontendOwnerAdminUid();
+    return Boolean(auth?.currentUser && uid && isVerifiedOwnerAccount(auth?.currentUser) && currentUser.uid === uid);
+  }
+
+  // Server-paginated D1 question list
+  const filteredQuestions = adminQuestionsPageData.questions;
+  const currentAdminPage = Math.floor((adminQuestionsPageData.offset || 0) / ADMIN_PAGE_SIZE) + 1;
+  const totalAdminPages = Math.max(1, Math.ceil((adminQuestionsPageData.total || 0) / ADMIN_PAGE_SIZE));
 
   // Filter payments
   const filteredPayments = paymentRequests.filter(req => {
@@ -1100,7 +1135,10 @@ export const AdminPanel: React.FC = () => {
 
             <div className="space-y-3">
               {subjects.map(s => {
-                const count = questions.filter(q => q.subjectId === s.id).length;
+                const count =
+                  subjectQuestionCounts[s.id] !== undefined
+                    ? subjectQuestionCounts[s.id]
+                    : questions.filter(q => q.subjectId === s.id).length;
                 return (
                   <div key={s.id} className="flex items-center justify-between p-3 rounded-xl bg-slate-50 border border-slate-100 text-xs sm:text-sm">
                     <span className="font-bold text-slate-800">
@@ -1920,10 +1958,10 @@ export const AdminPanel: React.FC = () => {
                 }}
                 disabled={adminQuestionsState.status === 'loading'}
                 className="px-3 py-2 rounded-xl bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 font-bold text-xs flex items-center gap-1.5 transition cursor-pointer disabled:opacity-50"
-                title={t('Firestore থেকে প্রশ্ন সম্ভার পুনরায় লোড করুন', 'Reload Question Bank from Firestore')}
+                title={t('D1 এজ ক্যাশ থেকে প্রশ্ন সম্ভার রিফ্রেশ করুন', 'Refresh Question Bank from D1 Edge Cache')}
               >
                 <RefreshCw className={`w-3.5 h-3.5 ${adminQuestionsState.status === 'loading' ? 'animate-spin' : ''}`} />
-                <span>{t('রিফ্রেশ', 'Refresh')}</span>
+                <span>{t('রিফ্রেশ (D1)', 'Refresh')}</span>
               </button>
 
               {isAdmin && (
@@ -1956,6 +1994,7 @@ export const AdminPanel: React.FC = () => {
               <button
                 type="button"
                 onClick={() => {
+                  void ensureAdminQuestionPool();
                   setAdminSelectedQuestionIds(Array.from(adminCheckedQuestions));
                   setShowAdminCreateExamModal(true);
                 }}
@@ -1990,13 +2029,56 @@ export const AdminPanel: React.FC = () => {
             </div>
           </div>
 
+          <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-2xl text-xs">
+            <div className="font-semibold text-slate-700">
+              {t(
+                `মোট ${adminQuestionsPageData.total} টি প্রশ্ন (D1 এজ ক্যাশ) • পৃষ্ঠা ${currentAdminPage} / ${totalAdminPages}`,
+                `Total ${adminQuestionsPageData.total} questions (D1 Edge Cache) • Page ${currentAdminPage} / ${totalAdminPages}`
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                disabled={adminQuestionsState.status === 'loading' || adminQuestionsPageData.offset <= 0}
+                onClick={() => {
+                  const prevOffset = Math.max(0, adminQuestionsPageData.offset - ADMIN_PAGE_SIZE);
+                  void loadAdminQuestionsPage({
+                    subjectId: subjectFilter,
+                    search: questionSearch,
+                    limit: ADMIN_PAGE_SIZE,
+                    offset: prevOffset
+                  });
+                }}
+                className="px-3 py-1 rounded-lg bg-white border border-slate-300 text-slate-700 font-bold disabled:opacity-40 hover:bg-slate-100 cursor-pointer"
+              >
+                {t('পূর্ববর্তী', 'Previous')}
+              </button>
+              <button
+                type="button"
+                disabled={adminQuestionsState.status === 'loading' || !adminQuestionsPageData.hasMore}
+                onClick={() => {
+                  const nextOffset = adminQuestionsPageData.offset + ADMIN_PAGE_SIZE;
+                  void loadAdminQuestionsPage({
+                    subjectId: subjectFilter,
+                    search: questionSearch,
+                    limit: ADMIN_PAGE_SIZE,
+                    offset: nextOffset
+                  });
+                }}
+                className="px-3 py-1 rounded-lg bg-white border border-slate-300 text-slate-700 font-bold disabled:opacity-40 hover:bg-slate-100 cursor-pointer"
+              >
+                {t('পরবর্তী', 'Next')}
+              </button>
+            </div>
+          </div>
+
           {adminQuestionsState.status === 'loading' && (
             <div className="p-4 bg-sky-50 border border-sky-200 rounded-2xl flex items-center gap-3 text-xs text-sky-900 font-semibold">
               <RefreshCw className="w-4 h-4 text-sky-700 animate-spin shrink-0" />
               <span>
                 {t(
-                  'Firestore ডাটাবেজ থেকে অনুমোদিত প্রশ্ন সম্ভার লোড হচ্ছে...',
-                  'Loading authoritative Question Bank from Firestore...'
+                  'D1 এজ ক্যাশ থেকে অনুমোদিত প্রশ্ন সম্ভার লোড হচ্ছে...',
+                  'Loading authoritative Question Bank from D1 Edge Cache...'
                 )}
               </span>
             </div>
@@ -2014,7 +2096,9 @@ export const AdminPanel: React.FC = () => {
                     <h4 className="font-black text-rose-900 text-sm">
                       {adminQuestionsState.errorCategory === 'auth' || adminQuestionsState.errorCategory === 'forbidden'
                         ? t('প্রশ্ন সম্ভার অনুমোদন ত্রুটি (Authentication / Permission Error)', 'Question Bank Authorization Error')
-                        : t('ব্যাকএন্ড বা ডাটাবেজ থেকে প্রশ্ন সম্ভার লোড করা যায়নি', 'Failed to Load Question Bank from Backend')}
+                        : adminQuestionsState.errorCategory === 'quota'
+                        ? t('Firestore কোটা সীমা অতিক্রম করেছে (429 RESOURCE_EXHAUSTED)', 'Firestore Quota Exhausted (429 RESOURCE_EXHAUSTED)')
+                        : t('ব্যাকএন্ড বা D1 ক্যাশ থেকে প্রশ্ন সম্ভার লোড করা যায়নি', 'Failed to Load Question Bank from Backend')}
                     </h4>
                     {(adminQuestionsState.httpStatus !== undefined || adminQuestionsState.errorCode) && (
                       <span className="px-2 py-0.5 rounded-md bg-rose-100 text-rose-800 font-mono text-[11px] font-bold">
@@ -2061,6 +2145,7 @@ export const AdminPanel: React.FC = () => {
                 <button
                   type="button"
                   onClick={() => {
+                    void ensureAdminQuestionPool();
                     setAdminSelectedQuestionIds(Array.from(adminCheckedQuestions));
                     setShowAdminCreateExamModal(true);
                   }}
@@ -2074,16 +2159,19 @@ export const AdminPanel: React.FC = () => {
 
           {adminQuestionsState.status !== 'error' &&
             adminQuestionsState.status !== 'loading' &&
-            questions.length === 0 && (
+            adminQuestionsPageData.total === 0 &&
+            adminQuestionsPageData.questions.length === 0 &&
+            subjectFilter === 'all' &&
+            questionSearch.trim() === '' && (
               <div className="bg-white rounded-3xl border border-slate-200 p-8 text-center space-y-3">
                 <FileQuestion className="w-10 h-10 text-amber-500 mx-auto" />
                 <h4 className="font-black text-slate-900 text-base">
-                  {t('প্রোডাকশন প্রশ্ন সম্ভার এখনও খালি (০টি প্রশ্ন)', 'Question Bank is Currently Empty (0 Questions)')}
+                  {t('D1 প্রশ্ন সম্ভার ক্যাশ এখনও খালি (০টি প্রশ্ন)', 'D1 Question Bank Cache is Currently Empty (0 Questions)')}
                 </h4>
                 <p className="text-xs text-slate-600 max-w-lg mx-auto">
                   {t(
-                    'Firestore-এ কোনো প্রশ্ন পাওয়া যায়নি। নতুন প্রশ্ন যোগ করুন অথবা কীলেস সিডার দিয়ে ৩,০০০ প্রশ্নের সংগ্রহ আপলোড করে D1 ক্যাশ সিঙ্ক করুন।',
-                    'No questions were found in Firestore. Add questions manually or seed the 3,000-question bank and sync the D1 edge cache.'
+                    'D1 এজ ক্যাশে কোনো প্রশ্ন পাওয়া যায়নি। নতুন প্রশ্ন যোগ করুন অথবা Firestore থেকে D1 ক্যাশ সিঙ্ক বাটনে ক্লিক করুন।',
+                    'No questions were found in D1 edge cache. Add questions manually or click Sync D1 Cache to populate from Firestore.'
                   )}
                 </p>
                 <button
@@ -2099,11 +2187,13 @@ export const AdminPanel: React.FC = () => {
               </div>
             )}
 
-          {questions.length > 0 && filteredQuestions.length === 0 && (
-            <div className="bg-white rounded-3xl border border-slate-200 p-6 text-center text-xs text-slate-600 font-semibold">
-              {t('সার্চ বা ফিল্টারের সাথে মিলে এমন কোনো প্রশ্ন পাওয়া যায়নি।', 'No questions match your current search or subject filter.')}
-            </div>
-          )}
+          {adminQuestionsState.status !== 'loading' &&
+            filteredQuestions.length === 0 &&
+            (subjectFilter !== 'all' || questionSearch.trim() !== '') && (
+              <div className="bg-white rounded-3xl border border-slate-200 p-6 text-center text-xs text-slate-600 font-semibold">
+                {t('সার্চ বা ফিল্টারের সাথে মিলে এমন কোনো প্রশ্ন পাওয়া যায়নি।', 'No questions match your current search or subject filter.')}
+              </div>
+            )}
 
           <div className="bg-white rounded-3xl border border-slate-200 shadow-xs divide-y divide-slate-100 overflow-hidden">
             {filteredQuestions.map((q) => {

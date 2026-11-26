@@ -376,6 +376,9 @@ export class FirestoreRestClient {
       const errObj = parsed as { error?: { code?: number; status?: string; message?: string } };
       const statusText = errObj?.error?.status || `HTTP_${res.status}`;
       const message = errObj?.error?.message || `Firestore REST request failed (${res.status})`;
+      if (res.status === 429 || statusText === 'RESOURCE_EXHAUSTED') {
+        throw new WorkerHttpError(429, 'RESOURCE_EXHAUSTED', message);
+      }
       if (res.status === 409 && statusText === 'ALREADY_EXISTS') {
         throw new WorkerHttpError(409, 'ALREADY_EXISTS', 'Document already exists.');
       }
@@ -415,13 +418,35 @@ export class FirestoreRestClient {
     }
     if (!res.ok) {
       const text = await res.text();
-      if (res.status === 403) {
-        throw new WorkerHttpError(403, 'PERMISSION_DENIED', text.slice(0, 200) || 'Firestore GET permission denied.');
+      let errStatus: string | undefined;
+      let errMessage: string | undefined;
+      if (text) {
+        try {
+          const parsed = JSON.parse(text) as { error?: { status?: string; message?: string } };
+          errStatus = parsed?.error?.status;
+          errMessage = parsed?.error?.message;
+        } catch {
+          // ignore non-JSON error body
+        }
+      }
+      if (res.status === 429 || errStatus === 'RESOURCE_EXHAUSTED') {
+        throw new WorkerHttpError(
+          429,
+          'RESOURCE_EXHAUSTED',
+          (errMessage || text).slice(0, 200) || 'Firestore quota exceeded (429 RESOURCE_EXHAUSTED).'
+        );
+      }
+      if (res.status === 403 || errStatus === 'PERMISSION_DENIED') {
+        throw new WorkerHttpError(
+          403,
+          'PERMISSION_DENIED',
+          (errMessage || text).slice(0, 200) || 'Firestore GET permission denied.'
+        );
       }
       throw new WorkerHttpError(
         res.status >= 500 ? 503 : res.status,
-        `FIRESTORE_GET_${res.status}`,
-        text.slice(0, 200) || `Firestore GET failed (${res.status})`
+        errStatus || `FIRESTORE_GET_${res.status}`,
+        (errMessage || text).slice(0, 200) || `Firestore GET failed (${res.status})`
       );
     }
     const doc = (await res.json()) as FirestoreRestDocument;
@@ -467,10 +492,29 @@ export class FirestoreRestClient {
         body: JSON.stringify(body)
       });
       if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        let errStatus: string | undefined;
+        let errMessage: string | undefined;
+        if (errText) {
+          try {
+            const parsed = JSON.parse(errText) as { error?: { status?: string; message?: string } };
+            errStatus = parsed?.error?.status;
+            errMessage = parsed?.error?.message;
+          } catch {
+            // ignore non-JSON error body
+          }
+        }
+        if (res.status === 429 || errStatus === 'RESOURCE_EXHAUSTED') {
+          throw new WorkerHttpError(
+            429,
+            'RESOURCE_EXHAUSTED',
+            (errMessage || errText).slice(0, 200) || 'Firestore batchGet quota exceeded (429 RESOURCE_EXHAUSTED).'
+          );
+        }
         if (res.status === 401) {
           throw new WorkerHttpError(401, 'UNAUTHORIZED', 'Firestore batchGet unauthorized.');
         }
-        if (res.status === 403) {
+        if (res.status === 403 || errStatus === 'PERMISSION_DENIED') {
           throw new WorkerHttpError(403, 'PERMISSION_DENIED', 'Firestore batchGet permission denied.');
         }
         throw new WorkerHttpError(503, 'FIRESTORE_BATCH_GET_FAILED', `Firestore batchGet failed (${res.status})`);

@@ -43,7 +43,6 @@ import {
   isVerifiedOwnerAccount
 } from '../lib/firebase';
 import {
-  fetchQuestionsFromFirestore,
   fetchExamsFromFirestore,
   fetchPaymentRequestsFromFirestore,
   fetchSubscriptionsFromFirestore,
@@ -121,6 +120,23 @@ interface AppContextType {
   };
   adminDashboardStats: AdminDashboardStatsResponse | null;
   adminQuestionsState: AdminQuestionBankLoadState;
+  adminQuestionsPageData: {
+    questions: Question[];
+    total: number;
+    limit: number;
+    offset: number;
+    hasMore: boolean;
+    subjectId: string;
+    search: string;
+    source: 'd1' | 'firestore';
+  };
+  loadAdminQuestionsPage: (params?: {
+    subjectId?: string;
+    search?: string;
+    limit?: number;
+    offset?: number;
+  }) => Promise<void>;
+  ensureAdminQuestionPool: () => Promise<void>;
   reloadAdminQuestions: () => Promise<void>;
   syncEdgeQuestionCache: () => Promise<{
     success: boolean;
@@ -520,6 +536,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const explicitAuthInProgressRef = useRef<boolean>(false);
   const activeSyncRef = useRef<{ uid: string; promise: Promise<void> } | null>(null);
   const questionsLoadedModeRef = useRef<'none' | 'sanitized' | 'admin'>('none');
+  const questionsLoadedFromApiRef = useRef<boolean>(false);
   const questionsFetchInFlightRef = useRef<{ mode: 'sanitized' | 'admin'; promise: Promise<void> } | null>(null);
   const [subjectQuestionCounts, setSubjectQuestionCounts] = useState<Record<string, number>>({});
   const [totalQuestionCount, setTotalQuestionCount] = useState<number>(0);
@@ -535,6 +552,28 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     status: 'idle',
     questionCount: 0
   });
+  const [adminQuestionsPageData, setAdminQuestionsPageData] = useState<{
+    questions: Question[];
+    total: number;
+    limit: number;
+    offset: number;
+    hasMore: boolean;
+    subjectId: string;
+    search: string;
+    source: 'd1' | 'firestore';
+  }>({
+    questions: [],
+    total: 0,
+    limit: 50,
+    offset: 0,
+    hasMore: false,
+    subjectId: 'all',
+    search: '',
+    source: 'd1'
+  });
+  const adminQuestionsPageDataRef = useRef(adminQuestionsPageData);
+  adminQuestionsPageDataRef.current = adminQuestionsPageData;
+  const adminPageRequestSeqRef = useRef<number>(0);
   const activeAttemptRef = useRef<ExamAttempt | null>(activeAttempt);
   const handleSessionRevokedRef = useRef<(reason: string) => void>(() => {});
   const examBatcherRef = useRef<ExamAnswerBatcher | null>(null);
@@ -601,14 +640,14 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     const fbUser = auth?.currentUser;
     if (!fbUser || !fbUser.emailVerified) {
       if (activeScreen === 'admin' || activeScreen === 'question_bank') {
-        setAdminQuestionsState({
+        setAdminQuestionsState(prev => ({
           status: 'error',
-          questionCount: 0,
+          questionCount: prev.questionCount,
           httpStatus: 401,
           errorCode: 'UNAUTHORIZED',
           errorCategory: 'auth',
           errorMessage: 'অ্যাডমিন প্রশ্ন সম্ভার দেখতে যাচাইকৃত Firebase অ্যাকাউন্ট দিয়ে সাইন ইন করুন।'
-        });
+        }));
       }
       return;
     }
@@ -631,8 +670,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       return questionsFetchInFlightRef.current.promise;
     }
 
-    const isProdEnv = typeof import.meta !== 'undefined' && Boolean(import.meta.env?.PROD);
-
     const runFetch = async () => {
       try {
         if (isOwner) {
@@ -642,35 +679,31 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
             errorMessage: undefined
           }));
           const adminQRes = await apiFetchAdminQuestions();
-          const outcome = resolveAdminQuestionBankFetchOutcome(adminQRes);
+          const outcome = resolveAdminQuestionBankFetchOutcome(adminQRes, {
+            previousQuestionCount: questionsLoadedFromApiRef.current
+              ? adminQuestionsPageDataRef.current.total || totalQuestionCount
+              : 0
+          });
           if (outcome.ok) {
+            questionsLoadedFromApiRef.current = true;
             setQuestions(outcome.questions);
             updateQuestionCountsFromPool(outcome.questions);
             questionsLoadedModeRef.current = 'admin';
             setAdminQuestionsState(outcome.state);
-          } else if (!isProdEnv) {
-            const fsQ = await fetchQuestionsFromFirestore();
-            if (fsQ.length > 0) {
-              setQuestions(fsQ);
-              updateQuestionCountsFromPool(fsQ);
-              questionsLoadedModeRef.current = 'admin';
-              setAdminQuestionsState({ status: 'loaded', questionCount: fsQ.length });
-            } else {
-              setQuestions([]);
-              questionsLoadedModeRef.current = 'none';
-              setAdminQuestionsState(outcome.state);
-            }
           } else {
             if (outcome.state.errorCode === 'SESSION_REVOKED') {
               handleSessionRevokedRef.current(outcome.state.errorMessage || 'Session revoked');
             }
-            setQuestions([]);
+            if (!questionsLoadedFromApiRef.current) {
+              setQuestions([]);
+            }
             questionsLoadedModeRef.current = 'none';
             setAdminQuestionsState(outcome.state);
           }
         } else {
           const qRes = await apiFetchSanitizedQuestions();
           if (qRes.ok && qRes.data?.questions?.length) {
+            questionsLoadedFromApiRef.current = true;
             setQuestions(qRes.data.questions);
             updateQuestionCountsFromPool(qRes.data.questions);
             questionsLoadedModeRef.current = 'sanitized';
@@ -679,16 +712,18 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       } catch (err) {
         console.warn('Lazy question bank load notice:', err);
         if (isOwner) {
-          setQuestions([]);
+          if (!questionsLoadedFromApiRef.current) {
+            setQuestions([]);
+          }
           questionsLoadedModeRef.current = 'none';
-          setAdminQuestionsState({
+          setAdminQuestionsState(prev => ({
             status: 'error',
-            questionCount: 0,
+            questionCount: questionsLoadedFromApiRef.current ? prev.questionCount : 0,
             httpStatus: 0,
             errorCode: 'NETWORK_ERROR',
             errorCategory: 'unavailable',
             errorMessage: formatBackendApiError({ status: 0, code: 'NETWORK_ERROR' })
-          });
+          }));
         }
       }
     };
@@ -700,11 +735,121 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     });
     questionsFetchInFlightRef.current = { mode: desiredMode, promise };
     return promise;
-  }, [activeScreen, updateQuestionCountsFromPool]);
+  }, [activeScreen, totalQuestionCount, updateQuestionCountsFromPool]);
+
+  const loadAdminQuestionsPage = useCallback(
+    async (params?: { subjectId?: string; search?: string; limit?: number; offset?: number }) => {
+      const fbUser = auth?.currentUser;
+      if (!fbUser || !fbUser.emailVerified || !isVerifiedOwnerAccount(fbUser)) {
+        setAdminQuestionsState(prev => ({
+          status: 'error',
+          questionCount: prev.questionCount,
+          httpStatus: 401,
+          errorCode: 'UNAUTHORIZED',
+          errorCategory: 'auth',
+          errorMessage: 'অ্যাডমিন প্রশ্ন সম্ভার দেখতে যাচাইকৃত Firebase অ্যাকাউন্ট দিয়ে সাইন ইন করুন।'
+        }));
+        return;
+      }
+
+      const current = adminQuestionsPageDataRef.current;
+      const subjectId = params?.subjectId !== undefined ? params.subjectId : current.subjectId;
+      const search = params?.search !== undefined ? params.search : current.search;
+      const limit = params?.limit !== undefined ? params.limit : current.limit || 50;
+      const offset = params?.offset !== undefined ? params.offset : current.offset;
+      const reqSeq = ++adminPageRequestSeqRef.current;
+
+      setAdminQuestionsState(prev => ({
+        ...prev,
+        status: 'loading',
+        errorMessage: undefined
+      }));
+
+      try {
+        const res = await apiFetchAdminQuestions({
+          subjectId,
+          search: search.trim() || undefined,
+          limit,
+          offset
+        });
+        if (reqSeq !== adminPageRequestSeqRef.current) return;
+
+        const outcome = resolveAdminQuestionBankFetchOutcome(res, {
+          previousQuestionCount: current.total
+        });
+
+        if (outcome.ok) {
+          questionsLoadedFromApiRef.current = true;
+          const total = outcome.total;
+          const hasMore =
+            typeof res.data?.hasMore === 'boolean'
+              ? res.data.hasMore
+              : offset + outcome.questions.length < total;
+          const source = res.data?.source || 'd1';
+
+          setAdminQuestionsPageData({
+            questions: outcome.questions,
+            total,
+            limit,
+            offset,
+            hasMore,
+            subjectId,
+            search,
+            source
+          });
+          setAdminQuestionsState(outcome.state);
+
+          if ((subjectId === 'all' || !subjectId) && !search.trim()) {
+            setTotalQuestionCount(total);
+          }
+
+          if (questionsLoadedModeRef.current !== 'admin' && outcome.questions.length > 0) {
+            setQuestions(prev => {
+              const map = new Map<string, Question>();
+              prev.forEach(q => map.set(q.id, q));
+              outcome.questions.forEach(q => map.set(q.id, q));
+              return Array.from(map.values());
+            });
+          }
+        } else {
+          if (outcome.state.errorCode === 'SESSION_REVOKED') {
+            handleSessionRevokedRef.current(outcome.state.errorMessage || 'Session revoked');
+          }
+          // Never wipe previously cached questions on refresh/error
+          setAdminQuestionsState(outcome.state);
+        }
+      } catch (err) {
+        if (reqSeq !== adminPageRequestSeqRef.current) return;
+        console.warn('Admin D1 question page load notice:', err);
+        setAdminQuestionsState({
+          status: 'error',
+          questionCount: current.total,
+          totalCount: current.total,
+          httpStatus: 0,
+          errorCode: 'NETWORK_ERROR',
+          errorCategory: 'unavailable',
+          errorMessage: formatBackendApiError({ status: 0, code: 'NETWORK_ERROR' })
+        });
+      }
+    },
+    []
+  );
+
+  const ensureAdminQuestionPool = useCallback(async () => {
+    await ensureQuestionsLoaded();
+  }, [ensureQuestionsLoaded]);
 
   const reloadAdminQuestions = useCallback(async () => {
-    await ensureQuestionsLoaded({ forceReload: true });
-  }, [ensureQuestionsLoaded]);
+    questionsLoadedModeRef.current = 'none';
+    const [countsRes] = await Promise.all([
+      apiFetchSubjectQuestionCounts(),
+      loadAdminQuestionsPage()
+    ]);
+    if (countsRes.ok && countsRes.data) {
+      setSubjectQuestionCounts(countsRes.data.counts || {});
+      setTotalQuestionCount(Number(countsRes.data.total || 0));
+    }
+  }, [loadAdminQuestionsPage]);
 
   const syncEdgeQuestionCache = useCallback(async () => {
     const res = await executeAuthoritativeAdminApi({
@@ -720,7 +865,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
     const { questionCount, keyCount, examsCount } = res.data;
     setTotalQuestionCount(questionCount);
-    await ensureQuestionsLoaded({ forceReload: true });
+    await reloadAdminQuestions();
     return {
       success: true,
       questionCount,
@@ -728,7 +873,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       examsCount,
       message: `Edge Cache সিঙ্ক সম্পন্ন: ${questionCount}টি প্রশ্ন, ${keyCount}টি উত্তর কী এবং ${examsCount}টি পরীক্ষা D1-এ আপডেট হয়েছে।`
     };
-  }, [ensureQuestionsLoaded]);
+  }, [reloadAdminQuestions]);
 
   const ensureSubjectQuestionsLoaded = useCallback(
     async (subjectId: string, opts?: { loadNextPage?: boolean }) => {
@@ -1449,12 +1594,23 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         setIsVerifiedAdmin(false);
         setCurrentUser(createGuestUserProfile());
         questionsLoadedModeRef.current = 'none';
+        questionsLoadedFromApiRef.current = false;
         questionsFetchInFlightRef.current = null;
         subjectLoadedMetaRef.current = {};
         subjectFetchInFlightRef.current.clear();
         setSubjectPagination({});
         setAdminDashboardStats(null);
         setAdminQuestionsState({ status: 'idle', questionCount: 0 });
+        setAdminQuestionsPageData({
+          questions: [],
+          total: 0,
+          limit: 50,
+          offset: 0,
+          hasMore: false,
+          subjectId: 'all',
+          search: '',
+          source: 'd1'
+        });
         setQuestions(INITIAL_QUESTIONS);
         setSubscriptions([]);
         setPaymentRequests([]);
@@ -1480,10 +1636,14 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     return () => unsubscribe();
   }, [language, syncAuthenticatedUserData]);
 
-  // Lazy-load full question bank only for Owner Admin views, or paginated subject slice for Practice
+  // Lazy-load paginated D1 questions for Owner Admin views, full D1 pool for QuestionBankView, or subject slice for Practice
   useEffect(() => {
     if (!isLoggedIn || !isEmailVerified || isSessionRevoked || !currentSession) return;
-    if (activeScreen === 'admin' || activeScreen === 'question_bank') {
+    if (activeScreen === 'admin') {
+      if (isVerifiedOwnerAccount(auth?.currentUser)) {
+        void loadAdminQuestionsPage();
+      }
+    } else if (activeScreen === 'question_bank') {
       if (isVerifiedOwnerAccount(auth?.currentUser)) {
         void ensureQuestionsLoaded();
       }
@@ -1497,6 +1657,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     currentSession,
     activeScreen,
     selectedSubjectForPractice,
+    loadAdminQuestionsPage,
     ensureQuestionsLoaded,
     ensureSubjectQuestionsLoaded
   ]);
@@ -2446,7 +2607,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       ...prev,
       [savedQ.subjectId]: (prev[savedQ.subjectId] || 0) + 1
     }));
-    setTotalQuestionCount(prev => (prev > 0 ? prev + 1 : prev));
+    setTotalQuestionCount(prev => (prev > 0 ? prev + 1 : 1));
+    void loadAdminQuestionsPage();
     return { success: true };
   };
 
@@ -2465,11 +2627,17 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
     const saved = res.data.question;
     setQuestions(prev => prev.map(q => (q.id === saved.id ? saved : q)));
+    setAdminQuestionsPageData(prev => ({
+      ...prev,
+      questions: prev.questions.map(q => (q.id === saved.id ? saved : q))
+    }));
     return { success: true };
   };
 
   const deleteQuestion = async (id: string): Promise<{ success: boolean; error?: string }> => {
-    const targetQ = questions.find(q => q.id === id);
+    const targetQ =
+      questions.find(q => q.id === id) ||
+      adminQuestionsPageDataRef.current.questions.find(q => q.id === id);
     const res = await executeAuthoritativeAdminApi({
       isVerifiedOwner: isVerifiedOwnerAccount(auth?.currentUser),
       operation: () => apiAdminDeleteQuestion(id),
@@ -2482,6 +2650,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
 
     setQuestions(prev => prev.filter(q => q.id !== id));
+    setAdminQuestionsPageData(prev => ({
+      ...prev,
+      questions: prev.questions.filter(q => q.id !== id),
+      total: Math.max(0, prev.total - 1)
+    }));
     if (targetQ?.subjectId) {
       setSubjectQuestionCounts(prev => ({
         ...prev,
@@ -2489,6 +2662,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       }));
     }
     setTotalQuestionCount(prev => Math.max(0, prev - 1));
+    void loadAdminQuestionsPage();
     return { success: true };
   };
 
@@ -2913,6 +3087,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         getSubjectLoadState,
         adminDashboardStats,
         adminQuestionsState,
+        adminQuestionsPageData,
+        loadAdminQuestionsPage,
+        ensureAdminQuestionPool,
         reloadAdminQuestions,
         syncEdgeQuestionCache,
         exams,

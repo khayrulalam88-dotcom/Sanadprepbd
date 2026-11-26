@@ -22,7 +22,6 @@ import {
 } from './d1Store.ts';
 import {
   getD1QuestionBankMeta,
-  getRemoteQuestionBankVersion,
   syncQuestionsAndKeysToD1
 } from './questionCache.ts';
 import type { Exam } from '../src/types/index.ts';
@@ -511,18 +510,17 @@ export function createWorkerHandler(deps?: WorkerDependencies) {
 
         const userClient = firestoreClient.withToken(authUser.idToken);
 
-        // When Owner Admin signs in, best-effort warm cold D1 question/key/exam cache & replicate pending edge records
+        // When Owner Admin signs in, only warm D1 question/key/exam cache from Firestore
+        // if D1 is genuinely cold or invalidated; routine logins avoid Firestore reads.
         if (isOwnerUser(authUser, env)) {
           try {
-            const [localMeta, remoteVersion] = await Promise.all([
-              getD1QuestionBankMeta(env.DB),
-              getRemoteQuestionBankVersion(userClient)
-            ]);
-            if (
-              !localMeta ||
-              localMeta.question_count === 0 ||
-              localMeta.version_token !== remoteVersion.versionToken
-            ) {
+            const localMeta = await getD1QuestionBankMeta(env.DB);
+            const d1AlreadyWarmed = Boolean(
+              localMeta &&
+                localMeta.question_count > 0 &&
+                localMeta.version_token !== '__invalidated__'
+            );
+            if (!d1AlreadyWarmed) {
               await syncQuestionsAndKeysToD1(env.DB, userClient, { nowMs }).catch(() => undefined);
               const examDocs = await userClient
                 .listDocuments<Record<string, unknown>>('exams', {

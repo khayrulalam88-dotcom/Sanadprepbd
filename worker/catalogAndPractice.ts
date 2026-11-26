@@ -25,13 +25,13 @@ import {
   createQuestionBankVersionPayload,
   deleteQuestionFromCacheD1,
   ensureSanitizedQuestionsSyncedD1,
-  fetchAllQuestionsWithKeysAuthoritative,
   getAuthoritativeQuestionKeys,
-  getRemoteQuestionBankVersion,
+  getD1QuestionBankMeta,
   getSanitizedQuestionMeta,
   getSubjectQuestionCountsFromD1,
   invalidateLocalD1QuestionCache,
   parseQuestionBankCacheTtlMs,
+  queryAdminQuestionsWithKeysFromD1,
   querySanitizedQuestionsFromD1,
   sanitizeQuestion,
   syncQuestionsAndKeysToD1,
@@ -137,6 +137,20 @@ function normalizeExamRecord(d: Record<string, unknown> & { id: string }): Exam 
   };
 }
 
+function isTransientFirestoreReadError(err: unknown): boolean {
+  return (
+    err instanceof WorkerHttpError &&
+    (err.status === 403 ||
+      err.code === 'PERMISSION_DENIED' ||
+      err.status === 429 ||
+      err.code === 'RESOURCE_EXHAUSTED' ||
+      err.status === 503 ||
+      err.code === 'FIRESTORE_UNAVAILABLE' ||
+      err.code === 'SERVICE_UNAVAILABLE' ||
+      err.code === 'UNAVAILABLE')
+  );
+}
+
 export async function resolveExamByIdKeyless(
   db: NonNullable<WorkerEnv['DB']>,
   client: FirestoreRestClient,
@@ -151,7 +165,7 @@ export async function resolveExamByIdKeyless(
       return normalized;
     }
   } catch (err) {
-    if (!(err instanceof WorkerHttpError && (err.status === 403 || err.code === 'PERMISSION_DENIED'))) {
+    if (!isTransientFirestoreReadError(err)) {
       if (!cached) {
         const staticFallback = INITIAL_EXAMS.find(e => e.id === examId);
         if (staticFallback) return normalizeExamRecord(staticFallback as unknown as Record<string, unknown> & { id: string });
@@ -266,12 +280,17 @@ export async function handlePhase2Routes(
           fallbackToRunQueryOn403: true
         })
         .catch(err => {
-          if (err instanceof WorkerHttpError && (err.status === 403 || err.code === 'PERMISSION_DENIED')) {
+          if (isTransientFirestoreReadError(err)) {
             return [] as Array<Record<string, unknown> & { id: string }>;
           }
           throw err;
         }),
-      firestoreClient.getDocument<Record<string, unknown>>('config', 'examDate')
+      firestoreClient.getDocument<Record<string, unknown>>('config', 'examDate').catch(err => {
+        if (isTransientFirestoreReadError(err)) {
+          return null;
+        }
+        throw err;
+      })
     ]);
 
     const sourceList = (pkgDocs.length > 0 ? pkgDocs : INITIAL_PACKAGES) as unknown as SubscriptionPackage[];
@@ -288,7 +307,14 @@ export async function handlePhase2Routes(
   }
 
   if (pathname === '/api/exam-config' && method === 'GET') {
-    const configDoc = await firestoreClient.getDocument<Record<string, unknown>>('config', 'examDate');
+    const configDoc = await firestoreClient
+      .getDocument<Record<string, unknown>>('config', 'examDate')
+      .catch(err => {
+        if (isTransientFirestoreReadError(err)) {
+          return null;
+        }
+        throw err;
+      });
     const examDateConfig = configDoc
       ? { ...INITIAL_EXAM_DATE_CONFIG, ...configDoc }
       : INITIAL_EXAM_DATE_CONFIG;
@@ -331,6 +357,7 @@ export async function handlePhase2Routes(
 
     let liveExamDocs: Array<Record<string, unknown> & { id: string }> = [];
     let fetchedFull = false;
+    let firestoreQuotaExhausted = false;
     try {
       liveExamDocs = await readerClient.listDocuments<Record<string, unknown>>('exams', {
         pageSize: 200,
@@ -338,12 +365,15 @@ export async function handlePhase2Routes(
       });
       fetchedFull = true;
     } catch (err) {
-      if (!(err instanceof WorkerHttpError && (err.status === 403 || err.code === 'PERMISSION_DENIED'))) {
+      if (!isTransientFirestoreReadError(err)) {
         throw err;
+      }
+      if (err instanceof WorkerHttpError && (err.status === 429 || err.code === 'RESOURCE_EXHAUSTED')) {
+        firestoreQuotaExhausted = true;
       }
     }
 
-    if (!fetchedFull) {
+    if (!fetchedFull && !firestoreQuotaExhausted) {
       liveExamDocs = await readerClient
         .runQuery<Record<string, unknown>>({
           collection: 'exams',
@@ -396,8 +426,17 @@ export async function handlePhase2Routes(
       nowIso
     });
 
-    const remote = await getRemoteQuestionBankVersion(firestoreClient);
-    return { status: 200, payload: remote };
+    const localMeta = await getD1QuestionBankMeta(db);
+    return {
+      status: 200,
+      payload: {
+        version: localMeta?.version ?? 0,
+        versionToken: localMeta?.version_token ?? '__initial__',
+        ...(localMeta?.synced_at ? { updatedAt: localMeta.synced_at } : {}),
+        questionCount: Number(localMeta?.question_count ?? 0),
+        source: 'd1'
+      }
+    };
   }
 
   if (pathname === '/api/questions' && method === 'GET') {
@@ -698,9 +737,49 @@ export async function handlePhase2Routes(
     });
     assertOwnerAdmin(authUser, env);
 
-    const ownerClient = firestoreClient.withToken(authUser.idToken);
-    const list = await fetchAllQuestionsWithKeysAuthoritative(ownerClient);
-    return { status: 200, payload: { questions: list } };
+    const subjectId = url.searchParams.get('subjectId')?.trim() || undefined;
+    const topicId = url.searchParams.get('topicId')?.trim() || undefined;
+    const search = url.searchParams.get('search')?.trim() || undefined;
+    const rawDifficulty = url.searchParams.get('difficulty')?.trim();
+    if (rawDifficulty && rawDifficulty !== 'easy' && rawDifficulty !== 'medium' && rawDifficulty !== 'hard') {
+      throw new WorkerHttpError(400, 'INVALID_REQUEST', 'Invalid difficulty filter.');
+    }
+    const difficulty = rawDifficulty as 'easy' | 'medium' | 'hard' | undefined;
+
+    const rawStatus = url.searchParams.get('status')?.trim();
+    if (rawStatus && rawStatus !== 'draft' && rawStatus !== 'reviewed' && rawStatus !== 'published') {
+      throw new WorkerHttpError(400, 'INVALID_REQUEST', 'Invalid status filter.');
+    }
+    const status = rawStatus as 'draft' | 'reviewed' | 'published' | undefined;
+
+    const safeLimit = parseOptionalIntParam(url.searchParams.get('limit'), 'limit', 1, 3000);
+    const safeOffset = parseOptionalIntParam(url.searchParams.get('offset'), 'offset', 0) ?? 0;
+
+    const { questions, total } = await queryAdminQuestionsWithKeysFromD1(db, {
+      subjectId,
+      topicId,
+      difficulty,
+      status,
+      search,
+      limit: safeLimit,
+      offset: safeOffset
+    });
+
+    return {
+      status: 200,
+      payload: {
+        questions,
+        total,
+        ...(safeLimit !== undefined
+          ? {
+              limit: safeLimit,
+              offset: safeOffset,
+              hasMore: safeOffset + questions.length < total
+            }
+          : {}),
+        source: 'd1'
+      }
+    };
   }
 
   if (pathname === '/api/admin/questions/sync-cache' && method === 'POST') {

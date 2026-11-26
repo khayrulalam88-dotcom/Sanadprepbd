@@ -1,11 +1,13 @@
 import type { Question, QuestionDifficulty, QuestionStatus } from '../types';
 import { formatBackendApiError, isBackendUnavailableResponse, type BackendApiResult } from './securityHelpers';
 
-export type AdminQuestionBankErrorCategory = 'auth' | 'forbidden' | 'unavailable' | 'other';
+export type AdminQuestionBankErrorCategory = 'auth' | 'forbidden' | 'quota' | 'unavailable' | 'other';
 
 export interface AdminQuestionBankLoadState {
   status: 'idle' | 'loading' | 'loaded' | 'error';
   questionCount: number;
+  totalCount?: number;
+  source?: 'd1' | 'firestore';
   httpStatus?: number;
   errorCode?: string;
   errorCategory?: AdminQuestionBankErrorCategory;
@@ -30,6 +32,13 @@ export function classifyAdminQuestionBankError(params: {
   if (params.status === 403 || params.code === 'FORBIDDEN' || params.code === 'PERMISSION_DENIED') {
     return 'forbidden';
   }
+  if (
+    params.code === 'RESOURCE_EXHAUSTED' ||
+    params.code === 'FIRESTORE_QUOTA_EXHAUSTED' ||
+    (params.status === 429 && params.code !== 'RATE_LIMITED')
+  ) {
+    return 'quota';
+  }
   if (isBackendUnavailableResponse({ ok: false, status: params.status, code: params.code })) {
     return 'unavailable';
   }
@@ -37,19 +46,30 @@ export function classifyAdminQuestionBankError(params: {
 }
 
 export function resolveAdminQuestionBankFetchOutcome(
-  res: BackendApiResult<{ questions: Question[] }>
+  res: BackendApiResult<{
+    questions: Question[];
+    total?: number;
+    source?: 'd1' | 'firestore';
+  }>,
+  options?: { previousQuestionCount?: number }
 ): {
   ok: boolean;
   questions: Question[];
+  total: number;
   state: AdminQuestionBankLoadState;
 } {
   if (res.ok && res.data && Array.isArray(res.data.questions)) {
+    const resolvedTotal =
+      typeof res.data.total === 'number' ? res.data.total : res.data.questions.length;
     return {
       ok: true,
       questions: res.data.questions,
+      total: resolvedTotal,
       state: {
         status: 'loaded',
-        questionCount: res.data.questions.length
+        questionCount: resolvedTotal,
+        totalCount: resolvedTotal,
+        source: res.data.source || 'd1'
       }
     };
   }
@@ -65,12 +85,16 @@ export function resolveAdminQuestionBankFetchOutcome(
     isJson: res.code !== 'NON_JSON_RESPONSE'
   });
 
+  const preservedCount = Math.max(0, options?.previousQuestionCount ?? 0);
+
   return {
     ok: false,
     questions: [],
+    total: preservedCount,
     state: {
       status: 'error',
-      questionCount: 0,
+      questionCount: preservedCount,
+      totalCount: preservedCount,
       httpStatus: res.status,
       errorCode: res.code,
       errorCategory,

@@ -40,6 +40,20 @@ export function formatBackendApiError(params: {
     );
   }
 
+  if (
+    code === 'RESOURCE_EXHAUSTED' ||
+    code === 'FIRESTORE_QUOTA_EXHAUSTED' ||
+    (status === 429 &&
+      code !== 'RATE_LIMITED' &&
+      typeof serverMessage === 'string' &&
+      /quota|resource_exhausted/i.test(serverMessage))
+  ) {
+    return (
+      serverMessage ||
+      'Firestore-এর দৈনিক কোটা সীমা অতিক্রম করেছে (429 RESOURCE_EXHAUSTED)। D1 ক্যাশ থেকে সংরক্ষিত তথ্য নিরাপদ রয়েছে।'
+    );
+  }
+
   if (status === 429 || code === 'RATE_LIMITED') {
     return (
       serverMessage ||

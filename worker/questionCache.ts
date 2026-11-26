@@ -151,16 +151,26 @@ function isFirestoreForbiddenError(err: unknown): boolean {
   return err instanceof WorkerHttpError && (err.status === 403 || err.code === 'PERMISSION_DENIED');
 }
 
+function isFirestoreQuotaOrOutageError(err: unknown): boolean {
+  return (
+    err instanceof WorkerHttpError &&
+    (err.status === 429 ||
+      err.code === 'RESOURCE_EXHAUSTED' ||
+      err.status === 503 ||
+      err.code === 'FIRESTORE_UNAVAILABLE' ||
+      err.code === 'SERVICE_UNAVAILABLE' ||
+      err.code === 'UNAVAILABLE')
+  );
+}
+
 export async function getRemoteQuestionBankVersion(
   firestoreClient: FirestoreRestClient
 ): Promise<{ version: number; versionToken: string; updatedAt?: string }> {
-  const versionDoc = await firestoreClient
-    .getDocument<{
-      versionToken?: string;
-      version?: number;
-      updatedAt?: string;
-    }>('config', META_ROW_ID)
-    .catch(() => null);
+  const versionDoc = await firestoreClient.getDocument<{
+    versionToken?: string;
+    version?: number;
+    updatedAt?: string;
+  }>('config', META_ROW_ID);
 
   const versionToken = versionDoc?.versionToken
     ? String(versionDoc.versionToken)
@@ -190,21 +200,44 @@ export async function checkD1QuestionCacheFreshness(
   db: D1Database,
   firestoreClient: FirestoreRestClient,
   options?: { ttlMs?: number; nowMs?: number }
-): Promise<{ fresh: boolean; remoteVersionToken: string; localMeta: MetaRow | null }> {
+): Promise<{ fresh: boolean; remoteVersionToken: string; localMeta: MetaRow | null; staleFallback?: boolean }> {
   const ttlMs = options?.ttlMs ?? DEFAULT_QUESTION_BANK_CACHE_TTL_MS;
   const nowMs = options?.nowMs ?? Date.now();
 
   const localMeta = await getD1QuestionBankMeta(db);
 
-  if (localMeta && ttlMs > 0) {
+  if (
+    localMeta &&
+    ttlMs > 0 &&
+    localMeta.question_count > 0 &&
+    localMeta.version_token !== '__invalidated__'
+  ) {
     const syncedAtMs = new Date(localMeta.synced_at).getTime();
-    if (!isNaN(syncedAtMs) && nowMs - syncedAtMs < ttlMs && localMeta.question_count > 0) {
+    if (!isNaN(syncedAtMs) && nowMs - syncedAtMs < ttlMs) {
       return { fresh: true, remoteVersionToken: localMeta.version_token, localMeta };
     }
   }
 
   // Single public Firestore document read to check authoritative version
-  const remote = await getRemoteQuestionBankVersion(firestoreClient);
+  let remote: { version: number; versionToken: string; updatedAt?: string };
+  try {
+    remote = await getRemoteQuestionBankVersion(firestoreClient);
+  } catch (err) {
+    if (
+      (isFirestoreForbiddenError(err) || isFirestoreQuotaOrOutageError(err)) &&
+      localMeta &&
+      localMeta.question_count > 0 &&
+      localMeta.version_token !== '__invalidated__'
+    ) {
+      return {
+        fresh: true,
+        staleFallback: true,
+        remoteVersionToken: localMeta.version_token,
+        localMeta
+      };
+    }
+    throw err;
+  }
 
   if (localMeta && localMeta.version_token === remote.versionToken && localMeta.question_count > 0) {
     await db
@@ -467,28 +500,33 @@ export async function ensureSanitizedQuestionsSyncedD1(
   if (!options?.bypassCache) {
     const check = await checkD1QuestionCacheFreshness(db, firestoreClient, { ttlMs, nowMs });
     if (check.fresh) {
-      return { versionToken: check.remoteVersionToken, fromCache: true };
+      return {
+        versionToken: check.remoteVersionToken,
+        fromCache: true,
+        ...(check.staleFallback ? { staleFallback: true } : {})
+      };
     }
   }
 
   const inflight = inFlightSanitizedSync.get(db);
   if (inflight) {
     const done = await inflight;
-    return { versionToken: done.versionToken, fromCache: false };
+    return { versionToken: done.versionToken, fromCache: !done.synced };
   }
 
   const syncPromise = (async () => {
-    const remote = await getRemoteQuestionBankVersion(firestoreClient);
-
+    const localMeta = await getD1QuestionBankMeta(db);
+    let remote: { version: number; versionToken: string; updatedAt?: string };
     let docs: Array<Record<string, unknown> & { id: string }>;
     try {
+      remote = await getRemoteQuestionBankVersion(firestoreClient);
       docs = await firestoreClient.listDocuments<Record<string, unknown>>('questions', {
         pageSize: 500,
         maxPages: 20,
         fallbackToRunQueryOn403: Boolean(options?.isOwner)
       });
     } catch (err) {
-      if (isFirestoreForbiddenError(err)) {
+      if (isFirestoreForbiddenError(err) || isFirestoreQuotaOrOutageError(err)) {
         const countRow = await db
           .prepare(`SELECT COUNT(*) AS cnt FROM question_bank_cache`)
           .first<{ cnt: number }>();
@@ -496,15 +534,17 @@ export async function ensureSanitizedQuestionsSyncedD1(
         if (existingCount > 0 || options?.allowEmptyOnForbidden) {
           return {
             synced: false,
-            versionToken: remote.versionToken,
+            versionToken: localMeta?.version_token || '__cached__',
             count: existingCount
           };
         }
-        throw new WorkerHttpError(
-          503,
-          'QUESTION_CACHE_WARMING_REQUIRED',
-          'প্রশ্নভাণ্ডার এজ ক্যাশ এখনো প্রস্তুত নয়। অনুগ্রহ করে অ্যাডমিন লগইন করে প্রশ্ন সিঙ্ক করুন।'
-        );
+        if (isFirestoreForbiddenError(err)) {
+          throw new WorkerHttpError(
+            503,
+            'QUESTION_CACHE_WARMING_REQUIRED',
+            'প্রশ্নভাণ্ডার এজ ক্যাশ এখনো প্রস্তুত নয়। অনুগ্রহ করে অ্যাডমিন লগইন করে প্রশ্ন সিঙ্ক করুন।'
+          );
+        }
       }
       throw err;
     }
@@ -635,6 +675,110 @@ export async function querySanitizedQuestionsFromD1(
   };
 }
 
+export interface AdminQuestionFilter extends SanitizedQuestionFilter {
+  status?: 'draft' | 'reviewed' | 'published';
+}
+
+interface AdminJoinedQuestionRow extends QuestionCacheRow {
+  correct_option_index: number | null;
+  explanation_bn: string | null;
+  explanation_en: string | null;
+  key_legal_reference: string | null;
+}
+
+/**
+ * Authoritative Owner Admin query against D1 question_bank_cache LEFT JOIN question_keys_cache.
+ * Reads ZERO documents from Firestore during normal Admin Question Bank browsing or refresh.
+ */
+export async function queryAdminQuestionsWithKeysFromD1(
+  db: D1Database,
+  filter: AdminQuestionFilter = {}
+): Promise<{ questions: ServerQuestion[]; total: number }> {
+  const conditions: string[] = [];
+  const params: unknown[] = [];
+
+  if (filter.subjectId) {
+    params.push(filter.subjectId);
+    conditions.push(`q.subject_id = ?${params.length}`);
+  }
+  if (filter.topicId) {
+    params.push(filter.topicId);
+    conditions.push(`q.topic_id = ?${params.length}`);
+  }
+  if (filter.difficulty) {
+    params.push(filter.difficulty);
+    conditions.push(`q.difficulty = ?${params.length}`);
+  }
+  if (filter.status) {
+    params.push(filter.status);
+    conditions.push(`q.status = ?${params.length}`);
+  }
+  if (filter.demoOnly) {
+    conditions.push(`q.is_demo_sample = 1`);
+  }
+  if (filter.search && filter.search.trim()) {
+    const escapedSearch = escapeSqliteLikePattern(filter.search.trim().toLowerCase());
+    const pattern = `%${escapedSearch}%`;
+    params.push(pattern);
+    const pIdx = params.length;
+    conditions.push(
+      `(LOWER(q.question_bn) LIKE ?${pIdx} ESCAPE '\\' OR LOWER(q.question_en) LIKE ?${pIdx} ESCAPE '\\' OR LOWER(q.legal_reference) LIKE ?${pIdx} ESCAPE '\\')`
+    );
+  }
+
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const countRow = await db
+    .prepare(`SELECT COUNT(*) AS total FROM question_bank_cache q ${whereClause}`)
+    .bind(...params)
+    .first<{ total: number }>();
+  const total = Number(countRow?.total ?? 0);
+
+  let limitOffsetSql = '';
+  const queryParams = [...params];
+  if (filter.limit !== undefined && filter.limit > 0) {
+    queryParams.push(filter.limit);
+    const limitIdx = queryParams.length;
+    const safeOffset = filter.offset !== undefined && filter.offset >= 0 ? filter.offset : 0;
+    queryParams.push(safeOffset);
+    const offsetIdx = queryParams.length;
+    limitOffsetSql = `LIMIT ?${limitIdx} OFFSET ?${offsetIdx}`;
+  }
+
+  const res = await db
+    .prepare(
+      `SELECT q.id, q.subject_id, q.topic_id, q.question_bn, q.question_en,
+              q.options_bn_json, q.options_en_json, q.legal_reference,
+              q.difficulty, q.status, q.is_demo_sample, q.created_at, q.updated_at,
+              k.correct_option_index, k.explanation_bn, k.explanation_en,
+              k.legal_reference AS key_legal_reference
+       FROM question_bank_cache q
+       LEFT JOIN question_keys_cache k ON k.question_id = q.id
+       ${whereClause}
+       ORDER BY q.id ASC
+       ${limitOffsetSql}`
+    )
+    .bind(...queryParams)
+    .all<AdminJoinedQuestionRow>();
+
+  const questions: ServerQuestion[] = res.results.map(row => {
+    const base = rowToSanitizedQuestion(row);
+    const rawCorrect = row.correct_option_index;
+    const correctOptionIndex =
+      typeof rawCorrect === 'number' && Number.isInteger(rawCorrect) && rawCorrect >= 0 && rawCorrect <= 3
+        ? rawCorrect
+        : 0;
+    return {
+      ...base,
+      legalReference: base.legalReference || row.key_legal_reference || '',
+      correctOptionIndex,
+      explanationBn: row.explanation_bn || '',
+      explanationEn: row.explanation_en || ''
+    };
+  });
+
+  return { questions, total };
+}
+
 export async function readSanitizedQuestionsFromD1(
   db: D1Database,
   options?: { subjectId?: string }
@@ -718,16 +862,47 @@ export async function getSanitizedQuestionMeta(
     if (!remoteDoc) return null;
     return sanitizeQuestion(firestoreDocToSanitizedQuestion(remoteDoc));
   } catch (err) {
-    if (isFirestoreForbiddenError(err)) {
+    if (isFirestoreForbiddenError(err) || isFirestoreQuotaOrOutageError(err)) {
       return null;
     }
     throw err;
   }
 }
 
+async function readQuestionKeysBatchD1(
+  db: D1Database,
+  questionIds: string[],
+  out: Map<string, QuestionKeyRecord>
+): Promise<void> {
+  for (let i = 0; i < questionIds.length; i += 90) {
+    const chunk = questionIds.slice(i, i + 90);
+    const placeholders = chunk.map((_, idx) => `?${idx + 1}`).join(', ');
+    const res = await db
+      .prepare(
+        `SELECT question_id, correct_option_index, explanation_bn, explanation_en, legal_reference, updated_at
+         FROM question_keys_cache
+         WHERE question_id IN (${placeholders})`
+      )
+      .bind(...chunk)
+      .all<QuestionKeyRow>();
+
+    for (const row of res.results) {
+      out.set(row.question_id, {
+        id: row.question_id,
+        correctOptionIndex: row.correct_option_index,
+        explanationBn: row.explanation_bn,
+        explanationEn: row.explanation_en,
+        legalReference: row.legal_reference,
+        updatedAt: row.updated_at
+      });
+    }
+  }
+}
+
 /**
  * Server-internal helper for scoring, practice verification, and Owner Admin CRUD ONLY.
- * Reads from D1 `question_keys_cache` and falls back to Firestore `questionKeys` when permitted.
+ * Reads from D1 `question_keys_cache` first (zero Firestore reads when warmed) and falls back
+ * to Firestore `questionKeys` only for missing IDs or invalidated caches when permitted.
  */
 export async function getAuthoritativeQuestionKeys(
   db: D1Database,
@@ -739,71 +914,49 @@ export async function getAuthoritativeQuestionKeys(
   const uniqueIds = Array.from(new Set(questionIds.map(id => String(id).trim()).filter(Boolean)));
   if (uniqueIds.length === 0) return out;
 
-  const freshness = await checkD1QuestionCacheFreshness(db, firestoreClient, {
-    ttlMs: options?.ttlMs,
-    nowMs: options?.nowMs
-  });
+  const localMeta = await getD1QuestionBankMeta(db);
+  const isInvalidated = localMeta?.version_token === '__invalidated__';
 
-  // Always check D1 keys cache first when fresh OR when remote fetch is disallowed/restricted
-  if (freshness.fresh || options?.allowRemoteFetch === false) {
-    for (let i = 0; i < uniqueIds.length; i += 90) {
-      const chunk = uniqueIds.slice(i, i + 90);
-      const placeholders = chunk.map((_, idx) => `?${idx + 1}`).join(', ');
-      const res = await db
-        .prepare(
-          `SELECT question_id, correct_option_index, explanation_bn, explanation_en, legal_reference, updated_at
-           FROM question_keys_cache
-           WHERE question_id IN (${placeholders})`
-        )
-        .bind(...chunk)
-        .all<QuestionKeyRow>();
-
-      for (const row of res.results) {
-        out.set(row.question_id, {
-          id: row.question_id,
-          correctOptionIndex: row.correct_option_index,
-          explanationBn: row.explanation_bn,
-          explanationEn: row.explanation_en,
-          legalReference: row.legal_reference,
-          updatedAt: row.updated_at
-        });
-      }
-    }
+  if (!isInvalidated || options?.allowRemoteFetch === false) {
+    await readQuestionKeysBatchD1(db, uniqueIds, out);
   }
 
   const missingIds = uniqueIds.filter(id => !out.has(id));
-  if (missingIds.length > 0 && options?.allowRemoteFetch !== false) {
+  if (missingIds.length === 0 || options?.allowRemoteFetch === false) {
+    return out;
+  }
+
+  let versionTokenForWrite = localMeta?.version_token || '__cached__';
+  if (isInvalidated) {
+    try {
+      const freshness = await checkD1QuestionCacheFreshness(db, firestoreClient, {
+        ttlMs: options?.ttlMs,
+        nowMs: options?.nowMs
+      });
+      versionTokenForWrite = freshness.remoteVersionToken;
+      if (freshness.fresh) {
+        await readQuestionKeysBatchD1(db, missingIds, out);
+      }
+    } catch (err) {
+      if (!isFirestoreForbiddenError(err) && !isFirestoreQuotaOrOutageError(err)) {
+        throw err;
+      }
+      await readQuestionKeysBatchD1(db, missingIds, out);
+    }
+  }
+
+  const stillMissingIds = uniqueIds.filter(id => !out.has(id));
+  if (stillMissingIds.length > 0) {
     let fetched: Map<string, Record<string, unknown> & { id: string }>;
     try {
       fetched = await firestoreClient.batchGetDocuments<Record<string, unknown>>(
-        missingIds.map(docId => ({ collection: 'questionKeys', docId }))
+        stillMissingIds.map(docId => ({ collection: 'questionKeys', docId }))
       );
     } catch (err) {
-      if (isFirestoreForbiddenError(err)) {
-        // Real Firestore Security Rules block non-owner reads of /questionKeys;
-        // fallback cleanly to any warmed keys in D1 question_keys_cache.
-        for (let i = 0; i < missingIds.length; i += 90) {
-          const chunk = missingIds.slice(i, i + 90);
-          const placeholders = chunk.map((_, idx) => `?${idx + 1}`).join(', ');
-          const res = await db
-            .prepare(
-              `SELECT question_id, correct_option_index, explanation_bn, explanation_en, legal_reference, updated_at
-               FROM question_keys_cache
-               WHERE question_id IN (${placeholders})`
-            )
-            .bind(...chunk)
-            .all<QuestionKeyRow>();
-          for (const row of res.results) {
-            out.set(row.question_id, {
-              id: row.question_id,
-              correctOptionIndex: row.correct_option_index,
-              explanationBn: row.explanation_bn,
-              explanationEn: row.explanation_en,
-              legalReference: row.legal_reference,
-              updatedAt: row.updated_at
-            });
-          }
-        }
+      if (isFirestoreForbiddenError(err) || isFirestoreQuotaOrOutageError(err)) {
+        // Real Firestore Security Rules block non-owner reads of /questionKeys,
+        // or Firestore quota/availability failed: fall back cleanly to D1 question_keys_cache.
+        await readQuestionKeysBatchD1(db, stillMissingIds, out);
         return out;
       }
       throw err;
@@ -842,7 +995,7 @@ export async function getAuthoritativeQuestionKeys(
             rec.explanationEn,
             rec.legalReference || '',
             rec.updatedAt,
-            freshness.remoteVersionToken
+            versionTokenForWrite
           )
       );
     }

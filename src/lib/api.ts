@@ -374,8 +374,32 @@ export async function apiRejectPaymentRequest(id: string, reason: string, verifi
 }
 
 // Admin Endpoints (Verified Owner Admin Only)
-export async function apiFetchAdminQuestions() {
-  return apiRequest<{ questions: Question[] }>('/api/admin/questions', { requireAuth: true });
+export async function apiFetchAdminQuestions(params?: {
+  subjectId?: string;
+  topicId?: string;
+  difficulty?: 'easy' | 'medium' | 'hard';
+  status?: 'draft' | 'reviewed' | 'published';
+  search?: string;
+  limit?: number;
+  offset?: number;
+}) {
+  const searchParams = new URLSearchParams();
+  if (params?.subjectId && params.subjectId !== 'all') searchParams.set('subjectId', params.subjectId);
+  if (params?.topicId) searchParams.set('topicId', params.topicId);
+  if (params?.difficulty) searchParams.set('difficulty', params.difficulty);
+  if (params?.status) searchParams.set('status', params.status);
+  if (params?.search) searchParams.set('search', params.search);
+  if (params?.limit !== undefined) searchParams.set('limit', String(params.limit));
+  if (params?.offset !== undefined) searchParams.set('offset', String(params.offset));
+  const qs = searchParams.toString() ? `?${searchParams.toString()}` : '';
+  return apiRequest<{
+    questions: Question[];
+    total?: number;
+    limit?: number;
+    offset?: number;
+    hasMore?: boolean;
+    source?: 'd1' | 'firestore';
+  }>(`/api/admin/questions${qs}`, { requireAuth: true });
 }
 
 export async function apiAdminSyncQuestionCache() {
