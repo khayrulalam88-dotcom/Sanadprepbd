@@ -54,6 +54,7 @@ import {
   type RateLimitResult
 } from './d1Store.ts';
 import { syncQuestionsAndKeysToD1 } from './questionCache.ts';
+import { handleOwnerExamRepairRoute } from './examRepair.ts';
 import {
   WorkerHttpError,
   type AuditLog,
@@ -1900,6 +1901,18 @@ export async function handlePaymentsAndAdminRoutes(
     await writeAuditLogD1(db, auditEntry, true);
 
     return { status: 200, payload: { success: true, exam: normalized } };
+  }
+
+  if (pathname === '/api/admin/exams/repair-model-test-2' && method === 'POST') {
+    return handleOwnerExamRepairRoute({
+      request: ctx.request,
+      env,
+      projectId,
+      nowMs,
+      firestoreClient,
+      jwksFetcher: ctx.jwksFetcher,
+      tokenVerifier: ctx.tokenVerifier
+    });
   }
 
   if (pathname === '/api/admin/dashboard-stats' && method === 'GET') {
