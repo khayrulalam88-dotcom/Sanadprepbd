@@ -17,14 +17,12 @@ export const CANONICAL_LEGACY_QUESTION_IDS = [
   'q_cpc_1'
 ];
 
-// Proposed 7-question mapping from the read-only reconciliation audit.
-// Note: #4 (q_bank_0609) is intentionally included as the audited CrPC Sec 144 candidate
-// so dry-run demonstrates flagging NEEDS_CORRECTION_AND_OWNER_APPROVAL and blocking execution.
+// Approved 7-question mapping for Model Test 2 (exam_1795671882276_o1zj5).
 export const DEFAULT_PROPOSED_REPLACEMENTS = [
   'q_bank_2648', // #1 q_lim_1 -> sub_limitation (Limitation Act Sec 5)
   'q_bank_2269', // #2 q_sra_1 -> sub_sra (SRA Sec 9)
   'q_bank_2851', // #3 q_bco_1 -> sub_bar_ethics (Bar Council Art 5 / AG Chairman)
-  'q_bank_0609', // #4 q_crpc_1 -> sub_crpc (CrPC Sec 144 - FLAGGED SEMANTIC MISMATCH)
+  'q_bank_3001', // #4 q_crpc_1 -> sub_crpc (CrPC Sec 144 - Urgent prohibitory order)
   'q_bank_1292', // #5 q_penal_1 -> sub_penal (Penal Code Sec 299)
   'q_bank_1874', // #6 q_evi_1 -> sub_evidence (Evidence Act Sec 32(1))
   'q_bank_0043'  // #7 q_cpc_1 -> sub_cpc (CPC Sec 9)

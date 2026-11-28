@@ -86998,5 +86998,34 @@
     "createdAt": "2026-01-01T00:00:00.000Z",
     "updatedAt": "2026-01-01T00:00:00.000Z",
     "createdBy": "Sanad Prep BD Academic Board"
+  },
+  {
+    "id": "q_bank_3001",
+    "subjectId": "sub_crpc",
+    "questionBn": "ফৌজদারী কার্যবিধি, ১৮৯৮-এর কোন ধারা অনুসারে তাৎক্ষণিক শান্তি ভঙ্গ, দাঙ্গা, জননিরাপত্তা বা মানবজীবনের ঝুঁকি কিংবা উৎপাত নিরসনে জেলা ম্যাজিস্ট্রেট বা বিশেষভাবে ক্ষমতাপ্রাপ্ত নির্বাহী ম্যাজিস্ট্রেট জরুরি নিষেধাজ্ঞা আদেশ জারি করতে পারেন?",
+    "questionEn": "Under which section of the Code of Criminal Procedure, 1898 may a District Magistrate or specially empowered Executive Magistrate issue an urgent written prohibitory order in urgent cases of nuisance or apprehended danger to prevent disturbance of public tranquillity, riot, or danger to human life, health, or safety?",
+    "optionsBn": [
+      "ধারা ১৩৩ (গণ-উৎপাত অপসারণের শর্তাধীন আদেশ)",
+      "ধারা ১৪৪ (তাৎক্ষণিক উৎপাত বা আসন্ন বিপদে জরুরি নিষেধাজ্ঞা আদেশ)",
+      "ধারা ১৪৫ (স্থাবর সম্পত্তির দখল সংক্রান্ত বিরোধে শান্তি ভঙ্গ নিবারণ)",
+      "ধারা ১০৭ (শান্তি রক্ষার্থে মুচলেকা গ্রহণের ক্ষমতা)"
+    ],
+    "optionsEn": [
+      "Section 133 (Conditional order for removal of public nuisance)",
+      "Section 144 (Urgent order absolute at once in cases of nuisance or apprehended danger)",
+      "Section 145 (Disputes concerning land or water likely to cause breach of peace)",
+      "Section 107 (Security for keeping the peace in other cases)"
+    ],
+    "correctOptionIndex": 1,
+    "explanationBn": "ফৌজদারী কার্যবিধি, ১৮৯৮-এর ধারা ১৪৪(১) অনুযায়ী, জেলা ম্যাজিস্ট্রেট অথবা সরকার বা জেলা ম্যাজিস্ট্রেট কর্তৃক বিশেষভাবে ক্ষমতাপ্রাপ্ত কোনো নির্বাহী ম্যাজিস্ট্রেটের মতে তাৎক্ষণিক প্রতিরোধ বা দ্রুত প্রতিকার প্রয়োজন হলে, তিনি ঘটনার গুরুত্বপূর্ণ বিবরণ উল্লেখপূর্বক লিখিত আদেশের মাধ্যমে কোনো ব্যক্তিকে নির্দিষ্ট কাজ থেকে বিরত থাকার বা তার দখল/নিয়ন্ত্রণাধীন সম্পত্তি সম্পর্কে নির্দিষ্ট ব্যবস্থা গ্রহণের নির্দেশ দিতে পারেন—যদি তা আইনানুগভাবে নিয়োজিত ব্যক্তির প্রতিবন্ধকতা, বিরক্তি বা ক্ষতি, মানবজীবন-স্বাস্থ্য-নিরাপত্তার ঝুঁকি, জনশান্তি ভঙ্গ, দাঙ্গা বা মারামারি প্রতিরোধে সহায়ক হয়। ধারা ১৪৪(২) অনুযায়ী জরুরি অবস্থায় বা নোটিশ জারির সুযোগ না থাকলে একতরফাভাবে (ex parte) আদেশ দেওয়া যায়; ধারা ১৪৪(৩) অনুযায়ী এটি নির্দিষ্ট ব্যক্তি বা কোনো স্থানে আগত সাধারণ জনগণের উদ্দেশ্যে হতে পারে; ধারা ১৪৪(৬) অনুযায়ী সরকারি গেজেট প্রজ্ঞাপন ছাড়া কোনো আদেশ ২ মাসের বেশি বলবৎ থাকে না; এবং ধারা ১৪৪(৭) অনুযায়ী এ ধারা মেট্রোপলিটন এলাকায় প্রযোজ্য নয়। অন্যদিকে ধারা ১৩৩ গণ-উৎপাত অপসারণের শর্তাধীন আদেশ, ধারা ১৪৫ স্থাবর সম্পত্তির দখলজনিত বিরোধ এবং ধারা ১০৭ শান্তি রক্ষায় মুচলেকা গ্রহণ সংক্রান্ত।",
+    "explanationEn": "Under Section 144(1) of the Code of Criminal Procedure, 1898, a District Magistrate or any other Executive Magistrate specially empowered by the Government or the District Magistrate may, by written order stating the material facts, direct any person to abstain from a certain act or take certain order with property in their possession or management where immediate prevention or speedy remedy is desirable to prevent obstruction, annoyance, or injury, danger to human life, health or safety, disturbance of public tranquillity, riot, or affray. Under Section 144(2) it may be passed ex parte in emergencies; under Section 144(3) it may be directed to an individual or the public generally frequenting a place; under Section 144(6) it cannot remain in force for more than two months unless extended by Official Gazette notification in specified emergencies; and under Section 144(7) it does not apply to Metropolitan Areas. Sections 133, 145, and 107 deal respectively with conditional public nuisance orders, immovable property possession disputes, and security for keeping the peace.",
+    "legalReference": "The Code of Criminal Procedure, 1898 - Section 144",
+    "difficulty": "easy",
+    "status": "published",
+    "year": "Bar Council Standard Syllabus",
+    "isDemoSample": false,
+    "createdAt": "2026-11-28T00:00:00.000Z",
+    "updatedAt": "2026-11-28T00:00:00.000Z",
+    "createdBy": "Sanad Prep BD Academic Board"
   }
 ]

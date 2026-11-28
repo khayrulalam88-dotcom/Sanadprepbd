@@ -379,31 +379,13 @@ const LIVE_MODEL_TEST_2_SNAPSHOT: Exam & { updatedAt: string } = {
   updatedAt: '2026-11-26T05:44:42.741Z'
 };
 
-const VALID_CORRECTED_CRPC_144_QUESTION: ServerQuestion = {
-  id: 'q_bank_0609_sec144_corrected',
-  subjectId: 'sub_crpc',
-  questionBn:
-    'ফৌজদারী কার্যবিধির কোন ধারা অনুসারে তাৎক্ষণিক শান্তি ভঙ্গ বা জননিরাপত্তা বিঘ্নিত হওয়ার আশঙ্কায় ম্যাজিস্ট্রেট ১৪৪ ধারা সাময়িক নিষেধাজ্ঞা জারি করেন?',
-  questionEn:
-    'Under which section of the Code of Criminal Procedure, 1898 is a temporary prohibitory order issued to prevent urgent cases of nuisance or apprehended danger?',
-  optionsBn: ['ধারা ১৩৩ (Section 133)', 'ধারা ১৪৪ (Section 144)', 'ধারা ১৪৫ (Section 145)', 'ধারা ১০৭ (Section 107)'],
-  optionsEn: ['Section 133', 'Section 144', 'Section 145', 'Section 107'],
-  correctOptionIndex: 1,
-  explanationBn: 'ধারা ১৪৪ (ফৌজদারী কার্যবিধি, ১৮৯৮): জননিরাপত্তা বিঘ্নিত হওয়ার আশঙ্কায় ম্যাজিস্ট্রেট কর্তৃক সাময়িক নিষেধাজ্ঞা।',
-  explanationEn: 'Section 144 CrPC, 1898: Urgent temporary prohibitory order in cases of nuisance or apprehended danger.',
-  legalReference: 'The Code of Criminal Procedure, 1898 - ধারা ১৪৪',
-  difficulty: 'easy',
-  status: 'published',
-  isDemoSample: false,
-  createdAt: '2026-11-27T00:00:00.000Z',
-  updatedAt: '2026-11-27T00:00:00.000Z'
-};
+const VALID_7_REPLACEMENTS = [...DEFAULT_PROPOSED_REPLACEMENTS];
 
-const VALID_7_REPLACEMENTS = [
+const MISMATCHED_0609_REPLACEMENTS = [
   'q_bank_2648',
   'q_bank_2269',
   'q_bank_2851',
-  'q_bank_0609_sec144_corrected',
+  'q_bank_0609',
   'q_bank_1292',
   'q_bank_1874',
   'q_bank_0043'
@@ -520,11 +502,12 @@ async function setupHarness(options?: {
     '2026-11-26T05:44:42.741Z'
   );
 
-  // Seed real candidate questions from questionBankFull.json + corrected Sec 144 + extra test fixtures
+  // Seed real candidate questions from questionBankFull.json + extra test fixtures
   const realCandidates = loadSourceQuestionsSubset([
     'q_bank_2648',
     'q_bank_2269',
     'q_bank_2851',
+    'q_bank_3001',
     'q_bank_0609',
     'q_bank_1292',
     'q_bank_1874',
@@ -539,7 +522,7 @@ async function setupHarness(options?: {
   );
   await seedD1QuestionsAndKeys(
     db,
-    [...realCandidates, VALID_CORRECTED_CRPC_144_QUESTION, ...(options?.extraQuestions || [])],
+    [...realCandidates, ...(options?.extraQuestions || [])],
     { omitKeyIds: options?.omitKeyIds }
   );
 
@@ -713,7 +696,7 @@ describe('Owner-only CAS Repair for exam_1795671882276_o1zj5', () => {
             q_bank_2648: 1,
             q_bank_2269: 0,
             q_bank_2851: 0,
-            q_bank_0609_sec144_corrected: 1,
+            q_bank_3001: 1,
             q_bank_1292: 1,
             q_bank_1874: 1,
             q_bank_0043: 0
@@ -825,14 +808,14 @@ describe('Owner-only CAS Repair for exam_1795671882276_o1zj5', () => {
     const h = await setupHarness({ extraQuestions: [limSec3WrongIntent] });
     const ownerToken = await h.signOwnerToken();
 
-    // 5a: Default proposed list (with q_bank_0609 in slot #4) in dry-run
+    // 5a: Mismatched list (with q_bank_0609 in slot #4) in dry-run
     const dryRes = await h.handler(
       new Request('https://worker.example/api/admin/exams/repair-model-test-2', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ownerToken}` },
         body: JSON.stringify({
           dryRun: true,
-          replacementQuestionIds: DEFAULT_PROPOSED_REPLACEMENTS
+          replacementQuestionIds: MISMATCHED_0609_REPLACEMENTS
         })
       }),
       h.env
@@ -853,7 +836,7 @@ describe('Owner-only CAS Repair for exam_1795671882276_o1zj5', () => {
         body: JSON.stringify({
           dryRun: false,
           expectedUpdateTime: h.initialUpdateTime,
-          replacementQuestionIds: DEFAULT_PROPOSED_REPLACEMENTS,
+          replacementQuestionIds: MISMATCHED_0609_REPLACEMENTS,
           approveMismatch: true,
           force: true
         })
@@ -1145,15 +1128,17 @@ describe('Owner-only CAS Repair for exam_1795671882276_o1zj5', () => {
     });
     assert.equal(scriptDryResult.dryRun, true);
     assert.equal(scriptDryResult.executed, false);
-    assert.equal(scriptDryResult.safeToExecute, false);
-    assert.equal(scriptDryResult.report.slotValidations[3].status, 'NEEDS_CORRECTION_AND_OWNER_APPROVAL');
+    assert.equal(scriptDryResult.safeToExecute, true);
+    assert.equal(scriptDryResult.report.slotValidations[3].replacementQuestionId, 'q_bank_3001');
+    assert.equal(scriptDryResult.report.slotValidations[3].status, 'VALID');
     assert.equal(h.fsStub.commitLog.length, 0);
 
-    // 11d: CLI script with --execute MUST abort in preflight when #4 q_bank_0609 is present (0 writes)
+    // 11d: CLI script with --execute MUST abort in preflight when #4 q_bank_0609 is passed (0 writes)
     await assert.rejects(
       () =>
         runRepairOwnerModelTest2({
           execute: true,
+          questionIds: MISMATCHED_0609_REPLACEMENTS,
           workerUrl: 'https://local-test-worker.example',
           idToken: ownerToken,
           nowMs: h.nowMs,
