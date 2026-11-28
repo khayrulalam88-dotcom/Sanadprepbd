@@ -55,6 +55,7 @@ import {
 } from './d1Store.ts';
 import { syncQuestionsAndKeysToD1 } from './questionCache.ts';
 import { handleOwnerExamRepairRoute } from './examRepair.ts';
+import { handleOwnerExamConversionRoute } from './examConversion.ts';
 import {
   WorkerHttpError,
   type AuditLog,
@@ -1905,6 +1906,18 @@ export async function handlePaymentsAndAdminRoutes(
 
   if (pathname === '/api/admin/exams/repair-model-test-2' && method === 'POST') {
     return handleOwnerExamRepairRoute({
+      request: ctx.request,
+      env,
+      projectId,
+      nowMs,
+      firestoreClient,
+      jwksFetcher: ctx.jwksFetcher,
+      tokenVerifier: ctx.tokenVerifier
+    });
+  }
+
+  if (pathname === '/api/admin/exams/convert-model-test-2' && method === 'POST') {
+    return handleOwnerExamConversionRoute({
       request: ctx.request,
       env,
       projectId,

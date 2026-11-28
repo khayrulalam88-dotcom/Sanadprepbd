@@ -479,6 +479,15 @@ export async function handlePhase2Routes(
     if (examId) {
       const targetExam = await resolveExamByIdKeyless(db, userClient, examId);
       if (targetExam) {
+        const pendingConversion =
+          (targetExam as unknown as { conversionState?: { status?: string } }).conversionState?.status === 'pending';
+        if (pendingConversion) {
+          throw new WorkerHttpError(
+            409,
+            'EXAM_CONVERSION_PENDING',
+            'Exam is currently undergoing maintenance conversion. Please retry shortly.'
+          );
+        }
         if (targetExam.isPaid && !isOwner) {
           const subCheck = await checkUserHasActiveSubscriptionKeyless(db, userClient, authUser.uid, nowMs);
           if (!subCheck.active) {

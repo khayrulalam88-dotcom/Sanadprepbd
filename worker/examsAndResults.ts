@@ -228,6 +228,16 @@ export async function handleExamsAndResultsRoutes(
       throw new WorkerHttpError(404, 'EXAM_NOT_FOUND', 'Exam not found.');
     }
 
+    const pendingConversion =
+      (exam as unknown as { conversionState?: { status?: string } }).conversionState?.status === 'pending';
+    if (pendingConversion) {
+      throw new WorkerHttpError(
+        409,
+        'EXAM_CONVERSION_PENDING',
+        'এই পরীক্ষাটির প্রশ্নসমূহ বর্তমানে আপগ্রেড হচ্ছে। অনুগ্রহ করে কিছুক্ষণ পর আবার চেষ্টা করুন।'
+      );
+    }
+
     if (exam.isActive === false && !isOwner) {
       throw new WorkerHttpError(
         403,
@@ -452,10 +462,30 @@ export async function handleExamsAndResultsRoutes(
       throw new WorkerHttpError(404, 'EXAM_NOT_FOUND', 'Exam not found.');
     }
 
-    const resolvedIds =
-      Array.isArray(rawAttempt.resolvedQuestionIds) && rawAttempt.resolvedQuestionIds.length > 0
-        ? rawAttempt.resolvedQuestionIds
-        : exam.questionIds || [];
+    const conversionState = (
+      exam as unknown as { conversionState?: { status?: string; startedAt?: string } }
+    ).conversionState;
+    const hasFrozenQuestionIds =
+      Array.isArray(rawAttempt.resolvedQuestionIds) && rawAttempt.resolvedQuestionIds.length > 0;
+    if (conversionState?.status === 'pending') {
+      const attemptStartMs = Date.parse(String(rawAttempt.startTime || ''));
+      const conversionStartedMs = Date.parse(String(conversionState.startedAt || ''));
+      const startedAfterConversionStarted =
+        Number.isFinite(attemptStartMs) &&
+        Number.isFinite(conversionStartedMs) &&
+        attemptStartMs >= conversionStartedMs;
+      if (!hasFrozenQuestionIds || startedAfterConversionStarted) {
+        throw new WorkerHttpError(
+          409,
+          'EXAM_CONVERSION_PENDING',
+          'এই পরীক্ষাটির প্রশ্নসমূহ বর্তমানে আপগ্রেড হচ্ছে। অনুগ্রহ করে কিছুক্ষণ পর আবার চেষ্টা করুন।'
+        );
+      }
+    }
+
+    const resolvedIds = hasFrozenQuestionIds
+      ? rawAttempt.resolvedQuestionIds!
+      : exam.questionIds || [];
 
     let authoritativeQuestions: ServerQuestion[] = [];
     if (resolvedIds.length > 0 && resolvedIds.length <= 200) {
