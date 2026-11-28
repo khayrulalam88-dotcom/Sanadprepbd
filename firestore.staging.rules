@@ -116,7 +116,7 @@ service cloud.firestore {
     // ---------------------------------------------------------
     // Students submit payments ONLY via the backend/Worker API; verified staging Owner manages approvals.
     match /paymentRequests/{paymentId} {
-      allow read: if (isAuthenticated() && resource.data.userId == request.auth.uid) || isOwnerAccount();
+      allow read: if isOwnerAccount() || (isAuthenticated() && resource != null && resource.data.userId == request.auth.uid);
       allow create, update: if isOwnerAccount();
       allow delete: if false;
     }
@@ -126,7 +126,7 @@ service cloud.firestore {
     // ---------------------------------------------------------
     // Created and managed ONLY by the verified staging owner UID / trusted backend.
     match /subscriptions/{subscriptionId} {
-      allow read: if (isAuthenticated() && resource.data.userId == request.auth.uid) || isOwnerAccount();
+      allow read: if isOwnerAccount() || (isAuthenticated() && resource != null && resource.data.userId == request.auth.uid);
       allow create, update, delete: if isOwnerAccount();
     }
 

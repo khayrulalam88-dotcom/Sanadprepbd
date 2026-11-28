@@ -1435,5 +1435,306 @@ describe('Sanad Prep BD — Cloudflare Worker Phase 3 Test Suite', async () => {
     assert.equal(stub.getCol('packages').get('pkg_monthly')?.price, 250);
     assert.equal(stub.getCol('packages').get('pkg_monthly')?.durationDays, 60);
   });
+
+  test('6. Payment approval permission fix: zero :beginTransaction, missing-doc 403 fallback for D1 pending payments, duplicate TrxID 409, unauthorized 403, subscription activation, and D1 recovery', async () => {
+    // Verify firestore.rules & firestore.staging.rules evaluate isOwnerAccount() before resource.data and guard resource != null
+    for (const rulesFile of ['firestore.rules', 'firestore.staging.rules']) {
+      const rulesSrc = fs.readFileSync(path.resolve(rulesFile), 'utf-8');
+      assert.match(
+        rulesSrc,
+        /match \/paymentRequests\/\{paymentId\}\s*\{\s*allow read:\s*if isOwnerAccount\(\) \|\| \(isAuthenticated\(\) && resource != null && resource\.data\.userId == request\.auth\.uid\);/,
+        `${rulesFile} must evaluate isOwnerAccount() first with resource != null on paymentRequests`
+      );
+      assert.match(
+        rulesSrc,
+        /match \/subscriptions\/\{subscriptionId\}\s*\{\s*allow read:\s*if isOwnerAccount\(\) \|\| \(isAuthenticated\(\) && resource != null && resource\.data\.userId == request\.auth\.uid\);/,
+        `${rulesFile} must evaluate isOwnerAccount() first with resource != null on subscriptions`
+      );
+    }
+
+    const db = await createMigratedTestD1();
+    const stub = createPhase3FirestoreStub();
+    seedPackagesAndConfig(stub);
+
+    stub.setDoc('users', 'student_pay', {
+      uid: 'student_pay',
+      name: 'Payment Student',
+      email: 'paystudent@example.com',
+      role: 'student',
+      subscriptionStatus: 'free',
+      createdAt: '2026-10-01T00:00:00.000Z'
+    });
+    stub.setDoc('users', 'fake_admin_2', {
+      uid: 'fake_admin_2',
+      name: 'Fake Admin 2',
+      email: 'fake2@example.com',
+      role: 'admin',
+      subscriptionStatus: 'free',
+      createdAt: '2026-10-01T00:00:00.000Z'
+    });
+
+    let beginTxCalls = 0;
+    let commitCalls = 0;
+    let simulateLegacyMissingDoc403 = true;
+
+    const guardedFetch: typeof fetch = async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      const method = (init?.method || 'GET').toUpperCase();
+      if (url.endsWith(':beginTransaction')) {
+        beginTxCalls++;
+      }
+      if (url.endsWith(':commit')) {
+        commitCalls++;
+      }
+      // Simulate pre-deploy Firestore rule Null Value Error ("Missing or insufficient permissions.")
+      // when GETting a paymentRequests doc that exists only in D1 and not yet in Firestore.
+      if (
+        simulateLegacyMissingDoc403 &&
+        method === 'GET' &&
+        /\/documents\/paymentRequests\/[^/?]+$/.test(url)
+      ) {
+        const docId = decodeURIComponent(url.split('/documents/paymentRequests/')[1]);
+        if (!stub.getCol('paymentRequests').has(docId)) {
+          return new Response(
+            JSON.stringify({
+              error: {
+                code: 403,
+                status: 'PERMISSION_DENIED',
+                message: 'Missing or insufficient permissions.'
+              }
+            }),
+            { status: 403, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+      }
+      return stub.fetchImpl(input, init);
+    };
+
+    const handler = createWorkerHandler({
+      jwksFetcher: async () => ({ keys: [keyPair.jwk], maxAgeSeconds: 3600 }),
+      fetchImpl: guardedFetch,
+      nowMsFn: () => baseNowMs
+    });
+    const env: WorkerEnv = {
+      DB: db,
+      ENVIRONMENT: 'production',
+      FIREBASE_PROJECT_ID: EXPECTED_FIREBASE_PROJECT_ID,
+      FIREBASE_DATABASE_ID: EXPECTED_FIREBASE_DATABASE_ID
+    };
+
+    const studentToken = await makeToken('student_pay', 'paystudent@example.com', 'Payment Student');
+    const fakeAdminToken = await makeToken('fake_admin_2', 'fake2@example.com', 'Fake Admin 2');
+    const ownerToken = await makeToken(OWNER_ADMIN_UID, OWNER_ADMIN_EMAIL, 'Khayrul Alam');
+
+    const studentSess = await loginStudent(handler, env, studentToken, 'Payment Student');
+
+    // Student submits pending payment (written only to D1, absent from Firestore)
+    const createRes = await handler(
+      new Request('https://s--khayrul-alam.khayrulalam88.workers.dev/api/payments/create', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${studentToken}`,
+          'X-Session-Id': studentSess,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          method: 'bKash',
+          senderNumber: '01712345678',
+          transactionId: 'D1PENDING001',
+          packageId: 'pkg_monthly'
+        })
+      }),
+      env
+    );
+    assert.equal(createRes.status, 200);
+    assert.equal(stub.getCol('paymentRequests').has('trx_D1PENDING001'), false);
+
+    // Unauthorized student and secondary fake admin MUST be rejected (403)
+    const unauthStudentRes = await handler(
+      new Request('https://s--khayrul-alam.khayrulalam88.workers.dev/api/admin/payments/trx_D1PENDING001/approve', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${studentToken}` }
+      }),
+      env
+    );
+    assert.equal(unauthStudentRes.status, 403);
+
+    const unauthFakeAdminRes = await handler(
+      new Request('https://s--khayrul-alam.khayrulalam88.workers.dev/api/admin/payments/trx_D1PENDING001/approve', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${fakeAdminToken}` }
+      }),
+      env
+    );
+    assert.equal(unauthFakeAdminRes.status, 403);
+
+    // Owner Admin approves D1-only pending payment cleanly (zero :beginTransaction, handles legacy missing-doc 403 via verified runQuery)
+    const approveRes = await handler(
+      new Request('https://s--khayrul-alam.khayrulalam88.workers.dev/api/admin/payments/trx_D1PENDING001/approve', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${ownerToken}` }
+      }),
+      env
+    );
+    assert.equal(approveRes.status, 200);
+    const approveJson = (await approveRes.json()) as {
+      success: boolean;
+      paymentRequest: { id: string; status: string; subscriptionId: string };
+      subscription: { id: string; status: string; expiresAt: string };
+    };
+    assert.equal(approveJson.success, true);
+    assert.equal(approveJson.paymentRequest.status, 'approved');
+    assert.equal(approveJson.subscription.status, 'active');
+    assert.equal(beginTxCalls, 0, 'Payment approval must NOT call Firestore :beginTransaction');
+
+    // Subscription activated in Firestore & verified via /api/subscriptions/active/:uid
+    assert.equal(stub.getCol('paymentRequests').get('trx_D1PENDING001')?.status, 'approved');
+    assert.equal(stub.getCol('users').get('student_pay')?.subscriptionStatus, 'pro');
+    const rawUserFields = stub.getRawCol('users').get('student_pay') as Record<string, Record<string, unknown>>;
+    assert.ok('timestampValue' in rawUserFields.subscriptionExpiresAt);
+    const activeSubRes = await handler(
+      new Request('https://s--khayrul-alam.khayrulalam88.workers.dev/api/subscriptions/active/student_pay', {
+        headers: { Authorization: `Bearer ${studentToken}`, 'X-Session-Id': studentSess }
+      }),
+      env
+    );
+    assert.equal(activeSubRes.status, 200);
+    assert.equal(((await activeSubRes.json()) as { hasActiveSubscription: boolean }).hasActiveSubscription, true);
+
+    // Duplicate TrxID approval rejected (409 TRX_ALREADY_APPROVED)
+    stub.setDoc('paymentRequests', 'trx_DUP_SHADOW', {
+      id: 'trx_DUP_SHADOW',
+      userId: 'student_pay',
+      studentName: 'Payment Student',
+      studentPhone: '01712345678',
+      method: 'bKash',
+      senderNumber: '01712345678',
+      transactionId: 'D1PENDING001',
+      amount: 150,
+      packageId: 'pkg_monthly',
+      packageNameBn: 'মাসিক',
+      packageNameEn: 'Monthly',
+      validityType: 'days',
+      durationDays: 30,
+      status: 'pending',
+      requestedAt: '2026-11-16T09:30:00.000Z'
+    });
+    const dupTrxApproveRes = await handler(
+      new Request('https://s--khayrul-alam.khayrulalam88.workers.dev/api/admin/payments/trx_DUP_SHADOW/approve', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${ownerToken}` }
+      }),
+      env
+    );
+    assert.equal(dupTrxApproveRes.status, 409);
+    assert.equal(((await dupTrxApproveRes.json()) as { error: string }).error, 'TRX_ALREADY_APPROVED');
+
+    // D1 sync failure recovery: simulate D1 write failure on edge_subscriptions after Firestore :commit succeeds
+    simulateLegacyMissingDoc403 = false;
+    stub.setDoc('paymentRequests', 'trx_RECOVER_D1', {
+      id: 'trx_RECOVER_D1',
+      userId: 'student_pay',
+      studentName: 'Payment Student',
+      studentPhone: '01712345678',
+      method: 'Nagad',
+      senderNumber: '01712345678',
+      transactionId: 'RECOVERD1TRX',
+      amount: 999,
+      packageId: 'pkg_long_course',
+      packageNameBn: 'লং কোর্স',
+      packageNameEn: 'Long Course',
+      validityType: 'days',
+      durationDays: 365,
+      status: 'pending',
+      requestedAt: '2026-11-16T09:45:00.000Z'
+    });
+
+    let failSubscriptionD1Write = true;
+    const flakyDb: D1Database = {
+      prepare(query: string) {
+        const stmt = db.prepare(query);
+        if (/INSERT INTO edge_subscriptions/i.test(query)) {
+          return {
+            bind(...values: unknown[]) {
+              stmt.bind(...values);
+              return this;
+            },
+            first: stmt.first.bind(stmt),
+            all: stmt.all.bind(stmt),
+            raw: stmt.raw.bind(stmt),
+            async run<T = Record<string, unknown>>() {
+              if (failSubscriptionD1Write) {
+                throw new Error('D1 transient write outage');
+              }
+              return stmt.run<T>();
+            }
+          };
+        }
+        return stmt;
+      },
+      batch: db.batch.bind(db),
+      exec: db.exec.bind(db)
+    };
+    const flakyEnv: WorkerEnv = { ...env, DB: flakyDb };
+
+    const commitsBeforeRecoveryTest = commitCalls;
+    const auditCountBeforeRecoveryTest = stub.getCol('auditLogs').size;
+
+    const failedD1SyncRes = await handler(
+      new Request('https://s--khayrul-alam.khayrulalam88.workers.dev/api/admin/payments/trx_RECOVER_D1/approve', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${ownerToken}` }
+      }),
+      flakyEnv
+    );
+    assert.equal(failedD1SyncRes.status, 503);
+    const failedD1Json = (await failedD1SyncRes.json()) as {
+      error: string;
+      firestoreCommitted: boolean;
+      d1Synced: boolean;
+      recoveryRequired: boolean;
+    };
+    assert.equal(failedD1Json.error, 'D1_SYNC_FAILED_RECOVERY_REQUIRED');
+    assert.equal(failedD1Json.firestoreCommitted, true);
+    assert.equal(failedD1Json.d1Synced, false);
+    assert.equal(failedD1Json.recoveryRequired, true);
+    assert.equal(stub.getCol('paymentRequests').get('trx_RECOVER_D1')?.status, 'approved');
+    assert.equal(commitCalls, commitsBeforeRecoveryTest + 1);
+    assert.equal(stub.getCol('auditLogs').size, auditCountBeforeRecoveryTest + 1);
+
+    // Retry once D1 recovers -> reconciles D1 WITHOUT issuing extra Firestore commits or duplicate Firestore audit logs
+    failSubscriptionD1Write = false;
+    const recoveredRes = await handler(
+      new Request('https://s--khayrul-alam.khayrulalam88.workers.dev/api/admin/payments/trx_RECOVER_D1/approve', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${ownerToken}` }
+      }),
+      flakyEnv
+    );
+    assert.equal(recoveredRes.status, 200);
+    const recoveredJson = (await recoveredRes.json()) as {
+      success: boolean;
+      recovered: boolean;
+      paymentRequest: { status: string; subscriptionId: string };
+    };
+    assert.equal(recoveredJson.success, true);
+    assert.equal(recoveredJson.recovered, true);
+    assert.equal(recoveredJson.paymentRequest.status, 'approved');
+    assert.equal(commitCalls, commitsBeforeRecoveryTest + 1, 'Recovery must NOT rewrite Firestore');
+    assert.equal(stub.getCol('auditLogs').size, auditCountBeforeRecoveryTest + 1, 'Recovery must NOT duplicate Firestore audit logs');
+    assert.equal((await getPaymentRequestD1(db, 'trx_RECOVER_D1'))?.status, 'approved');
+
+    // Subsequent retry now returns 409 ALREADY_APPROVED
+    const postRecoveryReplayRes = await handler(
+      new Request('https://s--khayrul-alam.khayrulalam88.workers.dev/api/admin/payments/trx_RECOVER_D1/approve', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${ownerToken}` }
+      }),
+      flakyEnv
+    );
+    assert.equal(postRecoveryReplayRes.status, 409);
+    assert.equal(beginTxCalls, 0, 'Zero :beginTransaction calls across entire payment approval/recovery suite');
+  });
 });
+
 

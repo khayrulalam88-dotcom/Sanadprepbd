@@ -44,6 +44,7 @@ import {
   markExamResultsSyncedD1,
   markLeaderboardSyncedD1,
   markPaymentsSyncedD1,
+  normalizeSubscriptionDoc,
   revokeUserSessionsByAdminD1,
   upsertExamCacheD1,
   upsertExamsBatchD1,
@@ -287,6 +288,64 @@ export async function syncEdgeRecordsWithOwnerFirestore(
     leaderboardSynced: unsyncedLeaderboard.length,
     auditLogsSynced: unsyncedAudits.length
   };
+}
+
+async function readOwnerPaymentRequestSafely(
+  ownerClient: FirestoreRestClient,
+  id: string,
+  d1Pay: PaymentRequest | null
+): Promise<{
+  fsPayDoc: (Record<string, unknown> & { id: string }) | null;
+  fsPayUpdateTime?: string;
+  prefetchedSameTrxPayDocs?: Array<Record<string, unknown> & { id: string }>;
+}> {
+  try {
+    const meta = await ownerClient.getDocumentWithMetadata<Record<string, unknown>>('paymentRequests', id);
+    return {
+      fsPayDoc: meta.data,
+      fsPayUpdateTime: meta.updateTime
+    };
+  } catch (err) {
+    // Pre-deploy firestore.rules evaluated resource.data.userId before isOwnerAccount() on missing-doc GETs,
+    // yielding 403 PERMISSION_DENIED for D1-only pending payments. Only treat as missing if D1 holds this record
+    // AND a verified Owner runQuery on paymentRequests succeeds.
+    if (
+      d1Pay &&
+      err instanceof WorkerHttpError &&
+      err.status === 403 &&
+      err.code === 'PERMISSION_DENIED'
+    ) {
+      const sameTrxDocs = await ownerClient.runQuery<Record<string, unknown>>({
+        collection: 'paymentRequests',
+        where: [{ field: 'transactionId', op: 'EQUAL', value: d1Pay.transactionId }]
+      });
+      const existing = sameTrxDocs.find(doc => doc.id === id) || null;
+      return {
+        fsPayDoc: existing,
+        prefetchedSameTrxPayDocs: sameTrxDocs
+      };
+    }
+    throw err;
+  }
+}
+
+async function readOwnerSubscriptionSafely(
+  ownerClient: FirestoreRestClient,
+  subId: string,
+  transactionId: string
+): Promise<(Record<string, unknown> & { id: string }) | null> {
+  try {
+    return await ownerClient.getDocument<Record<string, unknown>>('subscriptions', subId);
+  } catch (err) {
+    if (err instanceof WorkerHttpError && err.status === 403 && err.code === 'PERMISSION_DENIED') {
+      const sameTrxSubs = await ownerClient.runQuery<Record<string, unknown>>({
+        collection: 'subscriptions',
+        where: [{ field: 'transactionId', op: 'EQUAL', value: transactionId }]
+      });
+      return sameTrxSubs.find(doc => doc.id === subId) || null;
+    }
+    throw err;
+  }
 }
 
 export async function handlePaymentsAndAdminRoutes(
@@ -584,8 +643,8 @@ export async function handlePaymentsAndAdminRoutes(
     assertOwnerAdmin(authUser, env);
 
     const id = decodeURIComponent(approveMatch[1]).trim();
-    if (!id) {
-      throw new WorkerHttpError(400, 'INVALID_REQUEST', 'Payment request id is required.');
+    if (!id || id.includes('/')) {
+      throw new WorkerHttpError(400, 'INVALID_REQUEST', 'Valid payment request id is required.');
     }
     const body = await parsePhase3JsonBody(ctx.request);
     const verifier =
@@ -595,173 +654,287 @@ export async function handlePaymentsAndAdminRoutes(
 
     const ownerClient = firestoreClient.withToken(authUser.idToken);
     const d1Pay = await getPaymentRequestD1(db, id);
+    const { fsPayDoc, fsPayUpdateTime, prefetchedSameTrxPayDocs } = await readOwnerPaymentRequestSafely(
+      ownerClient,
+      id,
+      d1Pay
+    );
 
-    const { updatedPay, newSubscription, auditEntry } = await ownerClient.runTransaction(async tx => {
-      const fsPayDoc = await tx.get<Record<string, unknown>>('paymentRequests', id);
-      const sourcePay = fsPayDoc || (d1Pay as unknown as Record<string, unknown> | null);
-      if (!sourcePay) {
-        throw new WorkerHttpError(404, 'NOT_FOUND', 'Payment request not found.');
-      }
-      const reqItem = sourcePay as unknown as PaymentRequest;
+    const sourcePay = fsPayDoc || (d1Pay as unknown as Record<string, unknown> | null);
+    if (!sourcePay) {
+      throw new WorkerHttpError(404, 'NOT_FOUND', 'Payment request not found.');
+    }
+    const reqItem = sourcePay as unknown as PaymentRequest;
+    if (typeof reqItem.userId !== 'string' || !reqItem.userId.trim() || reqItem.userId.includes('/')) {
+      throw new WorkerHttpError(400, 'INVALID_REQUEST', 'Payment request has an invalid userId.');
+    }
 
-      if (reqItem.status === 'approved') {
+    if (fsPayDoc && fsPayDoc.status === 'approved') {
+      const expectedSubId =
+        typeof fsPayDoc.subscriptionId === 'string' && fsPayDoc.subscriptionId
+          ? fsPayDoc.subscriptionId
+          : `sub_${reqItem.userId}_${reqItem.transactionId}`;
+      const [fsSubDoc, d1Sub] = await Promise.all([
+        readOwnerSubscriptionSafely(ownerClient, expectedSubId, reqItem.transactionId),
+        findSubscriptionByTrxIdD1(db, reqItem.transactionId)
+      ]);
+      const isD1Synced = Boolean(
+        d1Pay &&
+          d1Pay.status === 'approved' &&
+          d1Pay.subscriptionId === expectedSubId &&
+          d1Sub &&
+          d1Sub.id === expectedSubId
+      );
+      if (isD1Synced) {
         throw new WorkerHttpError(409, 'ALREADY_APPROVED', 'Payment already approved.');
       }
-      if (reqItem.status === 'rejected') {
-        throw new WorkerHttpError(400, 'ALREADY_REJECTED', 'Rejected payment request cannot be approved.');
-      }
-
-      const [sameTrxPayDocs, sameTrxSubDocs, d1TrxPay, d1TrxSub, pkgDoc, configDoc] = await Promise.all([
-        ownerClient.runQuery<Record<string, unknown>>({
-          collection: 'paymentRequests',
-          where: [{ field: 'transactionId', op: 'EQUAL', value: reqItem.transactionId }],
-          transactionId: tx.transactionId
-        }),
-        ownerClient.runQuery<Record<string, unknown>>({
-          collection: 'subscriptions',
-          where: [{ field: 'transactionId', op: 'EQUAL', value: reqItem.transactionId }],
-          transactionId: tx.transactionId
-        }),
-        findPaymentRequestByTrxIdD1(db, reqItem.transactionId),
-        findSubscriptionByTrxIdD1(db, reqItem.transactionId),
-        tx.get<Record<string, unknown>>('packages', reqItem.packageId),
-        tx.get<Record<string, unknown>>('config', 'examDate')
-      ]);
-
-      const hasDuplicateApprovedPay =
-        sameTrxPayDocs.some(d => d.id !== id && d.status === 'approved') ||
-        Boolean(d1TrxPay && d1TrxPay.id !== id && d1TrxPay.status === 'approved');
-      if (hasDuplicateApprovedPay || sameTrxSubDocs.length > 0 || Boolean(d1TrxSub)) {
-        throw new WorkerHttpError(
-          409,
-          'TRX_ALREADY_APPROVED',
-          'এই TrxID দিয়ে ইতিপূর্বে আরেকটি পেমেন্ট অনুমোদন করা হয়েছে!'
-        );
-      }
-
-      const pkgData = (pkgDoc || undefined) as Partial<SubscriptionPackage> | undefined;
-      const targetExamDate =
-        typeof configDoc?.targetExamDate === 'string' && configDoc.targetExamDate
-          ? configDoc.targetExamDate
-          : INITIAL_EXAM_DATE_CONFIG.targetExamDate;
-
-      const validityType: 'days' | 'exam_date' =
-        (pkgData?.validityType || reqItem.validityType || 'days') === 'exam_date'
-          ? 'exam_date'
-          : 'days';
-      // Preserve Pro Model Test Pass 90-day duration as default fallback when validityType === 'days'
-      const durationDays = Number(pkgData?.durationDays || reqItem.durationDays || 90);
-      const packageNameBn = String(pkgData?.nameBn || reqItem.packageNameBn || 'Pro Package');
-      const packageNameEn = String(pkgData?.nameEn || reqItem.packageNameEn || 'Pro Package');
-
-      const activatedAt = nowIso;
-      const expiresAt = calculateSubscriptionExpiryWorker(
-        validityType,
-        durationDays,
-        targetExamDate,
-        nowMs
-      );
-
-      const subId = `sub_${reqItem.userId}_${reqItem.transactionId}`;
-      const createdSub: UserSubscription = {
-        id: subId,
-        userId: reqItem.userId,
-        studentName: reqItem.studentName,
-        studentPhone: reqItem.studentPhone,
-        packageId: reqItem.packageId,
-        packageNameBn,
-        packageNameEn,
-        pricePaid: Number(reqItem.amount),
-        paymentRequestId: reqItem.id,
-        paymentMethod: (reqItem.method === 'Nagad' ? 'Nagad' : 'bKash') as 'bKash' | 'Nagad',
-        transactionId: reqItem.transactionId,
-        activatedAt,
-        expiresAt,
-        validityType,
-        status: 'active',
-        ...(validityType === 'exam_date' ? { targetExamDateSnapshot: targetExamDate } : {}),
-        createdAt: activatedAt
-      };
-
-      const auditId = makeAuditId(nowMs);
-      const auditRecord: AuditLog = {
-        id: auditId,
-        userId: authUser.uid,
-        userName: verifier,
-        action: 'PAYMENT_APPROVED',
-        details: `Approved ${reqItem.method} TrxID: ${reqItem.transactionId} (৳${reqItem.amount}) for UID ${reqItem.userId}.`,
-        timestamp: activatedAt
-      };
-
-      const nextPayRecord: PaymentRequest = {
-        ...reqItem,
-        status: 'approved',
-        verifiedAt: activatedAt,
-        verifiedBy: verifier,
-        subscriptionId: subId
-      };
-
-      if (fsPayDoc) {
-        tx.update('paymentRequests', id, {
+      if (fsSubDoc) {
+        const verifiedAtIso =
+          timestampToIso(fsPayDoc.verifiedAt) ||
+          (typeof fsPayDoc.verifiedAt === 'string' && fsPayDoc.verifiedAt ? fsPayDoc.verifiedAt : nowIso);
+        const recoveredSub = normalizeSubscriptionDoc(fsSubDoc, verifiedAtIso);
+        const recoveredPay: PaymentRequest = {
+          ...reqItem,
+          id,
           status: 'approved',
-          verifiedAt: activatedAt,
-          verifiedBy: verifier,
-          subscriptionId: subId
-        });
-      } else {
-        tx.set('paymentRequests', id, {
-          ...(nextPayRecord as unknown as Record<string, unknown>),
-          rejectionReason: null
-        });
+          verifiedAt: verifiedAtIso,
+          verifiedBy: String(fsPayDoc.verifiedBy || verifier),
+          subscriptionId: expectedSubId
+        };
+        const d1RecoveryAudit: AuditLog = {
+          id: `log_d1_recover_approve_${id}`,
+          userId: authUser.uid,
+          userName: String(fsPayDoc.verifiedBy || verifier),
+          action: 'PAYMENT_APPROVED',
+          details: `Reconciled D1 edge state for approved ${recoveredPay.method} TrxID: ${recoveredPay.transactionId} (৳${recoveredPay.amount}) for UID ${recoveredPay.userId}.`,
+          timestamp: verifiedAtIso
+        };
+        try {
+          await Promise.all([
+            upsertPaymentRequestD1(db, recoveredPay, true, verifiedAtIso),
+            upsertSubscriptionD1(db, recoveredSub, true),
+            writeAuditLogD1(db, d1RecoveryAudit, true)
+          ]);
+        } catch {
+          return {
+            status: 503,
+            payload: {
+              success: false,
+              error: 'D1_SYNC_FAILED_RECOVERY_REQUIRED',
+              message:
+                'Payment is approved in Firestore, but edge D1 synchronization failed. Retry to complete D1 recovery.',
+              firestoreCommitted: true,
+              d1Synced: false,
+              recoveryRequired: true,
+              paymentRequest: recoveredPay,
+              subscription: recoveredSub
+            }
+          };
+        }
+        return {
+          status: 200,
+          payload: {
+            success: true,
+            recovered: true,
+            paymentRequest: recoveredPay,
+            subscription: recoveredSub
+          }
+        };
       }
+      throw new WorkerHttpError(409, 'ALREADY_APPROVED', 'Payment already approved.');
+    }
 
-      // Use atomic create so concurrent replay can never overwrite an existing subscription
-      tx.create('subscriptions', subId, {
-        userId: createdSub.userId,
-        studentName: createdSub.studentName,
-        studentPhone: createdSub.studentPhone,
-        packageId: createdSub.packageId,
-        packageNameBn: createdSub.packageNameBn,
-        packageNameEn: createdSub.packageNameEn,
-        pricePaid: createdSub.pricePaid,
-        paymentRequestId: createdSub.paymentRequestId,
-        paymentMethod: createdSub.paymentMethod,
-        transactionId: createdSub.transactionId,
-        activatedAt: new FirestoreTimestampValue(activatedAt),
-        expiresAt: new FirestoreTimestampValue(expiresAt),
-        validityType: createdSub.validityType,
-        status: 'active',
-        targetExamDateSnapshot: createdSub.targetExamDateSnapshot || null,
-        createdAt: activatedAt
-      });
+    if (reqItem.status === 'approved') {
+      throw new WorkerHttpError(409, 'ALREADY_APPROVED', 'Payment already approved.');
+    }
+    if (reqItem.status === 'rejected') {
+      throw new WorkerHttpError(400, 'ALREADY_REJECTED', 'Rejected payment request cannot be approved.');
+    }
 
-      tx.set(
-        'users',
-        reqItem.userId,
-        {
+    // All authoritative reads complete before issuing any Firestore write
+    const [sameTrxPayDocs, sameTrxSubDocs, d1TrxPay, d1TrxSub, pkgDoc, configDoc] = await Promise.all([
+      prefetchedSameTrxPayDocs
+        ? Promise.resolve(prefetchedSameTrxPayDocs)
+        : ownerClient.runQuery<Record<string, unknown>>({
+            collection: 'paymentRequests',
+            where: [{ field: 'transactionId', op: 'EQUAL', value: reqItem.transactionId }]
+          }),
+      ownerClient.runQuery<Record<string, unknown>>({
+        collection: 'subscriptions',
+        where: [{ field: 'transactionId', op: 'EQUAL', value: reqItem.transactionId }]
+      }),
+      findPaymentRequestByTrxIdD1(db, reqItem.transactionId),
+      findSubscriptionByTrxIdD1(db, reqItem.transactionId),
+      ownerClient.getDocument<Record<string, unknown>>('packages', reqItem.packageId),
+      ownerClient.getDocument<Record<string, unknown>>('config', 'examDate')
+    ]);
+
+    const hasDuplicateApprovedPay =
+      sameTrxPayDocs.some(d => d.id !== id && d.status === 'approved') ||
+      Boolean(d1TrxPay && d1TrxPay.id !== id && d1TrxPay.status === 'approved');
+    if (hasDuplicateApprovedPay || sameTrxSubDocs.length > 0 || Boolean(d1TrxSub)) {
+      throw new WorkerHttpError(
+        409,
+        'TRX_ALREADY_APPROVED',
+        'এই TrxID দিয়ে ইতিপূর্বে আরেকটি পেমেন্ট অনুমোদন করা হয়েছে!'
+      );
+    }
+
+    const pkgData = (pkgDoc || undefined) as Partial<SubscriptionPackage> | undefined;
+    const targetExamDate =
+      typeof configDoc?.targetExamDate === 'string' && configDoc.targetExamDate
+        ? configDoc.targetExamDate
+        : INITIAL_EXAM_DATE_CONFIG.targetExamDate;
+
+    const validityType: 'days' | 'exam_date' =
+      (pkgData?.validityType || reqItem.validityType || 'days') === 'exam_date'
+        ? 'exam_date'
+        : 'days';
+    // Preserve Pro Model Test Pass 90-day duration as default fallback when validityType === 'days'
+    const durationDays = Number(pkgData?.durationDays || reqItem.durationDays || 90);
+    const packageNameBn = String(pkgData?.nameBn || reqItem.packageNameBn || 'Pro Package');
+    const packageNameEn = String(pkgData?.nameEn || reqItem.packageNameEn || 'Pro Package');
+
+    const activatedAt = nowIso;
+    const expiresAt = calculateSubscriptionExpiryWorker(
+      validityType,
+      durationDays,
+      targetExamDate,
+      nowMs
+    );
+
+    const subId = `sub_${reqItem.userId}_${reqItem.transactionId}`;
+    const newSubscription: UserSubscription = {
+      id: subId,
+      userId: reqItem.userId,
+      studentName: reqItem.studentName,
+      studentPhone: reqItem.studentPhone,
+      packageId: reqItem.packageId,
+      packageNameBn,
+      packageNameEn,
+      pricePaid: Number(reqItem.amount),
+      paymentRequestId: reqItem.id,
+      paymentMethod: (reqItem.method === 'Nagad' ? 'Nagad' : 'bKash') as 'bKash' | 'Nagad',
+      transactionId: reqItem.transactionId,
+      activatedAt,
+      expiresAt,
+      validityType,
+      status: 'active',
+      ...(validityType === 'exam_date' ? { targetExamDateSnapshot: targetExamDate } : {}),
+      createdAt: activatedAt
+    };
+
+    const auditId = makeAuditId(nowMs);
+    const auditEntry: AuditLog = {
+      id: auditId,
+      userId: authUser.uid,
+      userName: verifier,
+      action: 'PAYMENT_APPROVED',
+      details: `Approved ${reqItem.method} TrxID: ${reqItem.transactionId} (৳${reqItem.amount}) for UID ${reqItem.userId}.`,
+      timestamp: activatedAt
+    };
+
+    const updatedPay: PaymentRequest = {
+      ...reqItem,
+      id,
+      status: 'approved',
+      verifiedAt: activatedAt,
+      verifiedBy: verifier,
+      subscriptionId: subId
+    };
+
+    const writes: FirestoreWriteOp[] = [
+      fsPayDoc
+        ? {
+            type: 'update',
+            collection: 'paymentRequests',
+            docId: id,
+            patch: {
+              status: 'approved',
+              verifiedAt: activatedAt,
+              verifiedBy: verifier,
+              subscriptionId: subId
+            },
+            currentDocument: fsPayUpdateTime ? { updateTime: fsPayUpdateTime } : { exists: true }
+          }
+        : {
+            type: 'create',
+            collection: 'paymentRequests',
+            docId: id,
+            data: {
+              ...(updatedPay as unknown as Record<string, unknown>),
+              rejectionReason: null
+            }
+          },
+      // Atomic create precondition prevents concurrent replay from overwriting an existing subscription
+      {
+        type: 'create',
+        collection: 'subscriptions',
+        docId: subId,
+        data: {
+          userId: newSubscription.userId,
+          studentName: newSubscription.studentName,
+          studentPhone: newSubscription.studentPhone,
+          packageId: newSubscription.packageId,
+          packageNameBn: newSubscription.packageNameBn,
+          packageNameEn: newSubscription.packageNameEn,
+          pricePaid: newSubscription.pricePaid,
+          paymentRequestId: newSubscription.paymentRequestId,
+          paymentMethod: newSubscription.paymentMethod,
+          transactionId: newSubscription.transactionId,
+          activatedAt: new FirestoreTimestampValue(activatedAt),
+          expiresAt: new FirestoreTimestampValue(expiresAt),
+          validityType: newSubscription.validityType,
+          status: 'active',
+          targetExamDateSnapshot: newSubscription.targetExamDateSnapshot || null,
+          createdAt: activatedAt
+        }
+      },
+      {
+        type: 'set',
+        collection: 'users',
+        docId: reqItem.userId,
+        data: {
           subscriptionStatus: 'pro',
           subscriptionExpiresAt: new FirestoreTimestampValue(expiresAt),
           activePackageId: reqItem.packageId,
           activePackageNameBn: packageNameBn,
           activePackageNameEn: packageNameEn
         },
-        { merge: true }
-      );
+        merge: true
+      },
+      {
+        type: 'create',
+        collection: 'auditLogs',
+        docId: auditId,
+        data: { ...auditEntry }
+      }
+    ];
 
-      tx.set('auditLogs', auditId, { ...auditRecord });
+    await ownerClient.commitWrites(writes);
 
+    try {
+      await Promise.all([
+        upsertPaymentRequestD1(db, updatedPay, true, updatedPay.verifiedAt || nowIso),
+        upsertSubscriptionD1(db, newSubscription, true),
+        writeAuditLogD1(db, auditEntry, true)
+      ]);
+    } catch {
       return {
-        updatedPay: nextPayRecord,
-        newSubscription: createdSub,
-        auditEntry: auditRecord
+        status: 503,
+        payload: {
+          success: false,
+          error: 'D1_SYNC_FAILED_RECOVERY_REQUIRED',
+          message:
+            'Payment was approved in Firestore, but edge D1 synchronization failed. Retry approval to reconcile D1.',
+          firestoreCommitted: true,
+          d1Synced: false,
+          recoveryRequired: true,
+          paymentRequest: updatedPay,
+          subscription: newSubscription
+        }
       };
-    });
-
-    await Promise.all([
-      upsertPaymentRequestD1(db, updatedPay, true, updatedPay.verifiedAt || nowIso),
-      upsertSubscriptionD1(db, newSubscription, true),
-      writeAuditLogD1(db, auditEntry, true)
-    ]);
+    }
 
     return {
       status: 200,
@@ -785,8 +958,8 @@ export async function handlePaymentsAndAdminRoutes(
     assertOwnerAdmin(authUser, env);
 
     const id = decodeURIComponent(rejectMatch[1]).trim();
-    if (!id) {
-      throw new WorkerHttpError(400, 'INVALID_REQUEST', 'Payment request id is required.');
+    if (!id || id.includes('/')) {
+      throw new WorkerHttpError(400, 'INVALID_REQUEST', 'Valid payment request id is required.');
     }
     const body = await parsePhase3JsonBody(ctx.request);
     const verifier =
@@ -800,61 +973,139 @@ export async function handlePaymentsAndAdminRoutes(
 
     const ownerClient = firestoreClient.withToken(authUser.idToken);
     const d1Pay = await getPaymentRequestD1(db, id);
+    const { fsPayDoc, fsPayUpdateTime } = await readOwnerPaymentRequestSafely(ownerClient, id, d1Pay);
 
-    const { updatedPay, auditEntry } = await ownerClient.runTransaction(async tx => {
-      const fsPayDoc = await tx.get<Record<string, unknown>>('paymentRequests', id);
-      const sourcePay = fsPayDoc || (d1Pay as unknown as Record<string, unknown> | null);
-      if (!sourcePay) {
-        throw new WorkerHttpError(404, 'NOT_FOUND', 'Payment request not found.');
-      }
-      const reqItem = sourcePay as unknown as PaymentRequest;
-      if (reqItem.status === 'approved') {
-        throw new WorkerHttpError(400, 'ALREADY_APPROVED', 'Approved payment request cannot be rejected.');
-      }
-      if (reqItem.status === 'rejected') {
+    const sourcePay = fsPayDoc || (d1Pay as unknown as Record<string, unknown> | null);
+    if (!sourcePay) {
+      throw new WorkerHttpError(404, 'NOT_FOUND', 'Payment request not found.');
+    }
+    const reqItem = sourcePay as unknown as PaymentRequest;
+
+    if (fsPayDoc && fsPayDoc.status === 'rejected') {
+      if (d1Pay && d1Pay.status === 'rejected') {
         throw new WorkerHttpError(409, 'ALREADY_REJECTED', 'Payment request has already been rejected.');
       }
-
-      const auditId = makeAuditId(nowMs);
-      const auditRecord: AuditLog = {
-        id: auditId,
-        userId: authUser.uid,
-        userName: verifier,
-        action: 'PAYMENT_REJECTED',
-        details: `Rejected ${reqItem.method} TrxID: ${reqItem.transactionId}. Reason: ${rejectionReason}`,
-        timestamp: nowIso
-      };
-
-      const nextPayRecord: PaymentRequest = {
+      const verifiedAtIso =
+        timestampToIso(fsPayDoc.verifiedAt) ||
+        (typeof fsPayDoc.verifiedAt === 'string' && fsPayDoc.verifiedAt ? fsPayDoc.verifiedAt : nowIso);
+      const recoveredPay: PaymentRequest = {
         ...reqItem,
+        id,
         status: 'rejected',
-        rejectionReason,
-        verifiedAt: nowIso,
-        verifiedBy: verifier
+        rejectionReason: String(fsPayDoc.rejectionReason || rejectionReason),
+        verifiedAt: verifiedAtIso,
+        verifiedBy: String(fsPayDoc.verifiedBy || verifier)
       };
-
-      if (fsPayDoc) {
-        tx.update('paymentRequests', id, {
-          status: 'rejected',
-          rejectionReason,
-          verifiedAt: nowIso,
-          verifiedBy: verifier
-        });
-      } else {
-        tx.set('paymentRequests', id, {
-          ...(nextPayRecord as unknown as Record<string, unknown>),
-          subscriptionId: null
-        });
+      const d1RecoveryAudit: AuditLog = {
+        id: `log_d1_recover_reject_${id}`,
+        userId: authUser.uid,
+        userName: String(fsPayDoc.verifiedBy || verifier),
+        action: 'PAYMENT_REJECTED',
+        details: `Reconciled D1 edge state for rejected ${recoveredPay.method} TrxID: ${recoveredPay.transactionId}. Reason: ${recoveredPay.rejectionReason}`,
+        timestamp: verifiedAtIso
+      };
+      try {
+        await Promise.all([
+          upsertPaymentRequestD1(db, recoveredPay, true, verifiedAtIso),
+          writeAuditLogD1(db, d1RecoveryAudit, true)
+        ]);
+      } catch {
+        return {
+          status: 503,
+          payload: {
+            success: false,
+            error: 'D1_SYNC_FAILED_RECOVERY_REQUIRED',
+            message:
+              'Payment rejection is saved in Firestore, but edge D1 synchronization failed. Retry to complete D1 recovery.',
+            firestoreCommitted: true,
+            d1Synced: false,
+            recoveryRequired: true,
+            paymentRequest: recoveredPay
+          }
+        };
       }
-      tx.set('auditLogs', auditId, { ...auditRecord });
+      return { status: 200, payload: { success: true, recovered: true, paymentRequest: recoveredPay } };
+    }
 
-      return { updatedPay: nextPayRecord, auditEntry: auditRecord };
-    });
+    if (reqItem.status === 'approved') {
+      throw new WorkerHttpError(400, 'ALREADY_APPROVED', 'Approved payment request cannot be rejected.');
+    }
+    if (reqItem.status === 'rejected') {
+      throw new WorkerHttpError(409, 'ALREADY_REJECTED', 'Payment request has already been rejected.');
+    }
 
-    await Promise.all([
-      upsertPaymentRequestD1(db, updatedPay, true, nowIso),
-      writeAuditLogD1(db, auditEntry, true)
-    ]);
+    const auditId = makeAuditId(nowMs);
+    const auditEntry: AuditLog = {
+      id: auditId,
+      userId: authUser.uid,
+      userName: verifier,
+      action: 'PAYMENT_REJECTED',
+      details: `Rejected ${reqItem.method} TrxID: ${reqItem.transactionId}. Reason: ${rejectionReason}`,
+      timestamp: nowIso
+    };
+
+    const updatedPay: PaymentRequest = {
+      ...reqItem,
+      id,
+      status: 'rejected',
+      rejectionReason,
+      verifiedAt: nowIso,
+      verifiedBy: verifier
+    };
+
+    const writes: FirestoreWriteOp[] = [
+      fsPayDoc
+        ? {
+            type: 'update',
+            collection: 'paymentRequests',
+            docId: id,
+            patch: {
+              status: 'rejected',
+              rejectionReason,
+              verifiedAt: nowIso,
+              verifiedBy: verifier
+            },
+            currentDocument: fsPayUpdateTime ? { updateTime: fsPayUpdateTime } : { exists: true }
+          }
+        : {
+            type: 'create',
+            collection: 'paymentRequests',
+            docId: id,
+            data: {
+              ...(updatedPay as unknown as Record<string, unknown>),
+              subscriptionId: null
+            }
+          },
+      {
+        type: 'create',
+        collection: 'auditLogs',
+        docId: auditId,
+        data: { ...auditEntry }
+      }
+    ];
+
+    await ownerClient.commitWrites(writes);
+
+    try {
+      await Promise.all([
+        upsertPaymentRequestD1(db, updatedPay, true, nowIso),
+        writeAuditLogD1(db, auditEntry, true)
+      ]);
+    } catch {
+      return {
+        status: 503,
+        payload: {
+          success: false,
+          error: 'D1_SYNC_FAILED_RECOVERY_REQUIRED',
+          message:
+            'Payment rejection was saved in Firestore, but edge D1 synchronization failed. Retry rejection to reconcile D1.',
+          firestoreCommitted: true,
+          d1Synced: false,
+          recoveryRequired: true,
+          paymentRequest: updatedPay
+        }
+      };
+    }
 
     return { status: 200, payload: { success: true, paymentRequest: updatedPay } };
   }
